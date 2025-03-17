@@ -8,6 +8,7 @@ use crate::util::os::*;
 use crate::util::ObjectReference;
 use crate::vm::slot::{MemorySlice, Slot};
 use crate::vm::*;
+use crate::ObjectQueue;
 use crate::MMTK;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -46,11 +47,16 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND
     fn trace_object(&mut self, object: ObjectReference) -> ObjectReference {
         // We cannot borrow `self` twice in a call, so we extract `worker` as a local variable.
         let worker = self.worker();
-        self.plan.trace_object_nursery::<VectorObjectQueue, KIND>(
-            &mut self.base.nodes,
-            object,
-            worker,
-        )
+        if cfg!(not(feature = "edge_enqueuing")) {
+            self.plan.trace_object_nursery::<VectorObjectQueue, KIND>(
+                &mut self.base.nodes,
+                object,
+                worker,
+            )
+        } else {
+            self.plan
+                .trace_object_nursery::<_, KIND>(self, object, worker)
+        }
     }
 
     fn process_slot(&mut self, slot: SlotOf<Self>) {
@@ -68,7 +74,67 @@ impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND
     }
 
     fn create_scan_work(&self, nodes: Vec<ObjectReference>) -> Option<Self::ScanObjectsWorkType> {
-        Some(PlanScanObjects::new(self.plan, nodes, false, self.bucket))
+        if cfg!(not(feature = "edge_enqueuing")) {
+            Some(PlanScanObjects::new(self.plan, nodes, false, self.bucket))
+        } else {
+            unreachable!()
+        }
+    }
+
+    #[cfg(feature = "edge_enqueuing")]
+    fn process_slots(&mut self) {
+        while let Some(slot) = self.slots.pop() {
+            self.process_slot(slot)
+        }
+    }
+
+    #[cfg(feature = "edge_enqueuing")]
+    fn flush(&mut self) {
+        if !self.slots.is_empty() {
+            let slots = std::mem::take(&mut self.slots);
+            let w = Self::new(slots, false, self.mmtk(), self.bucket);
+            self.worker().add_work(self.bucket, w);
+        }
+        self.pushes = 0;
+    }
+}
+
+impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND: TraceKind>
+    ObjectQueue for GenNurseryProcessEdges<VM, P, KIND>
+{
+    fn enqueue(&mut self, object: ObjectReference) {
+        let tls = self.worker().tls;
+        let mut closure = |slot: VM::VMSlot| {
+            let Some(_) = slot.load() else { return };
+            self.slots.push(slot);
+            self.pushes += 1;
+            if self.slots.len() >= Self::CAPACITY || self.pushes >= (Self::CAPACITY / 2) as u32 {
+                self.flush_half();
+            }
+        };
+        <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut closure);
+        self.plan.post_scan_object(object);
+    }
+}
+
+impl<VM: VMBinding, P: GenerationalPlanExt<VM> + PlanTraceObject<VM>, const KIND: TraceKind>
+    GenNurseryProcessEdges<VM, P, KIND>
+{
+    fn flush_half(&mut self) {
+        let slots = if self.slots.len() > 1 {
+            let half = self.slots.len() / 2;
+            self.slots.split_off(half)
+        } else {
+            return;
+        };
+
+        self.pushes = self.slots.len() as u32;
+        if slots.is_empty() {
+            return;
+        }
+
+        let w = Self::new(slots, false, self.mmtk(), self.bucket);
+        self.worker().add_work(self.bucket, w);
     }
 }
 

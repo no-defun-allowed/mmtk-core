@@ -228,10 +228,14 @@ impl<VM: VMBinding> ProcessEdgesWork for SanityGCProcessEdges<VM> {
     }
 
     fn create_scan_work(&self, nodes: Vec<ObjectReference>) -> Option<Self::ScanObjectsWorkType> {
-        Some(ScanObjects::<Self>::new(
-            nodes,
-            false,
-            WorkBucketStage::Closure,
-        ))
+        if cfg!(not(feature = "edge_enqueuing")) {
+            Some(ScanObjects::<Self>::new(
+                nodes,
+                false,
+                WorkBucketStage::Closure,
+            ))
+        } else {
+            unreachable!()
+        }
     }
 }

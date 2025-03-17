@@ -270,8 +270,14 @@ impl<E: ProcessEdgesWork> ProcessEdgesWorkTracer<E> {
     }
 
     pub fn flush_if_not_empty(&mut self) {
-        if !self.process_edges_work.nodes.is_empty() {
-            self.flush();
+        if cfg!(not(feature = "edge_enqueuing")) {
+            if !self.process_edges_work.nodes.is_empty() {
+                self.flush();
+            }
+        } else {
+            if !self.process_edges_work.slots.is_empty() {
+                self.process_edges_work.flush();
+            }
         }
     }
 
@@ -482,6 +488,7 @@ pub struct ProcessEdgesBase<VM: VMBinding> {
     // Because a copying gc will dereference this pointer at least once for every object copy.
     worker: *mut GCWorker<VM>,
     pub roots: bool,
+    pub pushes: u32,
     pub bucket: WorkBucketStage,
 }
 
@@ -509,6 +516,7 @@ impl<VM: VMBinding> ProcessEdgesBase<VM> {
             mmtk,
             worker: std::ptr::null_mut(),
             roots,
+            pushes: 0,
             bucket,
         }
     }
@@ -733,7 +741,11 @@ impl<VM: VMBinding> ProcessEdgesWork for SFTProcessEdges<VM> {
     }
 
     fn create_scan_work(&self, nodes: Vec<ObjectReference>) -> Option<ScanObjects<Self>> {
-        Some(ScanObjects::<Self>::new(nodes, false, self.bucket))
+        if cfg!(not(feature = "edge_enqueuing")) {
+            Some(ScanObjects::<Self>::new(nodes, false, self.bucket))
+        } else {
+            unreachable!()
+        }
     }
 }
 
@@ -1000,19 +1012,27 @@ impl<VM: VMBinding, P: PlanTraceObject<VM> + Plan<VM = VM>, const KIND: TraceKin
     }
 
     fn create_scan_work(&self, nodes: Vec<ObjectReference>) -> Option<Self::ScanObjectsWorkType> {
-        Some(PlanScanObjects::<Self, P>::new(
-            self.plan,
-            nodes,
-            false,
-            self.bucket,
-        ))
+        if cfg!(not(feature = "edge_enqueuing")) {
+            Some(PlanScanObjects::<Self, P>::new(
+                self.plan,
+                nodes,
+                false,
+                self.bucket,
+            ))
+        } else {
+            unreachable!()
+        }
     }
 
     fn trace_object(&mut self, object: ObjectReference) -> ObjectReference {
         // We cannot borrow `self` twice in a call, so we extract `worker` as a local variable.
         let worker = self.worker();
-        self.plan
-            .trace_object::<VectorObjectQueue, KIND>(&mut self.base.nodes, object, worker)
+        if cfg!(not(feature = "edge_enqueuing")) {
+            self.plan
+                .trace_object::<VectorObjectQueue, KIND>(&mut self.base.nodes, object, worker)
+        } else {
+            self.plan.trace_object::<_, KIND>(self, object, worker)
+        }
     }
 
     fn process_slot(&mut self, slot: SlotOf<Self>) {
@@ -1024,6 +1044,62 @@ impl<VM: VMBinding, P: PlanTraceObject<VM> + Plan<VM = VM>, const KIND: TraceKin
         if P::may_move_objects::<KIND>() && new_object != object {
             slot.store(new_object);
         }
+    }
+
+    #[cfg(feature = "edge_enqueuing")]
+    fn process_slots(&mut self) {
+        while let Some(slot) = self.slots.pop() {
+            self.process_slot(slot)
+        }
+    }
+
+    #[cfg(feature = "edge_enqueuing")]
+    fn flush(&mut self) {
+        if !self.slots.is_empty() {
+            let slots = std::mem::take(&mut self.slots);
+            let w = Self::new(slots, false, self.mmtk, self.bucket);
+            self.worker().add_work(self.bucket, w);
+        }
+        self.pushes = 0;
+    }
+}
+
+impl<VM: VMBinding, P: PlanTraceObject<VM> + Plan<VM = VM>, const KIND: TraceKind> ObjectQueue
+    for PlanProcessEdges<VM, P, KIND>
+{
+    fn enqueue(&mut self, object: ObjectReference) {
+        let tls = self.worker().tls;
+        let mut closure = |slot: VM::VMSlot| {
+            let Some(_) = slot.load() else { return };
+            self.slots.push(slot);
+            self.pushes += 1;
+            if self.slots.len() >= Self::CAPACITY || self.pushes >= (Self::CAPACITY / 2) as u32 {
+                self.flush_half();
+            }
+        };
+        <VM as VMBinding>::VMScanning::scan_object(tls, object, &mut closure);
+        self.plan.post_scan_object(object);
+    }
+}
+
+impl<VM: VMBinding, P: PlanTraceObject<VM> + Plan<VM = VM>, const KIND: TraceKind>
+    PlanProcessEdges<VM, P, KIND>
+{
+    fn flush_half(&mut self) {
+        let slots = if self.slots.len() > 1 {
+            let half = self.slots.len() / 2;
+            self.slots.split_off(half)
+        } else {
+            return;
+        };
+
+        self.pushes = self.slots.len() as u32;
+        if slots.is_empty() {
+            return;
+        }
+
+        let w = Self::new(slots, false, self.mmtk(), self.bucket);
+        self.worker().add_work(self.bucket, w);
     }
 }
 

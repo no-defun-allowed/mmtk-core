@@ -150,6 +150,9 @@ code_space  = []
 # Use with care.
 exec_permission_on_all_spaces = []
 
+# Edge enqueuing only
+edge_enqueuing = []
+
 # Global valid object (VO) bit metadata.
 # The VO bit is set when an object is allocated, and cleared when the GC determines it is dead.
 # It is useful for conservative garbage collection, including conservative stack scanning.
