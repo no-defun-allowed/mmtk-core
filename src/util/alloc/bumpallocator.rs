@@ -38,6 +38,7 @@ pub struct BumpPointer {
     pub cursor: Address,
     /// The upperbound of the allocation buffer.
     pub limit: Address,
+    pub real_limit: Address,
 }
 
 impl BumpPointer {
@@ -45,6 +46,19 @@ impl BumpPointer {
     pub fn reset(&mut self, start: Address, end: Address) {
         self.cursor = start;
         self.limit = end;
+        self.real_limit = end;
+    }
+
+    pub fn set_stress(&mut self, size: usize) {
+        self.limit = if self.cursor + size < self.real_limit {
+             self.cursor + size
+        } else {
+            self.real_limit
+        }
+    }
+
+    pub fn restore_stress(&mut self) {
+        self.limit = self.real_limit;
     }
 }
 
@@ -56,6 +70,7 @@ impl std::default::Default for BumpPointer {
         BumpPointer {
             cursor: Address::ZERO,
             limit: Address::ZERO,
+            real_limit: Address::ZERO,
         }
     }
 }
