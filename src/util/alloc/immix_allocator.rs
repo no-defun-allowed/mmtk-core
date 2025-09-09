@@ -42,13 +42,7 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
         self.request_for_large = false;
         self.line = None;
     }
-
-    fn sampling_factor(&self) -> usize {
-        *self.get_context().options.sampling_factor
-    }
 }
-
-const SAMPLE_HEADER_SIZE: usize = 8;
 
 impl<VM: VMBinding> Allocator<VM> for ImmixAllocator<VM> {
     fn get_space(&self) -> &'static dyn Space<VM> {
@@ -200,38 +194,22 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
         trace!("{:?}: overflow_alloc", self.tls);
         let start = align_allocation_no_fill::<VM>(self.large_bump_pointer.cursor, align, offset);
         let end = start + size;
-        if end <= self.large_bump_pointer.limit {
+        if end > self.large_bump_pointer.limit {
+            self.request_for_large = true;
+            let rtn = self.alloc_slow_inline(size, align, offset);
+            self.request_for_large = false;
+            rtn
+        } else {
             fill_alignment_gap::<VM>(self.large_bump_pointer.cursor, start);
             self.large_bump_pointer.cursor = end;
             start
-        } else {
-            let start = align_allocation_no_fill::<VM>(self.large_bump_pointer.cursor + SAMPLE_HEADER_SIZE, align, offset);
-            let end = start + size;
-            if end <= self.large_bump_pointer.real_limit {
-                fill_alignment_gap::<VM>(self.large_bump_pointer.cursor, start);
-                self.large_bump_pointer.cursor = end;
-                self.large_bump_pointer.set_stress(self.sampling_factor());
-                start
-            } else {
-                self.request_for_large = true;
-                let rtn = self.alloc_slow_inline(size + SAMPLE_HEADER_SIZE, align, offset);
-                self.request_for_large = false;
-                rtn
-            }
         }
     }
 
     /// Bump allocate small objects into recyclable lines (i.e. holes).
     fn alloc_slow_hot(&mut self, size: usize, align: usize, offset: usize) -> Address {
         trace!("{:?}: alloc_slow_hot", self.tls);
-        let start = align_allocation_no_fill::<VM>(self.bump_pointer.cursor + SAMPLE_HEADER_SIZE, align, offset);
-        let end = start + size;
-        if end <= self.bump_pointer.real_limit {
-            fill_alignment_gap::<VM>(self.bump_pointer.cursor, start);
-            self.bump_pointer.cursor = end;
-            self.bump_pointer.set_stress(self.sampling_factor());
-            start
-        } else if self.acquire_recyclable_lines(size, align, offset) {
+        if self.acquire_recyclable_lines(size, align, offset) {
             // If stress test is active, then we need to go to the slow path instead of directly
             // calling `alloc()`. This is because the `acquire_recyclable_lines()` function
             // manipulates the cursor and limit if a line can be recycled and if we directly call
@@ -261,7 +239,8 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
             if let Some((start_line, end_line)) = self.immix_space().get_next_available_lines(line)
             {
                 // Find recyclable lines. Update the bump allocation cursor and limit.
-                self.bump_pointer.reset(start_line.start(), end_line.start());
+                self.bump_pointer.cursor = start_line.start();
+                self.bump_pointer.limit = end_line.start();
                 trace!(
                     "{:?}: acquire_recyclable_lines -> {:?} [{:?}, {:?}) {:?}",
                     self.tls,
@@ -278,7 +257,6 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                     align_allocation_no_fill::<VM>(self.bump_pointer.cursor, align, offset) + size
                         <= self.bump_pointer.limit
                 );
-                self.bump_pointer.set_stress(self.sampling_factor());
                 let block = line.block();
                 self.line = if end_line == block.end_line() {
                     // Hole searching reached the end of a reusable block. Set the hole-searching cursor to None.
@@ -328,13 +306,13 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
                 Line::MARK_TABLE
                     .bzero_metadata(block.start(), crate::policy::immix::block::Block::BYTES);
                 if self.request_for_large {
-                    self.large_bump_pointer.reset(block.start(), block.end());
-                    self.large_bump_pointer.set_stress(self.sampling_factor());
+                    self.large_bump_pointer.cursor = block.start();
+                    self.large_bump_pointer.limit = block.end();
                 } else {
-                    self.bump_pointer.reset(block.start(), block.end());
-                    self.bump_pointer.set_stress(self.sampling_factor());
+                    self.bump_pointer.cursor = block.start();
+                    self.bump_pointer.limit = block.end();
                 }
-                self.alloc(size + SAMPLE_HEADER_SIZE, align, offset)
+                self.alloc(size, align, offset)
             }
         }
     }
@@ -366,9 +344,34 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
     /// thread local buffer size, which should be always smaller than the bump cursor. This method
     /// may be reentrant. We need to check before setting the values.
     fn set_limit_for_stress(&mut self) {
-        let factor = *self.get_context().options.analysis_factor;
-        self.bump_pointer.set_stress(factor);
-        self.large_bump_pointer.set_stress(factor);
+        if self.bump_pointer.cursor < self.bump_pointer.limit {
+            let old_limit = self.bump_pointer.limit;
+            let new_limit =
+                unsafe { Address::from_usize(self.bump_pointer.limit - self.bump_pointer.cursor) };
+            self.bump_pointer.limit = new_limit;
+            trace!(
+                "{:?}: set_limit_for_stress. normal c {} l {} -> {}",
+                self.tls,
+                self.bump_pointer.cursor,
+                old_limit,
+                new_limit,
+            );
+        }
+
+        if self.large_bump_pointer.cursor < self.large_bump_pointer.limit {
+            let old_lg_limit = self.large_bump_pointer.limit;
+            let new_lg_limit = unsafe {
+                Address::from_usize(self.large_bump_pointer.limit - self.large_bump_pointer.cursor)
+            };
+            self.large_bump_pointer.limit = new_lg_limit;
+            trace!(
+                "{:?}: set_limit_for_stress. large c {} l {} -> {}",
+                self.tls,
+                self.large_bump_pointer.cursor,
+                old_lg_limit,
+                new_lg_limit,
+            );
+        }
     }
 
     /// Restore the real limits for the bump allocation so we can properly do a thread local
@@ -376,7 +379,31 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
     /// actual limit from the size and the cursor. This method may be reentrant. We need to check
     /// before setting the values.
     fn restore_limit_for_stress(&mut self) {
-        self.bump_pointer.restore_stress();
-        self.large_bump_pointer.restore_stress();
+        if self.bump_pointer.limit < self.bump_pointer.cursor {
+            let old_limit = self.bump_pointer.limit;
+            let new_limit = self.bump_pointer.cursor + self.bump_pointer.limit.as_usize();
+            self.bump_pointer.limit = new_limit;
+            trace!(
+                "{:?}: restore_limit_for_stress. normal c {} l {} -> {}",
+                self.tls,
+                self.bump_pointer.cursor,
+                old_limit,
+                new_limit,
+            );
+        }
+
+        if self.large_bump_pointer.limit < self.large_bump_pointer.cursor {
+            let old_lg_limit = self.large_bump_pointer.limit;
+            let new_lg_limit =
+                self.large_bump_pointer.cursor + self.large_bump_pointer.limit.as_usize();
+            self.large_bump_pointer.limit = new_lg_limit;
+            trace!(
+                "{:?}: restore_limit_for_stress. large c {} l {} -> {}",
+                self.tls,
+                self.large_bump_pointer.cursor,
+                old_lg_limit,
+                new_lg_limit,
+            );
+        }
     }
 }

@@ -89,6 +89,15 @@ impl<VM: VMBinding> BumpAllocator<VM> {
         self.reset();
         self.space = space;
     }
+
+    fn sampling_factor(&self) -> usize {
+        *self.context.options.sampling_factor
+    }
+
+    fn is_mutator(&self) -> bool {
+        use crate::vm::ActivePlan;
+        VM::VMActivePlan::is_mutator(self.tls)
+    }
 }
 
 use crate::util::alloc::allocator::align_allocation_no_fill;
@@ -119,8 +128,20 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
         let new_cursor = result + size;
 
         if new_cursor > self.bump_pointer.limit {
+            use crate::util::constants::BYTES_IN_WORD;
+            let result = align_allocation_no_fill::<VM>(self.bump_pointer.cursor + BYTES_IN_WORD, align, offset);
+            let new_cursor = result + size;
             trace!("Thread local buffer used up, go to alloc slow path");
-            self.alloc_slow(size, align, offset)
+            if new_cursor > self.bump_pointer.real_limit {
+                self.alloc_slow(size, align, offset)
+            } else {
+                fill_alignment_gap::<VM>(self.bump_pointer.cursor, result);
+                self.bump_pointer.cursor = new_cursor;
+                if self.is_mutator() {
+                    self.bump_pointer.set_stress(self.sampling_factor());
+                }
+                result
+            }
         } else {
             fill_alignment_gap::<VM>(self.bump_pointer.cursor, result);
             self.bump_pointer.cursor = new_cursor;
@@ -234,6 +255,9 @@ impl<VM: VMBinding> BumpAllocator<VM> {
             );
             if !stress_test {
                 self.set_limit(acquired_start, acquired_start + block_size);
+                if self.is_mutator() {
+                    self.bump_pointer.set_stress(self.sampling_factor());
+                }
                 self.alloc(size, align, offset)
             } else {
                 // For a stress test, we artificially make the fastpath fail by
