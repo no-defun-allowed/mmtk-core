@@ -94,6 +94,10 @@ impl<VM: VMBinding> BumpAllocator<VM> {
         *self.context.options.sampling_factor
     }
 
+    fn sampling_extra_word(&self) -> bool {
+        *self.context.options.sampling_word
+    }
+
     fn is_mutator(&self) -> bool {
         use crate::vm::ActivePlan;
         VM::VMActivePlan::is_mutator(self.tls)
@@ -129,7 +133,8 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
 
         if new_cursor > self.bump_pointer.limit {
             use crate::util::constants::BYTES_IN_WORD;
-            let result = align_allocation_no_fill::<VM>(self.bump_pointer.cursor + BYTES_IN_WORD, align, offset);
+            let extra = if self.sampling_extra_word() { BYTES_IN_WORD } else { 0 };
+            let result = align_allocation_no_fill::<VM>(self.bump_pointer.cursor + extra, align, offset);
             let new_cursor = result + size;
             trace!("Thread local buffer used up, go to alloc slow path");
             if new_cursor > self.bump_pointer.real_limit {
