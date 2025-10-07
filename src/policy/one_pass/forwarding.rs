@@ -134,6 +134,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         let mut state = Transducer::new();
         let first_block = Block::from_aligned_address(self.first_address);
         let last_block = Block::from_aligned_address(pr.cursor());
+        self.calculated.store(true, Ordering::Relaxed);
         for block in RegionIterator::<Block>::new(first_block, last_block) {
             OFFSET_VECTOR_SPEC.store_atomic::<usize>(
                 block.start(),
@@ -151,7 +152,6 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 },
             );
         }
-        self.calculated.store(true, Ordering::Relaxed);
     }
 
     pub fn release(&self) {

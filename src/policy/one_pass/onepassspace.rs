@@ -17,6 +17,7 @@ use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
 use crate::{vm::*, ObjectQueue};
 use atomic::Ordering;
+use std::collections::HashMap;
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
 pub(crate) const TRACE_KIND_FORWARD_ROOT: TraceKind = 1;
@@ -282,18 +283,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         ObjectReference::from_raw_address(self.forwarding.forward(object.to_raw_address())).unwrap()
     }
 
-    fn heap_span(&self) -> (Address, Address) {
-        (self.forwarding.first_address, self.pr.cursor())
-    }
-
     pub fn compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
-        todo!();
-        let mut to = Address::ZERO;
-        // The allocator will never cause an object to span multiple regions,
-        // but the Compressor may move an object to span multiple regions.
-        // Thus we must treat all regions as one contiguous space when
-        // walking the mark bitmap.
-        let (start, end) = self.heap_span();
         #[cfg(feature = "vo_bit")]
         {
             #[cfg(debug_assertions)]
@@ -309,19 +299,31 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 crate::util::metadata::vo_bit::bzero_vo_bit(region_start, size);
             }
         }
-        let update_references = &mut |object: ObjectReference| {
+        type SlotTable<VM> = HashMap<ObjectReference, Vec<<VM as VMBinding>::VMSlot>>;
+        let mut to = Address::ZERO;
+        let add_forwards_slot = &mut |forwards_slots: &mut SlotTable<VM>, object: ObjectReference, s: VM::VMSlot| {
+            if let Option::Some(v) = forwards_slots.get_mut(&object) {
+                v.push(s);
+            } else {
+                forwards_slots.insert(object, vec![s]);
+            }
+        };
+        let update_references = &mut |forwards_slots: &mut SlotTable<VM>, object: ObjectReference| {
             if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
                 VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
                     if let Some(o) = s.load() {
-                        s.store(self.forward(o, false));
+                        if o <= object {
+                            s.store(self.forward(o, false));
+                        } else {
+                            add_forwards_slot(forwards_slots, o, s);
+                        }
                     }
                 });
             } else {
-                VM::VMScanning::scan_object_and_trace_edges(worker.tls, object, &mut |o| {
-                    self.forward(o, false)
-                });
+                panic!("nah I've really got to look at slots here");
             }
         };
+        let mut forwards_slots: SlotTable<VM> = HashMap::new();
         self.forwarding
             .calculate_offset_vector(&self.pr, &mut |obj: ObjectReference| {
                 // We set the end bits based on the sizes of objects when they are
@@ -344,11 +346,16 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 vo_bit::set_vo_bit(new_object);
                 to = new_object.to_object_start::<VM>() + copied_size;
                 debug_assert_eq!(end_of_new_object, to);
-                update_references(new_object);
+                update_references(&mut forwards_slots, new_object);
+                if let Option::Some(v) = forwards_slots.get(&obj) {
+                    for slot in v {
+                        slot.store(new_object)
+                    }
+                }
             });
         // Update references from the LOS to Compressor too.
         los.enumerate_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
-            update_references,
+            &mut |o| update_references(&mut forwards_slots, o),
         ));
         debug!("Compact end: to = {}", to);
         // reset the bump pointer

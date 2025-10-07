@@ -96,11 +96,13 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
         scheduler.work_buckets[WorkBucketStage::Prepare]
             .add(Prepare::<OnePassWorkContext<VM>>::new(self));
 
+        // Well, yes, but no.
+        scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
+            .add(Compact::<VM>::new(&self.op_space, &self.common.los));
+        
         // do another trace to update references
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
-        scheduler.work_buckets[WorkBucketStage::Compact]
-            .add(Compact::<VM>::new(&self.op_space, &self.common.los));
-
+        
         // Release global/collectors/mutators
         scheduler.work_buckets[WorkBucketStage::Release]
             .add(Release::<OnePassWorkContext<VM>>::new(self));
