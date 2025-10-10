@@ -267,6 +267,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         if !self.in_space(object) {
             return object;
         }
+        let ret = ObjectReference::from_raw_address(self.forwarding.forward(object.to_raw_address())).unwrap();
         // We can't expect the VO bit to be valid whilst in the compaction loop.
         // If we are fixing a reference to an object which precedes the referent
         // the VO bit will have been cleared already.
@@ -275,17 +276,19 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         #[cfg(feature = "vo_bit")]
         if _vo_bit_valid {
             debug_assert!(
-                crate::util::metadata::vo_bit::is_vo_bit_set(object),
+                crate::util::metadata::vo_bit::is_vo_bit_set(ret),
                 "{:x}: VO bit not set",
                 object
             );
         }
-        ObjectReference::from_raw_address(self.forwarding.forward(object.to_raw_address())).unwrap()
+        ret
     }
 
     pub fn compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
         #[cfg(feature = "vo_bit")]
         {
+            let start = self.forwarding.first_address;
+            let end = self.pr.cursor();
             #[cfg(debug_assertions)]
             self.forwarding
                 .scan_marked_objects(start, end, &mut |object: ObjectReference| {
@@ -299,23 +302,26 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 crate::util::metadata::vo_bit::bzero_vo_bit(region_start, size);
             }
         }
-        type SlotTable<VM> = HashMap<ObjectReference, Vec<<VM as VMBinding>::VMSlot>>;
-        let mut to = Address::ZERO;
-        let add_forwards_slot = &mut |forwards_slots: &mut SlotTable<VM>, object: ObjectReference, s: VM::VMSlot| {
+        type SlotTable<VM> = HashMap<ObjectReference, Vec<(ObjectReference, <VM as VMBinding>::VMSlot)>>;
+        let add_forwards_slot = &mut |forwards_slots: &mut SlotTable<VM>, object: ObjectReference, source: ObjectReference, s: VM::VMSlot| {
             if let Option::Some(v) = forwards_slots.get_mut(&object) {
-                v.push(s);
+                v.push((source, s));
             } else {
-                forwards_slots.insert(object, vec![s]);
+                forwards_slots.insert(object, vec![(source, s)]);
             }
         };
-        let update_references = &mut |forwards_slots: &mut SlotTable<VM>, object: ObjectReference| {
+        let thread_references = &mut |forwards_slots: &mut SlotTable<VM>, object: ObjectReference, old: ObjectReference| {
             if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
                 VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
                     if let Some(o) = s.load() {
-                        if o <= object {
-                            s.store(self.forward(o, false));
-                        } else {
-                            add_forwards_slot(forwards_slots, o, s);
+                        if self.in_space(o) {
+                            if o > old {
+                                trace!("threading {o}");
+                                add_forwards_slot(forwards_slots, o, object, s);
+                            } else {
+                                trace!("forwarding {o} to {}", self.forward(o, true));
+                                s.store(self.forward(o, true));
+                            }
                         }
                     }
                 });
@@ -323,7 +329,20 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 panic!("nah I've really got to look at slots here");
             }
         };
+        let update_references = &mut |object: ObjectReference| {
+            if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
+                VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
+                    if let Some(o) = s.load() {
+                            trace!("forwarding {o} to {}", self.forward(o, true));
+                            s.store(self.forward(o, true));
+                    }
+                });
+            } else {
+                panic!("nah I've really got to look at slots here");
+            }
+        };
         let mut forwards_slots: SlotTable<VM> = HashMap::new();
+        let mut to = Address::ZERO;
         self.forwarding
             .calculate_offset_vector(&self.pr, &mut |obj: ObjectReference| {
                 // We set the end bits based on the sizes of objects when they are
@@ -333,6 +352,14 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
                 debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
                 let new_object = self.forward(obj, false);
+                if let Option::Some(v) = forwards_slots.get(&obj) {
+                    for (source, slot) in v {
+                        debug_assert!(*source < obj, "The source object {source} should be before the target {obj}");
+                        debug_assert!(slot.load() == Some(obj));
+                        slot.store(new_object)
+                    }
+                }
+                forwards_slots.remove(&obj);
                 debug_assert!(
                     new_object.to_raw_address() >= to,
                     "{0} < {to}",
@@ -346,17 +373,13 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 vo_bit::set_vo_bit(new_object);
                 to = new_object.to_object_start::<VM>() + copied_size;
                 debug_assert_eq!(end_of_new_object, to);
-                update_references(&mut forwards_slots, new_object);
-                if let Option::Some(v) = forwards_slots.get(&obj) {
-                    for slot in v {
-                        slot.store(new_object)
-                    }
-                }
+                thread_references(&mut forwards_slots, new_object, obj);
             });
         // Update references from the LOS to Compressor too.
         los.enumerate_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
-            &mut |o| update_references(&mut forwards_slots, o),
+            update_references
         ));
+        assert_eq!(forwards_slots.len(), 0, "Should not have to forward any more slots");
         debug!("Compact end: to = {}", to);
         // reset the bump pointer
         self.pr.reset_cursor(to);

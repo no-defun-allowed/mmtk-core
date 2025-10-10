@@ -177,6 +177,17 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         self.first_address + state.live
     }
 
+    #[cfg(debug_assertions)]
+    pub fn scan_marked_objects(&self, start: Address, end: Address, f: &mut impl FnMut(ObjectReference)) {
+        let mut in_object = false;
+        MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
+            in_object = !in_object;
+            if in_object {
+                f(ObjectReference::from_raw_address(addr).unwrap())
+            }
+        });
+    }
+
     pub fn has_calculated_forwarding_addresses(&self) -> bool {
         self.calculated.load(Ordering::Relaxed)
     }
