@@ -1,7 +1,7 @@
 use super::global::OnePass;
-use crate::policy::one_pass::OnePassSpace;
-use crate::policy::one_pass::{TRACE_KIND_FORWARD_ROOT, TRACE_KIND_MARK};
 use crate::policy::largeobjectspace::LargeObjectSpace;
+use crate::policy::one_pass::{Counters, OnePassSpace};
+use crate::policy::one_pass::{TRACE_KIND_FORWARD_ROOT, TRACE_KIND_MARK};
 use crate::scheduler::gc_work::PlanProcessEdges;
 use crate::scheduler::gc_work::*;
 use crate::scheduler::GCWork;
@@ -55,11 +55,12 @@ impl<VM: VMBinding> UpdateReferences<VM> {
 pub struct Compact<VM: VMBinding> {
     op_space: &'static OnePassSpace<VM>,
     los: &'static LargeObjectSpace<VM>,
+    counters: &'static Counters,
 }
 
 impl<VM: VMBinding> GCWork<VM> for Compact<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.op_space.compact(worker, self.los);
+        self.op_space.compact(worker, self.los, self.counters);
     }
 }
 
@@ -67,10 +68,12 @@ impl<VM: VMBinding> Compact<VM> {
     pub fn new(
         op_space: &'static OnePassSpace<VM>,
         los: &'static LargeObjectSpace<VM>,
+        counters: &'static Counters,
     ) -> Self {
         Self {
             op_space,
             los,
+            counters,
         }
     }
 }

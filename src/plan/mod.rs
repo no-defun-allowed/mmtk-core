@@ -48,8 +48,8 @@ mod compressor;
 mod immix;
 mod markcompact;
 mod marksweep;
-mod one_pass;
 mod nogc;
+mod one_pass;
 mod pageprotect;
 mod semispace;
 

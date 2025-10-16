@@ -86,6 +86,9 @@ pub trait Slot: Copy + Send + Debug + PartialEq + Eq + Hash {
     fn prefetch_store(&self) {
         // no-op by default
     }
+
+    fn as_address(&self) -> Address;
+    fn from_address(address: Address) -> Self;
 }
 
 /// A simple slot implementation that represents a word-sized slot which holds the raw address of
@@ -98,25 +101,6 @@ pub struct SimpleSlot {
     slot_addr: *mut Atomic<Address>,
 }
 
-impl SimpleSlot {
-    /// Create a simple slot from an address.
-    ///
-    /// Arguments:
-    /// *   `address`: The address in memory where an `ObjectReference` is stored.
-    pub fn from_address(address: Address) -> Self {
-        Self {
-            slot_addr: address.to_mut_ptr(),
-        }
-    }
-
-    /// Get the address of the slot.
-    ///
-    /// Return the address at which the `ObjectReference` is stored.
-    pub fn as_address(&self) -> Address {
-        Address::from_mut_ptr(self.slot_addr)
-    }
-}
-
 unsafe impl Send for SimpleSlot {}
 
 impl Slot for SimpleSlot {
@@ -127,6 +111,23 @@ impl Slot for SimpleSlot {
 
     fn store(&self, object: ObjectReference) {
         unsafe { (*self.slot_addr).store(object.to_raw_address(), atomic::Ordering::Relaxed) }
+    }
+
+    /// Create a simple slot from an address.
+    ///
+    /// Arguments:
+    /// *   `address`: The address in memory where an `ObjectReference` is stored.
+    fn from_address(address: Address) -> Self {
+        Self {
+            slot_addr: address.to_mut_ptr(),
+        }
+    }
+
+    /// Get the address of the slot.
+    ///
+    /// Return the address at which the `ObjectReference` is stored.
+    fn as_address(&self) -> Address {
+        Address::from_mut_ptr(self.slot_addr)
     }
 }
 
@@ -148,6 +149,13 @@ impl Slot for Address {
 
     fn store(&self, object: ObjectReference) {
         unsafe { Address::store(*self, object) }
+    }
+
+    fn from_address(address: Address) -> Self {
+        address
+    }
+    fn as_address(&self) -> Address {
+        *self
     }
 }
 

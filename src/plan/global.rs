@@ -61,9 +61,7 @@ pub fn create_mutator<VM: VMBinding>(
         PlanSelector::Compressor => {
             crate::plan::compressor::mutator::create_compressor_mutator(tls, mmtk)
         }
-        PlanSelector::OnePass => {
-            crate::plan::one_pass::mutator::create_onepass_mutator(tls, mmtk)
-        }
+        PlanSelector::OnePass => crate::plan::one_pass::mutator::create_onepass_mutator(tls, mmtk),
     })
 }
 

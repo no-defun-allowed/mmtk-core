@@ -1,16 +1,14 @@
 use super::gc_work::OnePassWorkContext;
-use super::gc_work::{
-    Compact, ForwardingProcessEdges, MarkingProcessEdges, UpdateReferences,
-};
-use crate::plan::one_pass::mutator::ALLOCATOR_MAPPING;
+use super::gc_work::{Compact, ForwardingProcessEdges, MarkingProcessEdges, UpdateReferences};
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
 use crate::plan::global::{BasePlan, CommonPlan};
+use crate::plan::one_pass::mutator::ALLOCATOR_MAPPING;
 use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
 use crate::plan::AllocationSemantics;
 use crate::plan::Plan;
 use crate::plan::PlanConstraints;
-use crate::policy::one_pass::OnePassSpace;
+use crate::policy::one_pass::{Counters, OnePassSpace};
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
 use crate::scheduler::GCWorkScheduler;
@@ -34,6 +32,7 @@ pub struct OnePass<VM: VMBinding> {
     pub common: CommonPlan<VM>,
     #[space]
     pub op_space: OnePassSpace<VM>,
+    pub counters: Counters,
 }
 
 /// The plan constraints for the OnePass plan.
@@ -97,12 +96,15 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
             .add(Prepare::<OnePassWorkContext<VM>>::new(self));
 
         // Well, yes, but no.
-        scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
-            .add(Compact::<VM>::new(&self.op_space, &self.common.los));
-        
+        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(Compact::<VM>::new(
+            &self.op_space,
+            &self.common.los,
+            &self.counters,
+        ));
+
         // do another trace to update references
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
-        
+
         // Release global/collectors/mutators
         scheduler.work_buckets[WorkBucketStage::Release]
             .add(Release::<OnePassWorkContext<VM>>::new(self));
@@ -174,6 +176,7 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
 
 impl<VM: VMBinding> OnePass<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
+        let stats = args.stats;
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &ONE_PASS_CONSTRAINTS,
@@ -188,6 +191,7 @@ impl<VM: VMBinding> OnePass<VM> {
                 VMRequest::discontiguous(),
             )),
             common: CommonPlan::new(plan_args),
+            counters: Counters::new(stats),
         };
 
         res.verify_side_metadata_sanity();

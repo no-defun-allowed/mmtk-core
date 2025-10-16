@@ -95,6 +95,11 @@ impl Region for Block {
     }
 }
 
+#[inline(always)]
+pub fn block_number(a: ObjectReference) -> usize {
+    a.to_raw_address().as_usize() >> Block::LOG_BYTES
+}
+
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
 
@@ -130,10 +135,28 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         MARK_SPEC.fetch_or_atomic(last_word_of_object, GC_MARK_BIT_MASK, Ordering::SeqCst);
     }
 
-    pub fn calculate_offset_vector(&self, pr: &MonotonePageResource<VM>, f: &mut impl FnMut(ObjectReference)) {
+    pub fn calculate_offset_vector(
+        &self,
+        pr: &MonotonePageResource<VM>,
+        f: &mut impl FnMut(ObjectReference),
+    ) {
         let mut state = Transducer::new();
         let first_block = Block::from_aligned_address(self.first_address);
         let last_block = Block::from_aligned_address(pr.cursor());
+        /*
+        {
+            use crate::util::metadata::side_metadata::helpers::address_to_meta_address;
+            use std::fs::File;
+            use std::io::Write;
+            let first_meta = address_to_meta_address(&MARK_SPEC, self.first_address).as_usize();
+            let last_meta = address_to_meta_address(&MARK_SPEC, pr.cursor()).as_usize();
+            let mut f = File::create("/tmp/hayleyp/fop-marks").unwrap();
+            let bytes = (first_meta..last_meta)
+                .map(|n| unsafe { Address::from_usize(n).load::<u8>() })
+                .collect::<Vec<u8>>();
+            f.write(&bytes).unwrap();
+        }
+        */
         self.calculated.store(true, Ordering::Relaxed);
         for block in RegionIterator::<Block>::new(first_block, last_block) {
             OFFSET_VECTOR_SPEC.store_atomic::<usize>(
@@ -177,8 +200,13 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         self.first_address + state.live
     }
 
-    #[cfg(debug_assertions)]
-    pub fn scan_marked_objects(&self, start: Address, end: Address, f: &mut impl FnMut(ObjectReference)) {
+    #[cfg(all(debug_assertions, feature = "vo_bit"))]
+    pub fn scan_marked_objects(
+        &self,
+        start: Address,
+        end: Address,
+        f: &mut impl FnMut(ObjectReference),
+    ) {
         let mut in_object = false;
         MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
             in_object = !in_object;

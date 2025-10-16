@@ -51,7 +51,7 @@ impl BumpPointer {
 
     pub fn set_stress(&mut self, size: usize) {
         self.limit = if self.cursor + size < self.real_limit {
-             self.cursor + size
+            self.cursor + size
         } else {
             self.real_limit
         }
@@ -133,8 +133,13 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
 
         if new_cursor > self.bump_pointer.limit {
             use crate::util::constants::BYTES_IN_WORD;
-            let extra = if self.sampling_extra_word() { BYTES_IN_WORD } else { 0 };
-            let result = align_allocation_no_fill::<VM>(self.bump_pointer.cursor + extra, align, offset);
+            let extra = if self.sampling_extra_word() {
+                BYTES_IN_WORD
+            } else {
+                0
+            };
+            let result =
+                align_allocation_no_fill::<VM>(self.bump_pointer.cursor + extra, align, offset);
             let new_cursor = result + size;
             trace!("Thread local buffer used up, go to alloc slow path");
             if new_cursor > self.bump_pointer.real_limit {
