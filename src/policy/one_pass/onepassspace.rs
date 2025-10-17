@@ -193,6 +193,7 @@ pub struct Counters {
     hashmap_size: Arc<Mutex<EventCounter>>,
     threaded: Arc<Mutex<EventCounter>>,
     seen: Arc<Mutex<EventCounter>>,
+    distances: Vec<Arc<Mutex<EventCounter>>>,
 }
 impl Counters {
     pub fn new(stats: &Stats) -> Self {
@@ -200,6 +201,7 @@ impl Counters {
             hashmap_size: stats.new_event_counter("hashmap_size", true, true),
             threaded: stats.new_event_counter("threaded", true, true),
             seen: stats.new_event_counter("seen", true, true),
+            distances: (0..48).map(|v| stats.new_event_counter(&format!("distance.{v}"), true, true)).collect(),
         }
     }
 }
@@ -343,6 +345,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             };
         let mut seen: u64 = 0;
         let mut threaded: u64 = 0;
+        let mut local_counters: Vec<u64> = counters.distances.iter().map(|_| 0).collect();
         let thread_references = &mut |forwards_slots: &mut SlotTable<VM>,
                                       object: ObjectReference,
                                       old: ObjectReference| {
@@ -351,6 +354,10 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                     if let Some(o) = s.load() {
                         if self.in_space(o) {
                             seen += 1;
+                            if o > old {
+                                let bits = (o.to_raw_address().as_usize() ^ s.as_address().as_usize()).ilog2();
+                                local_counters[bits as usize] += 1;
+                            }
                             if forwarding::block_number(o) > forwarding::block_number(old) {
                                 threaded += 1;
                                 trace!("threading {o}");
@@ -433,6 +440,9 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             .inc_by(max_size);
         counters.threaded.clone().lock().unwrap().inc_by(threaded);
         counters.seen.clone().lock().unwrap().inc_by(seen);
+        for (local, global) in std::iter::zip(local_counters.iter(), counters.distances.iter()) {
+            global.clone().lock().unwrap().inc_by(*local);
+        }
         //println!("{threaded} / {seen} = {:.2}%", 100.0 * threaded as f64 / seen as f64);
         //println!("HashMap had {max_size} maximum entries");
         // reset the bump pointer
