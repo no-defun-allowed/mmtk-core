@@ -216,17 +216,19 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         let local_specs = extract_side_metadata(&[
             MetadataSpec::OnSide(forwarding::MARK_SPEC),
             MetadataSpec::OnSide(forwarding::OFFSET_VECTOR_SPEC),
+            MetadataSpec::OnSide(forwarding::SELECTED_SPEC),
         ]);
         let is_discontiguous = args.vmrequest.is_discontiguous();
         let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
+        let percent = *common.options.compressor_compact_max_percent;
         CompressorSpace {
             pr: if is_discontiguous {
                 RegionPageResource::new_discontiguous(vm_map)
             } else {
                 RegionPageResource::new_contiguous(common.start, common.extent, vm_map)
             },
-            forwarding: forwarding::ForwardingMetadata::new(),
+            forwarding: forwarding::ForwardingMetadata::new(percent),
             common,
             scheduler,
         }
@@ -319,6 +321,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         if !self.in_space(object) {
             return object;
         }
+
         // We can't expect the VO bit to be valid whilst compacting the heap.
         // If we are fixing a reference to an object which was moved before the referent,
         // the relevant VO bit will have been cleared, and this assertion would fail.
@@ -373,32 +376,38 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 crate::util::metadata::vo_bit::bzero_vo_bit(start, end - start);
             }
             let mut to = start;
-            self.forwarding
-                .scan_marked_objects(start, end, &mut |obj: ObjectReference| {
-                    // We set the end bits based on the sizes of objects when they are
-                    // marked, and we compute the live data and thus the forwarding
-                    // addresses based on those sizes. The forwarding addresses would be
-                    // incorrect if the sizes of objects were to change.
-                    let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
-                    debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
-                    let new_object = self.forward(obj, false);
-                    debug_assert!(
-                        new_object.to_raw_address() >= to,
-                        "whilst forwarding {obj}, the new address {0} should be after the end of the last object {to}",
-                        new_object.to_raw_address()
-                    );
-                    // copy object
-                    trace!(" copy from {} to {}", obj, new_object);
-                    let end_of_new_object =
-                        VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
-                    // update VO bit
-                    #[cfg(feature = "vo_bit")]
-                    vo_bit::set_vo_bit(new_object);
-                    to = new_object.to_object_start::<VM>() + copied_size;
-                    debug_assert_eq!(end_of_new_object, to);
-                    self.update_references(worker, new_object);
+            if self.forwarding.is_forwarding_region(r.region) {
+                self.forwarding
+                    .scan_marked_objects(start, end, &mut |obj: ObjectReference| {
+                        // We set the end bits based on the sizes of objects when they are
+                        // marked, and we compute the live data and thus the forwarding
+                        // addresses based on those sizes. The forwarding addresses would be
+                        // incorrect if the sizes of objects were to change.
+                        let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
+                        debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
+                        let new_object = self.forward(obj, false);
+                        debug_assert!(
+                            new_object.to_raw_address() >= to,
+                            "whilst forwarding {obj}, the new address {0} should be after the end of the last object {to}",
+                            new_object.to_raw_address()
+                        );
+                        // copy object
+                        trace!(" copy from {} to {}", obj, new_object);
+                        let end_of_new_object =
+                            VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
+                        // update VO bit
+                        #[cfg(feature = "vo_bit")]
+                        vo_bit::set_vo_bit(new_object);
+                        to = new_object.to_object_start::<VM>() + copied_size;
+                        debug_assert_eq!(end_of_new_object, to);
+                        self.update_references(worker, new_object);
+                    });
+                self.pr.reset_cursor(r, to);
+            } else {
+                self.forwarding.scan_marked_objects(start, end, &mut |obj: ObjectReference| {
+                    self.update_references(worker, obj);
                 });
-            self.pr.reset_cursor(r, to);
+            }
         });
     }
 

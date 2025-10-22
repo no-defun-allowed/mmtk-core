@@ -1,7 +1,7 @@
 use crate::policy::compressor::GC_MARK_BIT_MASK;
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::{Region, RegionIterator};
-use crate::util::metadata::side_metadata::spec_defs::{COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR};
+use crate::util::metadata::side_metadata::spec_defs::{COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED};
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::util::{Address, ObjectReference};
 use crate::vm::object_model::ObjectModel;
@@ -93,6 +93,7 @@ impl Transducer {
 }
 
 pub struct ForwardingMetadata<VM: VMBinding> {
+    max_compact_percent: usize,
     calculated: AtomicBool,
     vm: PhantomData<VM>,
 }
@@ -115,10 +116,12 @@ impl Region for Block {
 
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
+pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
-    pub fn new() -> ForwardingMetadata<VM> {
+    pub fn new(max_compact_percent: usize) -> ForwardingMetadata<VM> {
         ForwardingMetadata {
+            max_compact_percent,
             calculated: AtomicBool::new(false),
             vm: PhantomData,
         }
@@ -166,17 +169,30 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             );
         }
         self.calculated.store(true, Ordering::Relaxed);
+        let percent = (state.to - region.start()) / (CompressorRegion::BYTES / 100);
+        SELECTED_SPEC.store_atomic::<u8>(
+            region.start(),
+            (percent < self.max_compact_percent) as u8,
+             Ordering::Relaxed,
+            );
     }
 
     pub fn release(&self) {
         self.calculated.store(false, Ordering::Relaxed);
     }
 
+        pub fn is_forwarding_region(&self, region: CompressorRegion) -> bool {
+            SELECTED_SPEC.load_atomic::<u8>(region.start(), Ordering::Relaxed) != 0
+        }
+
     pub fn forward(&self, address: Address) -> Address {
         debug_assert!(
             self.calculated.load(Ordering::Relaxed),
             "forward() should only be called when we have calculated an offset vector"
         );
+        if SELECTED_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) == 0 {
+            return address;
+        }
         let block = Block::from_unaligned_address(address);
         let mut state = Transducer::decode(
             OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
