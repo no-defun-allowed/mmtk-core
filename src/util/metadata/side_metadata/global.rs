@@ -1247,6 +1247,54 @@ impl SideMetadataSpec {
             &mut visitor,
         );
     }
+
+    pub fn scan_words(
+        &self,
+        data_start_addr: Address,
+        data_end_addr: Address,
+        visit_word: &mut impl FnMut(usize, Address),
+    ) {
+        debug_assert!(self.uses_contiguous_side_metadata());
+        let start_meta_addr = address_to_contiguous_meta_address(self, data_start_addr);
+        let start_meta_shift = meta_byte_lshift(self, data_start_addr);
+        let end_meta_addr = address_to_contiguous_meta_address(self, data_end_addr);
+        let end_meta_shift = meta_byte_lshift(self, data_end_addr);
+
+        let mut visit_bytes = |start: Address, end: Address| {
+            ranges::break_byte_range(
+                start,
+                end,
+                &mut |_| panic!("no (byte edition)"),
+                &mut |range| {
+                    let start = range.start.as_usize();
+                    let end = range.end.as_usize();
+                    for a in (start..end).step_by(crate::util::constants::BYTES_IN_ADDRESS) {
+                        let meta = unsafe { Address::from_usize(a) };
+                        let addr = contiguous_meta_address_to_address(self, meta, 0);
+                        let word = unsafe { meta.load::<usize>() };
+                        visit_word(word, addr);
+                    }
+                },
+            );
+        };
+
+        ranges::break_bit_range(
+            start_meta_addr,
+            start_meta_shift,
+            end_meta_addr,
+            end_meta_shift,
+            true,
+            &mut |range| {
+                match range {
+                    BitByteRange::Bytes { start, end } => {
+                        visit_bytes(start, end);
+                    }
+                    BitByteRange::BitsInByte { .. } => panic!("no"),
+                }
+                false
+            },
+        );
+    }
 }
 
 impl fmt::Debug for SideMetadataSpec {

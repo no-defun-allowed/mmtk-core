@@ -1,7 +1,9 @@
 use crate::policy::compressor::GC_MARK_BIT_MASK;
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::{Region, RegionIterator};
-use crate::util::metadata::side_metadata::spec_defs::{COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED};
+use crate::util::metadata::side_metadata::spec_defs::{
+    COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
+};
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::util::{Address, ObjectReference};
 use crate::vm::object_model::ObjectModel;
@@ -150,7 +152,40 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         MARK_SPEC.fetch_or_atomic(last_word_of_object, GC_MARK_BIT_MASK, Ordering::SeqCst);
     }
 
-    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
+    #[target_feature(enable = "pclmulqdq,popcnt")]
+    unsafe fn clmul_inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
+        use std::arch::x86_64;
+        // encode state to offset vector
+        let encoded = (*to).as_usize() + ((*in_object as usize) >> 63);
+        OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
+        // update by clmul
+        let ones = unsafe { x86_64::_mm_set1_epi8(0xFFu8 as i8) };
+        let vector = unsafe { x86_64::_mm_set_epi64x(0, word as i64) };
+        let mask: i64 =
+            unsafe { x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0)) };
+        let flipped = mask ^ *in_object;
+        *in_object = flipped >> 63;
+        *to += (((flipped as usize | word).count_ones()) * 8) as usize;
+    }
+
+    unsafe fn calculate_offset_vector_clmul(
+        &self,
+        region: CompressorRegion,
+        cursor: Address,
+    ) -> usize {
+        let mut to = region.start();
+        let mut in_object: i64 = 0;
+        MARK_SPEC.scan_words(
+            region.start(),
+            cursor.align_up(Block::BYTES),
+            &mut |word: usize, addr: Address| {
+                Self::clmul_inner(&mut to, &mut in_object, word, addr);
+            },
+        );
+        to - region.start()
+    }
+
+    fn calculate_offset_vector_base(&self, region: CompressorRegion, cursor: Address) -> usize {
         let mut state = Transducer::new(region.start());
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
@@ -168,22 +203,31 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 },
             );
         }
+        state.to - region.start()
+    }
+
+    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
+        let used = if is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt") {
+            unsafe { self.calculate_offset_vector_clmul(region, cursor) }
+        } else {
+            self.calculate_offset_vector_base(region, cursor)
+        };
         self.calculated.store(true, Ordering::Relaxed);
-        let percent = (state.to - region.start()) / (CompressorRegion::BYTES / 100);
+        let percent = used / (CompressorRegion::BYTES / 100);
         SELECTED_SPEC.store_atomic::<u8>(
             region.start(),
             (percent < self.max_compact_percent) as u8,
-             Ordering::Relaxed,
-            );
+            Ordering::Relaxed,
+        );
     }
 
     pub fn release(&self) {
         self.calculated.store(false, Ordering::Relaxed);
     }
 
-        pub fn is_forwarding_region(&self, region: CompressorRegion) -> bool {
-            SELECTED_SPEC.load_atomic::<u8>(region.start(), Ordering::Relaxed) != 0
-        }
+    pub fn is_forwarding_region(&self, region: CompressorRegion) -> bool {
+        SELECTED_SPEC.load_atomic::<u8>(region.start(), Ordering::Relaxed) != 0
+    }
 
     pub fn forward(&self, address: Address) -> Address {
         debug_assert!(
