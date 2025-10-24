@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 #[derive(Copy, Clone, PartialEq, PartialOrd)]
 pub(crate) struct CompressorRegion(Address);
 impl Region for CompressorRegion {
-    const LOG_BYTES: usize = 20; // 1 MiB
+    const LOG_BYTES: usize = 18; // 1 MiB
     fn from_aligned_address(address: Address) -> Self {
         assert!(
             address.is_aligned_to(Self::BYTES),
@@ -152,6 +152,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         MARK_SPEC.fetch_or_atomic(last_word_of_object, GC_MARK_BIT_MASK, Ordering::SeqCst);
     }
 
+    // SAFETY: Only call this function when the processor supports pclmulqdq and popcnt.
     #[target_feature(enable = "pclmulqdq,popcnt")]
     unsafe fn clmul_inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
         use std::arch::x86_64;
@@ -208,7 +209,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 
     pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
         let used = if is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt") {
-            unsafe { self.calculate_offset_vector_clmul(region, cursor) }
+            unsafe {
+                // SAFETY: We checked the processor supports the
+                // necessary instructions.
+                self.calculate_offset_vector_clmul(region, cursor)
+            }
         } else {
             self.calculate_offset_vector_base(region, cursor)
         };
