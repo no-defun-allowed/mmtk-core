@@ -153,34 +153,34 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 
     // SAFETY: Only call this function when the processor supports pclmulqdq and popcnt.
-    #[target_feature(enable = "pclmulqdq,popcnt")]
-    unsafe fn clmul_inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
-        use std::arch::x86_64;
-        // encode state to offset vector
-        let encoded = (*to).as_usize() + ((*in_object as usize) >> 63);
-        OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
-        // update by clmul
-        let ones = unsafe { x86_64::_mm_set1_epi8(0xFFu8 as i8) };
-        let vector = unsafe { x86_64::_mm_set_epi64x(0, word as i64) };
-        let mask: i64 =
-            unsafe { x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0)) };
-        let flipped = mask ^ *in_object;
-        *in_object = flipped >> 63;
-        *to += (((flipped as usize | word).count_ones()) * 8) as usize;
-    }
-
     unsafe fn calculate_offset_vector_clmul(
         &self,
         region: CompressorRegion,
         cursor: Address,
     ) -> usize {
+        #[target_feature(enable = "pclmulqdq,popcnt")]
+        unsafe fn inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
+            use std::arch::x86_64;
+            // encode state to offset vector
+            let encoded = (*to).as_usize() + ((*in_object as usize) >> 63);
+            OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
+            // update by clmul
+            let ones = unsafe { x86_64::_mm_set1_epi8(0xFFu8 as i8) };
+            let vector = unsafe { x86_64::_mm_set_epi64x(0, word as i64) };
+            let mask: i64 =
+                unsafe { x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0)) };
+            let flipped = mask ^ *in_object;
+            *in_object = flipped >> 63;
+            *to += (((flipped as usize | word).count_ones()) * 8) as usize;
+        }
+
         let mut to = region.start();
         let mut in_object: i64 = 0;
         MARK_SPEC.scan_words(
             region.start(),
             cursor.align_up(Block::BYTES),
             &mut |word: usize, addr: Address| {
-                Self::clmul_inner(&mut to, &mut in_object, word, addr);
+                inner(&mut to, &mut in_object, word, addr);
             },
         );
         to - region.start()
