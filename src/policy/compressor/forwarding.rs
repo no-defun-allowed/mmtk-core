@@ -163,7 +163,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             use std::arch::x86_64;
             // encode state to offset vector
             let encoded = (*to).as_usize() + ((*in_object as usize) >> 63);
-            OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
+            if addr.is_aligned_to(Block::BYTES) {
+                OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
+            }
             // update by clmul
             let ones = unsafe { x86_64::_mm_set1_epi8(0xFFu8 as i8) };
             let vector = unsafe { x86_64::_mm_set_epi64x(0, word as i64) };
@@ -208,7 +210,10 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 
     pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
-        let used = if is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt") {
+        let blocks_large_enough = Block::LOG_BYTES >= 9;
+        let cpu_supports_features =
+            is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt");
+        let used = if blocks_large_enough && cpu_supports_features {
             unsafe {
                 // SAFETY: We checked the processor supports the
                 // necessary instructions.
