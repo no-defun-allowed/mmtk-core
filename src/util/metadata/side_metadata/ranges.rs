@@ -11,7 +11,6 @@
 //!     -   And use it for visiting discontiguous side metadata in bulk.
 
 use crate::util::Address;
-use std::ops::Range;
 
 /// The type for bit offset in a byte.
 pub type BitOffset = u8;
@@ -168,29 +167,39 @@ where
     }
 }
 
+pub enum ByteWordRange {
+    Bytes {
+        start: Address,
+        end: Address,
+    },
+    Words {
+        start: Address,
+        end: Address,
+    },
+}
+
 pub fn break_byte_range(
     start_addr: Address,
     end_addr: Address,
-    byte_range_visitor: &mut impl FnMut(Range<Address>),
-    word_range_visitor: &mut impl FnMut(Range<Address>),
+    visitor: &mut impl FnMut(ByteWordRange),
 ) {
     use crate::util::constants::BYTES_IN_ADDRESS;
     let start_word = start_addr.align_up(BYTES_IN_ADDRESS);
     let end_word = end_addr.align_down(BYTES_IN_ADDRESS);
     if start_word != start_addr {
-        byte_range_visitor(Range {
+        visitor(ByteWordRange::Bytes {
             start: start_addr,
             end: start_word,
         });
     }
     if start_word != end_word {
-        word_range_visitor(Range {
+        visitor(ByteWordRange::Words {
             start: start_word,
             end: end_word,
         });
     }
     if end_word != end_addr {
-        byte_range_visitor(Range {
+        visitor(ByteWordRange::Bytes {
             start: end_word,
             end: end_addr,
         });

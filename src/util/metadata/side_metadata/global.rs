@@ -8,7 +8,7 @@ use crate::util::metadata::metadata_val_traits::*;
 use crate::util::metadata::vo_bit::VO_BIT_SIDE_METADATA_SPEC;
 use crate::util::Address;
 use num_traits::FromPrimitive;
-use ranges::BitByteRange;
+use ranges::{BitByteRange, ByteWordRange};
 use std::fmt;
 use std::io::Result;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -1188,15 +1188,13 @@ impl SideMetadataSpec {
     ) {
         let region_bytes = 1usize << self.log_bytes_in_region;
 
-        let mut cursor = data_start_addr;
-        while cursor < data_end_addr {
+        for cursor in data_start_addr.iter_to(data_end_addr, region_bytes) {
             debug_assert!(cursor.is_mapped());
 
             // If we find non-zero value, just call back.
             if !unsafe { self.load::<T>(cursor).is_zero() } {
                 visit_data(cursor);
             }
-            cursor += region_bytes;
         }
     }
 
@@ -1267,25 +1265,25 @@ impl SideMetadataSpec {
                 start,
                 end,
                 &mut |range| {
-                    let start = range.start.as_usize();
-                    let end = range.end.as_usize();
-                    for a in start..end {
-                        let meta = unsafe { Address::from_usize(a) };
-                        let addr = contiguous_meta_address_to_address(self, meta, 0);
-                        let byte = unsafe { meta.load::<u8>() };
-                        visit_byte(byte, addr);
+                    match range {
+                        ByteWordRange::Bytes { start, end } => {
+                            for meta in start.iter_to(end, 1) {
+                                let addr = contiguous_meta_address_to_address(self, meta, 0);
+                                let byte = unsafe { meta.load::<u8>() };
+                                visit_byte(byte, addr);
+                            }
+                        }
+                        ByteWordRange::Words { start, end } => {
+                            for meta in start
+                                .iter_to(end, crate::util::constants::BYTES_IN_ADDRESS)
+                            {
+                                let addr = contiguous_meta_address_to_address(self, meta, 0);
+                                let word = unsafe { meta.load::<usize>() };
+                                visit_word(word, addr);
+                            }
+                        }
                     }
-                },
-                &mut |range| {
-                    let start = range.start.as_usize();
-                    let end = range.end.as_usize();
-                    for a in (start..end).step_by(crate::util::constants::BYTES_IN_ADDRESS) {
-                        let meta = unsafe { Address::from_usize(a) };
-                        let addr = contiguous_meta_address_to_address(self, meta, 0);
-                        let word = unsafe { meta.load::<usize>() };
-                        visit_word(word, addr);
-                    }
-                },
+                }
             );
         };
 
