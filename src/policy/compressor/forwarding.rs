@@ -178,9 +178,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 
         let mut to = region.start();
         let mut in_object: i64 = 0;
-        MARK_SPEC.scan_words(
+        MARK_SPEC.scan_words::<u8>(
             region.start(),
             cursor.align_up(Block::BYTES),
+            &mut |_, _| panic!("should be word aligned, got a bit instead"),
+            &mut |_, _| panic!("should be word aligned, got a byte instead"),
             &mut |word: usize, addr: Address| {
                 inner(&mut to, &mut in_object, word, addr);
             },

@@ -1248,10 +1248,12 @@ impl SideMetadataSpec {
         );
     }
 
-    pub fn scan_words(
+    pub fn scan_words<T: MetadataValue>(
         &self,
         data_start_addr: Address,
         data_end_addr: Address,
+        visit_value: &mut impl FnMut(T, Address),
+        visit_byte: &mut impl FnMut(u8, Address),
         visit_word: &mut impl FnMut(usize, Address),
     ) {
         debug_assert!(self.uses_contiguous_side_metadata());
@@ -1264,7 +1266,16 @@ impl SideMetadataSpec {
             ranges::break_byte_range(
                 start,
                 end,
-                &mut |_| panic!("no (byte edition)"),
+                &mut |range| {
+                    let start = range.start.as_usize();
+                    let end = range.end.as_usize();
+                    for a in start..end {
+                        let meta = unsafe { Address::from_usize(a) };
+                        let addr = contiguous_meta_address_to_address(self, meta, 0);
+                        let byte = unsafe { meta.load::<u8>() };
+                        visit_byte(byte, addr);
+                    }
+                },
                 &mut |range| {
                     let start = range.start.as_usize();
                     let end = range.end.as_usize();
@@ -1289,7 +1300,21 @@ impl SideMetadataSpec {
                     BitByteRange::Bytes { start, end } => {
                         visit_bytes(start, end);
                     }
-                    BitByteRange::BitsInByte { .. } => panic!("no"),
+                    BitByteRange::BitsInByte {
+                        addr,
+                        bit_start,
+                        bit_end,
+                    } => {
+                        let start = contiguous_meta_address_to_address(self, addr, bit_start);
+                        let end = contiguous_meta_address_to_address(self, addr, bit_end);
+                        let region_bytes = 1usize << self.log_bytes_in_region;
+                        let mut cursor = start;
+                        while cursor < end {
+                            let value = unsafe { self.load::<T>(cursor) };
+                            visit_value(value, cursor);
+                            cursor += region_bytes;
+                        }
+                    }
                 }
                 false
             },
