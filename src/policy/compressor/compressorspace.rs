@@ -50,6 +50,12 @@ pub struct CompressorSpace<VM: VMBinding> {
 
 pub(crate) const GC_MARK_BIT_MASK: u8 = 1;
 
+/// The number of bytes of the heap that each CalculateOffsetVector
+/// work packet should process. Calculating the offset vector is very fast,
+/// and we are often swamped by scheduling overhead when we
+/// only process one region per work packet.
+const OFFSET_VECTOR_PACKET_BYTES: usize = 1 << 21;
+
 impl<VM: VMBinding> SFT for CompressorSpace<VM> {
     fn name(&self) -> &'static str {
         self.get_name()
@@ -88,7 +94,7 @@ impl<VM: VMBinding> SFT for CompressorSpace<VM> {
         true
     }
 
-    fn initialize_object_metadata(&self, _object: ObjectReference, _alloc: bool) {
+    fn initialize_object_metadata(&self, _object: ObjectReference) {
         #[cfg(feature = "vo_bit")]
         crate::util::metadata::vo_bit::set_vo_bit(_object);
     }
@@ -216,17 +222,19 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         let local_specs = extract_side_metadata(&[
             MetadataSpec::OnSide(forwarding::MARK_SPEC),
             MetadataSpec::OnSide(forwarding::OFFSET_VECTOR_SPEC),
+            MetadataSpec::OnSide(forwarding::SELECTED_SPEC),
         ]);
         let is_discontiguous = args.vmrequest.is_discontiguous();
         let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
+        let percent = *common.options.compressor_compact_max_percent;
         CompressorSpace {
             pr: if is_discontiguous {
                 RegionPageResource::new_discontiguous(vm_map)
             } else {
                 RegionPageResource::new_contiguous(common.start, common.extent, vm_map)
             },
-            forwarding: forwarding::ForwardingMetadata::new(),
+            forwarding: forwarding::ForwardingMetadata::new(percent),
             common,
             scheduler,
         }
@@ -300,9 +308,16 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     pub fn add_offset_vector_tasks(&'static self) {
-        let offset_vector_packets: Vec<Box<dyn GCWork<VM>>> = self.generate_tasks(&mut |r, _| {
-            Box::new(CalculateOffsetVector::<VM>::new(self, r.region, r.cursor()))
+        let mut regions = vec![];
+        self.pr.enumerate_regions(&mut |r| {
+            regions.push((r.region, r.cursor()));
         });
+        let offset_vector_packets: Vec<Box<dyn GCWork<VM>>> = regions
+            .chunks(OFFSET_VECTOR_PACKET_BYTES / forwarding::CompressorRegion::BYTES)
+            .map(|c| {
+                Box::new(CalculateOffsetVector::<VM>::new(self, c.to_vec())) as Box<dyn GCWork<VM>>
+            })
+            .collect();
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
             .bulk_add(offset_vector_packets);
     }
@@ -319,6 +334,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         if !self.in_space(object) {
             return object;
         }
+
         // We can't expect the VO bit to be valid whilst compacting the heap.
         // If we are fixing a reference to an object which was moved before the referent,
         // the relevant VO bit will have been cleared, and this assertion would fail.
@@ -373,32 +389,38 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 crate::util::metadata::vo_bit::bzero_vo_bit(start, end - start);
             }
             let mut to = start;
-            self.forwarding
-                .scan_marked_objects(start, end, &mut |obj: ObjectReference| {
-                    // We set the end bits based on the sizes of objects when they are
-                    // marked, and we compute the live data and thus the forwarding
-                    // addresses based on those sizes. The forwarding addresses would be
-                    // incorrect if the sizes of objects were to change.
-                    let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
-                    debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
-                    let new_object = self.forward(obj, false);
-                    debug_assert!(
-                        new_object.to_raw_address() >= to,
-                        "whilst forwarding {obj}, the new address {0} should be after the end of the last object {to}",
-                        new_object.to_raw_address()
-                    );
-                    // copy object
-                    trace!(" copy from {} to {}", obj, new_object);
-                    let end_of_new_object =
-                        VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
-                    // update VO bit
-                    #[cfg(feature = "vo_bit")]
-                    vo_bit::set_vo_bit(new_object);
-                    to = new_object.to_object_start::<VM>() + copied_size;
-                    debug_assert_eq!(end_of_new_object, to);
-                    self.update_references(worker, new_object);
+            if self.forwarding.is_forwarding_region(r.region) {
+                self.forwarding
+                    .scan_marked_objects(start, end, &mut |obj: ObjectReference| {
+                        // We set the end bits based on the sizes of objects when they are
+                        // marked, and we compute the live data and thus the forwarding
+                        // addresses based on those sizes. The forwarding addresses would be
+                        // incorrect if the sizes of objects were to change.
+                        let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
+                        debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
+                        let new_object = self.forward(obj, false);
+                        debug_assert!(
+                            new_object.to_raw_address() >= to,
+                            "whilst forwarding {obj}, the new address {0} should be after the end of the last object {to}",
+                            new_object.to_raw_address()
+                        );
+                        // copy object
+                        trace!(" copy from {} to {}", obj, new_object);
+                        let end_of_new_object =
+                            VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
+                        // update VO bit
+                        #[cfg(feature = "vo_bit")]
+                        vo_bit::set_vo_bit(new_object);
+                        to = new_object.to_object_start::<VM>() + copied_size;
+                        debug_assert_eq!(end_of_new_object, to);
+                        self.update_references(worker, new_object);
+                    });
+                self.pr.reset_cursor(r, to);
+            } else {
+                self.forwarding.scan_marked_objects(start, end, &mut |obj: ObjectReference| {
+                    self.update_references(worker, obj);
                 });
-            self.pr.reset_cursor(r, to);
+            }
         });
     }
 
@@ -416,27 +438,26 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 /// Calculate the offset vector for a region.
 pub struct CalculateOffsetVector<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
-    region: forwarding::CompressorRegion,
-    cursor: Address,
+    regions: Vec<(forwarding::CompressorRegion, Address)>,
 }
 
 impl<VM: VMBinding> GCWork<VM> for CalculateOffsetVector<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.compressor_space
-            .calculate_offset_vector_for_region(self.region, self.cursor);
+        for (region, cursor) in self.regions.iter() {
+            self.compressor_space
+                .calculate_offset_vector_for_region(*region, *cursor);
+        }
     }
 }
 
 impl<VM: VMBinding> CalculateOffsetVector<VM> {
     pub fn new(
         compressor_space: &'static CompressorSpace<VM>,
-        region: forwarding::CompressorRegion,
-        cursor: Address,
+        regions: Vec<(forwarding::CompressorRegion, Address)>,
     ) -> Self {
         Self {
             compressor_space,
-            region,
-            cursor,
+            regions,
         }
     }
 }

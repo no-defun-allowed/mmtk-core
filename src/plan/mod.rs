@@ -16,7 +16,7 @@
 mod barriers;
 pub use barriers::BarrierSelector;
 
-pub(crate) mod gc_requester;
+mod gc_work;
 
 mod global;
 pub(crate) use global::create_gc_worker_context;
@@ -45,6 +45,7 @@ mod generational;
 mod sticky;
 
 mod compressor;
+mod concurrent;
 mod immix;
 mod markcompact;
 mod marksweep;

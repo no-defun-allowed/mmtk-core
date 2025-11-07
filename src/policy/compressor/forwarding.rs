@@ -1,7 +1,9 @@
 use crate::policy::compressor::GC_MARK_BIT_MASK;
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::{Region, RegionIterator};
-use crate::util::metadata::side_metadata::spec_defs::{COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR};
+use crate::util::metadata::side_metadata::spec_defs::{
+    COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
+};
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::util::{Address, ObjectReference};
 use crate::vm::object_model::ObjectModel;
@@ -16,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 #[derive(Copy, Clone, PartialEq, PartialOrd)]
 pub(crate) struct CompressorRegion(Address);
 impl Region for CompressorRegion {
-    const LOG_BYTES: usize = 20; // 1 MiB
+    const LOG_BYTES: usize = 18; // 1 MiB
     fn from_aligned_address(address: Address) -> Self {
         assert!(
             address.is_aligned_to(Self::BYTES),
@@ -93,6 +95,7 @@ impl Transducer {
 }
 
 pub struct ForwardingMetadata<VM: VMBinding> {
+    max_compact_percent: usize,
     calculated: AtomicBool,
     vm: PhantomData<VM>,
 }
@@ -115,10 +118,12 @@ impl Region for Block {
 
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
+pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
-    pub fn new() -> ForwardingMetadata<VM> {
+    pub fn new(max_compact_percent: usize) -> ForwardingMetadata<VM> {
         ForwardingMetadata {
+            max_compact_percent,
             calculated: AtomicBool::new(false),
             vm: PhantomData,
         }
@@ -147,7 +152,45 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         MARK_SPEC.fetch_or_atomic(last_word_of_object, GC_MARK_BIT_MASK, Ordering::SeqCst);
     }
 
-    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
+    // SAFETY: Only call this function when the processor supports pclmulqdq and popcnt.
+    unsafe fn calculate_offset_vector_clmul(
+        &self,
+        region: CompressorRegion,
+        cursor: Address,
+    ) -> usize {
+        #[target_feature(enable = "pclmulqdq,popcnt")]
+        unsafe fn inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
+            use std::arch::x86_64;
+            // encode state to offset vector
+            let encoded = (*to).as_usize() + ((*in_object as usize) >> 63);
+            if addr.is_aligned_to(Block::BYTES) {
+                OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
+            }
+            // update by clmul
+            let ones = unsafe { x86_64::_mm_set1_epi8(0xFFu8 as i8) };
+            let vector = unsafe { x86_64::_mm_set_epi64x(0, word as i64) };
+            let mask: i64 =
+                unsafe { x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0)) };
+            let flipped = mask ^ *in_object;
+            *in_object = flipped >> 63;
+            *to += (((flipped as usize | word).count_ones()) * 8) as usize;
+        }
+
+        let mut to = region.start();
+        let mut in_object: i64 = 0;
+        MARK_SPEC.scan_words::<u8>(
+            region.start(),
+            cursor.align_up(Block::BYTES),
+            &mut |_, _| panic!("should be word aligned, got a bit instead"),
+            &mut |_, _| panic!("should be word aligned, got a byte instead"),
+            &mut |word: usize, addr: Address| {
+                inner(&mut to, &mut in_object, word, addr);
+            },
+        );
+        to - region.start()
+    }
+
+    fn calculate_offset_vector_base(&self, region: CompressorRegion, cursor: Address) -> usize {
         let mut state = Transducer::new(region.start());
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
@@ -165,11 +208,37 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 },
             );
         }
+        state.to - region.start()
+    }
+
+    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
+        let blocks_large_enough = Block::LOG_BYTES >= 9;
+        let cpu_supports_features =
+            is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt");
+        let used = if blocks_large_enough && cpu_supports_features {
+            unsafe {
+                // SAFETY: We checked the processor supports the
+                // necessary instructions.
+                self.calculate_offset_vector_clmul(region, cursor)
+            }
+        } else {
+            self.calculate_offset_vector_base(region, cursor)
+        };
         self.calculated.store(true, Ordering::Relaxed);
+        let percent = used / (CompressorRegion::BYTES / 100);
+        SELECTED_SPEC.store_atomic::<u8>(
+            region.start(),
+            (percent < self.max_compact_percent) as u8,
+            Ordering::Relaxed,
+        );
     }
 
     pub fn release(&self) {
         self.calculated.store(false, Ordering::Relaxed);
+    }
+
+    pub fn is_forwarding_region(&self, region: CompressorRegion) -> bool {
+        SELECTED_SPEC.load_atomic::<u8>(region.start(), Ordering::Relaxed) != 0
     }
 
     pub fn forward(&self, address: Address) -> Address {
@@ -177,6 +246,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             self.calculated.load(Ordering::Relaxed),
             "forward() should only be called when we have calculated an offset vector"
         );
+        if SELECTED_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) == 0 {
+            return address;
+        }
         let block = Block::from_unaligned_address(address);
         let mut state = Transducer::decode(
             OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
