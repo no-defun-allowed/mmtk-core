@@ -220,13 +220,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         state.to - region.start()
     }
 
-    fn finish_calculating_offset_vector(&self, region: CompressorRegion, used: usize) {
-        let percent = used / (CompressorRegion::BYTES / 100);
-        let will_compact = match self.compact_limit {
-            CompactLimit::AlwaysCompact => true,
-            CompactLimit::Percent(limit) => percent < limit,
-        };
-        SELECTED_SPEC.store_atomic::<u8>(region.start(), will_compact as u8, Ordering::Relaxed);
+    pub fn select_region(&self, region: CompressorRegion) {
+        SELECTED_SPEC.store_atomic::<u8>(region.start(), 1, Ordering::Relaxed);
     }
 
     pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
@@ -243,7 +238,13 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             self.calculate_offset_vector_base(region, cursor)
         };
         self.calculated.store(true, Ordering::Relaxed);
-        self.finish_calculating_offset_vector(region, used);
+        let percent = used / (CompressorRegion::BYTES / 100);
+        let will_compact = match self.compact_limit {
+            CompactLimit::AlwaysCompact => true,
+            CompactLimit::Percent(limit) => percent < limit,
+        };
+        SELECTED_SPEC.store_atomic::<u8>(region.start(), will_compact as u8, Ordering::Relaxed);
+
     }
 
     pub fn calculate_and_walk_offset_vector(
@@ -276,8 +277,6 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 );
             });
         }
-        let used = state.to - region.start();
-        self.finish_calculating_offset_vector(region, used);
     }
 
     pub fn release(&self) {

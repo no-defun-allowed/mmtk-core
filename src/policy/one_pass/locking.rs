@@ -96,7 +96,7 @@ pub(crate) fn thread_or_forward(
     }
 }
 
-pub(crate) fn forward(block: forwarding::Block, body: &mut (impl FnMut() + ?Sized)) {
+pub(crate) fn lock_for_forwarding(block: forwarding::Block, body: &mut (impl FnMut() + ?Sized)) {
     loop {
         let s = status(block);
         match s {

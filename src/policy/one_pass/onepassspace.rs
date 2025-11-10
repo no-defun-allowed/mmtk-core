@@ -253,6 +253,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 forwarding::MARK_SPEC
                     .bzero_metadata(r.region.start(), r.region.end() - r.region.start());
+                self.forwarding.select_region(r.region);
                 locking::reset_metadata(r.region.start(), r.region.end() - r.region.start());
             });
     }
@@ -346,17 +347,17 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                     if let Some(target) = s.load() {
                         if self.in_space(target) {
                             seen += 1;
-                            #[cfg(feature = "distances")]
-                            {
-                                let bits = (target.to_raw_address().as_usize()
-                                    ^ s.as_address().as_usize())
-                                .ilog2();
-                                local_counters[bits as usize] += 1;
-                            }
                             locking::thread_or_forward(old, target, &mut |action| match action {
                                 locking::ThreadOrForward::Thread => {
                                     threaded += 1;
                                     trace!("threading {target}");
+                                    #[cfg(feature = "distances")]
+                                    {
+                                        let bits = (target.to_raw_address().as_usize()
+                                                    ^ s.as_address().as_usize())
+                                            .ilog2();
+                                        local_counters[bits as usize] += 1;
+                                    }
                                     Self::push_threading_list(target, s);
                                 }
                                 locking::ThreadOrForward::Forward => {
@@ -391,10 +392,11 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             }
 
             let mut to = r.region.start();
+            trace!("forwarding region {:?}", r.region.start());
             self.forwarding.calculate_and_walk_offset_vector(
                 r.region,
                 r.cursor(),
-                &mut |b, f| locking::forward(b, f),
+                &mut |b, f| locking::lock_for_forwarding(b, f),
                 &mut |obj: ObjectReference| {
                     let new_object = self.forward(obj, false);
                     while let Some(slot) = Self::pop_threading_list(obj) {
