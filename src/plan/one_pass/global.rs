@@ -1,5 +1,5 @@
 use super::gc_work::OnePassWorkContext;
-use super::gc_work::{Compact, ForwardingProcessEdges, MarkingProcessEdges, UpdateReferences};
+use super::gc_work::{AfterCompact, ForwardingProcessEdges, MarkingProcessEdges, UpdateReferences};
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
 use crate::plan::global::{BasePlan, CommonPlan};
@@ -96,10 +96,9 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
             .add(Prepare::<OnePassWorkContext<VM>>::new(self));
 
         // Well, yes, but no.
-        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(Compact::<VM>::new(
-            &self.op_space,
-            &self.common.los,
-            &self.counters,
+        self.op_space.add_compact_tasks(&self.counters);
+        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].set_sentinel(Box::new(
+            AfterCompact::<VM>::new(&self.op_space, &self.common.los),
         ));
 
         // do another trace to update references

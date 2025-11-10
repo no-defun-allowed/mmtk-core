@@ -1,6 +1,6 @@
 use super::global::OnePass;
 use crate::policy::largeobjectspace::LargeObjectSpace;
-use crate::policy::one_pass::{Counters, OnePassSpace};
+use crate::policy::one_pass::OnePassSpace;
 use crate::policy::one_pass::{TRACE_KIND_FORWARD_ROOT, TRACE_KIND_MARK};
 use crate::scheduler::gc_work::PlanProcessEdges;
 use crate::scheduler::gc_work::*;
@@ -29,11 +29,6 @@ impl<VM: VMBinding> GCWork<VM> for UpdateReferences<VM> {
         #[cfg(feature = "extreme_assertions")]
         mmtk.slot_logger.reset();
 
-        // We do two passes of transitive closures. We clear the live bytes from the first pass.
-        mmtk.scheduler
-            .worker_group
-            .get_and_clear_worker_live_bytes();
-
         for mutator in VM::VMActivePlan::mutators() {
             mmtk.scheduler.work_buckets[WorkBucketStage::SecondRoots].add(ScanMutatorRoots::<
                 OnePassForwardingWorkContext<VM>,
@@ -51,29 +46,26 @@ impl<VM: VMBinding> UpdateReferences<VM> {
     }
 }
 
-/// Compact live objects based on the previously-calculated forwarding pointers.
-pub struct Compact<VM: VMBinding> {
-    op_space: &'static OnePassSpace<VM>,
+/// Reset the allocator and update references in large object space.
+pub struct AfterCompact<VM: VMBinding> {
+    one_pass_space: &'static OnePassSpace<VM>,
     los: &'static LargeObjectSpace<VM>,
-    counters: &'static Counters,
 }
 
-impl<VM: VMBinding> GCWork<VM> for Compact<VM> {
+impl<VM: VMBinding> GCWork<VM> for AfterCompact<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.op_space.compact(worker, self.los, self.counters);
+        self.one_pass_space.after_compact(worker, self.los);
     }
 }
 
-impl<VM: VMBinding> Compact<VM> {
+impl<VM: VMBinding> AfterCompact<VM> {
     pub fn new(
-        op_space: &'static OnePassSpace<VM>,
+        one_pass_space: &'static OnePassSpace<VM>,
         los: &'static LargeObjectSpace<VM>,
-        counters: &'static Counters,
     ) -> Self {
         Self {
-            op_space,
+            one_pass_space,
             los,
-            counters,
         }
     }
 }

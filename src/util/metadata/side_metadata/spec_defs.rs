@@ -99,6 +99,7 @@ define_side_metadata_specs!(
     // Block offset vectors by Compressor
     COMPRESSOR_OFFSET_VECTOR = (global: false, log_num_of_bits: LOG_BITS_IN_ADDRESS, log_bytes_in_region: crate::policy::compressor::forwarding::Block::LOG_BYTES),
     COMPRESSOR_SELECTED = (global: false, log_num_of_bits: 0, log_bytes_in_region: crate::policy::compressor::forwarding::CompressorRegion::LOG_BYTES),
+    ONE_PASS_STATUS = (global: false, log_num_of_bits: 3, log_bytes_in_region: crate::policy::compressor::forwarding::Block::LOG_BYTES),
 );
 
 #[cfg(test)]

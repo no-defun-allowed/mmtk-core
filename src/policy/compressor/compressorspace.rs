@@ -234,7 +234,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             } else {
                 RegionPageResource::new_contiguous(common.start, common.extent, vm_map)
             },
-            forwarding: forwarding::ForwardingMetadata::new(percent),
+            forwarding: forwarding::ForwardingMetadata::new(forwarding::CompactLimit::Percent(
+                percent,
+            )),
             common,
             scheduler,
         }

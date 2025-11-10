@@ -2,13 +2,16 @@ use crate::plan::VectorObjectQueue;
 use crate::policy::compressor::forwarding;
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::largeobjectspace::LargeObjectSpace;
-use crate::policy::onepass::locking;
+use crate::policy::one_pass::locking;
 use crate::policy::sft::GCWorkerMutRef;
 use crate::policy::sft::SFT;
 use crate::policy::space::{CommonSpace, Space};
-use crate::scheduler::GCWorker;
+use crate::scheduler::GCWorkScheduler;
+use crate::scheduler::{GCWork, GCWorker, WorkBucketStage};
 use crate::util::copy::CopySemantics;
-use crate::util::heap::{MonotonePageResource, PageResource};
+use crate::util::heap::regionpageresource::AllocatedRegion;
+use crate::util::heap::{PageResource, RegionPageResource};
+use crate::util::linear_scan::Region;
 use crate::util::metadata::extract_side_metadata;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
@@ -18,6 +21,7 @@ use crate::util::statistics::counter::EventCounter;
 use crate::util::statistics::stats::Stats;
 use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
+use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
 use atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -220,17 +224,25 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             MetadataSpec::OnSide(forwarding::MARK_SPEC),
             MetadataSpec::OnSide(forwarding::OFFSET_VECTOR_SPEC),
             MetadataSpec::OnSide(forwarding::SELECTED_SPEC),
+            MetadataSpec::OnSide(locking::STATUS_SPEC),
         ]);
         let is_discontiguous = args.vmrequest.is_discontiguous();
         let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
+        assert!(scheduler.num_workers() <= locking::Status::MAX_WORKERS);
+        assert!(
+            scheduler.num_workers() == 1,
+            "write the CAS list code first"
+        );
         OnePassSpace {
             pr: if is_discontiguous {
                 RegionPageResource::new_discontiguous(vm_map)
             } else {
                 RegionPageResource::new_contiguous(common.start, common.extent, vm_map)
             },
-            forwarding: forwarding::ForwardingMetadata::new(forwarding::AlwaysCompact),
+            forwarding: forwarding::ForwardingMetadata::new(
+                forwarding::CompactLimit::AlwaysCompact,
+            ),
             common,
             scheduler,
         }
@@ -314,10 +326,10 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         ret
     }
 
-    pub fn add_compact_tasks(&'static self) {
-        let packets: Vec<Box<dyn GCWork<VM>>> = self.pr.with_regions(&|r| {
+    pub fn add_compact_tasks(&'static self, counters: &'static Counters) {
+        let packets: Vec<Box<dyn GCWork<VM>>> = self.pr.with_regions(&mut |r| {
             (0..r.len())
-                .map(|r| Box::new(Compact::<VM>::new(self, r)) as Box<dyn GCWork<VM>>)
+                .map(|i| Box::new(Compact::<VM>::new(self, i, counters)) as Box<dyn GCWork<VM>>)
                 .collect()
         });
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding].bulk_add(packets);
@@ -341,13 +353,13 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                                 .ilog2();
                                 local_counters[bits as usize] += 1;
                             }
-                            locking::thread_or_forward(old, target, &|action| match action {
-                                locking::Thread => {
+                            locking::thread_or_forward(old, target, &mut |action| match action {
+                                locking::ThreadOrForward::Thread => {
                                     threaded += 1;
                                     trace!("threading {target}");
                                     Self::push_threading_list(target, s);
                                 }
-                                locking::Forward => {
+                                locking::ThreadOrForward::Forward => {
                                     trace!("forwarding {target} to {}", self.forward(target, true));
                                     s.store(self.forward(target, true));
                                 }
@@ -362,24 +374,26 @@ impl<VM: VMBinding> OnePassSpace<VM> {
 
         self.pr.with_regions(&mut |regions| {
             let r = &regions[index];
-            let start = r.region.start();
-            let end = r.cursor();
             #[cfg(feature = "vo_bit")]
             {
                 #[cfg(debug_assertions)]
-                self.forwarding
-                    .scan_marked_objects(start, end, &mut |object: ObjectReference| {
+                self.forwarding.scan_marked_objects(
+                    r.region.start(),
+                    r.cursor(),
+                    &mut |object: ObjectReference| {
                         debug_assert!(
                             crate::util::metadata::vo_bit::is_vo_bit_set(object),
                             "{:x}: VO bit not set",
                             object
                         );
-                    });
+                    },
+                );
             }
 
-            let mut to = start;
+            let mut to = r.region.start();
             self.forwarding.calculate_and_walk_offset_vector(
-                r,
+                r.region,
+                r.cursor(),
                 &mut |b, f| locking::forward(b, f),
                 &mut |obj: ObjectReference| {
                     let new_object = self.forward(obj, false);
@@ -447,7 +461,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
     const SLOT_TAG_BIT: usize = 1 << 63;
 
     fn pop_threading_list(o: ObjectReference) -> Option<VM::VMSlot> {
-        todo!("CAS");
+        // TODO: CAS
         let list = Self::threading_list(o);
         let word = unsafe { list.load::<usize>() };
         if word & Self::SLOT_TAG_BIT != 0 {
@@ -463,7 +477,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
     }
 
     fn push_threading_list(o: ObjectReference, slot: VM::VMSlot) {
-        todo!("CAS");
+        // TODO: CAS
         let list = Self::threading_list(o);
         let next = unsafe { Address::from_usize(list.load::<usize>()) };
         slot.store(ObjectReference::from_raw_address(next).unwrap());
@@ -475,19 +489,26 @@ impl<VM: VMBinding> OnePassSpace<VM> {
 pub struct Compact<VM: VMBinding> {
     one_pass_space: &'static OnePassSpace<VM>,
     index: usize,
+    counters: &'static Counters,
 }
 
 impl<VM: VMBinding> GCWork<VM> for Compact<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.one_pass_space.compact_region(worker, self.index);
+        self.one_pass_space
+            .compact_region(worker, self.index, self.counters);
     }
 }
 
 impl<VM: VMBinding> Compact<VM> {
-    pub fn new(one_pass_space: &'static OnePassSpace<VM>, index: usize) -> Self {
+    pub fn new(
+        one_pass_space: &'static OnePassSpace<VM>,
+        index: usize,
+        counters: &'static Counters,
+    ) -> Self {
         Self {
             one_pass_space,
             index,
+            counters,
         }
     }
 }
