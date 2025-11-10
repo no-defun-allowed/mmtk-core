@@ -1,7 +1,8 @@
 use crate::plan::VectorObjectQueue;
+use crate::policy::compressor::forwarding;
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::largeobjectspace::LargeObjectSpace;
-use crate::policy::one_pass::forwarding;
+use crate::policy::onepass::locking;
 use crate::policy::sft::GCWorkerMutRef;
 use crate::policy::sft::SFT;
 use crate::policy::space::{CommonSpace, Space};
@@ -19,7 +20,6 @@ use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
 use crate::{vm::*, ObjectQueue};
 use atomic::Ordering;
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
@@ -30,8 +30,9 @@ pub(crate) const TRACE_KIND_FORWARD_ROOT: TraceKind = 1;
 /// [The One Pass (OP) Compactor: An Intellectual Abstract](https://dl.acm.org/doi/pdf/10.1145/3652024.3665513).
 pub struct OnePassSpace<VM: VMBinding> {
     common: CommonSpace<VM>,
-    pr: MonotonePageResource<VM>,
+    pr: RegionPageResource<VM, forwarding::CompressorRegion>,
     forwarding: forwarding::ForwardingMetadata<VM>,
+    scheduler: Arc<GCWorkScheduler<VM>>,
 }
 
 pub(crate) const GC_MARK_BIT_MASK: u8 = 1;
@@ -72,7 +73,7 @@ impl<VM: VMBinding> SFT for OnePassSpace<VM> {
         true
     }
 
-    fn initialize_object_metadata(&self, _object: ObjectReference, _alloc: bool) {
+    fn initialize_object_metadata(&self, _object: ObjectReference) {
         #[cfg(feature = "vo_bit")]
         crate::util::metadata::vo_bit::set_vo_bit(_object);
     }
@@ -146,7 +147,7 @@ impl<VM: VMBinding> Space<VM> for OnePassSpace<VM> {
     }
 
     fn enumerate_objects(&self, enumerator: &mut dyn ObjectEnumerator) {
-        object_enum::enumerate_blocks_from_monotonic_page_resource(enumerator, &self.pr);
+        self.pr.enumerate(enumerator);
     }
 
     fn clear_side_log_bits(&self) {
@@ -190,18 +191,20 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for OnePassSpa
 }
 
 pub struct Counters {
-    hashmap_size: Arc<Mutex<EventCounter>>,
     threaded: Arc<Mutex<EventCounter>>,
     seen: Arc<Mutex<EventCounter>>,
+    #[cfg(feature = "distances")]
     distances: Vec<Arc<Mutex<EventCounter>>>,
 }
 impl Counters {
     pub fn new(stats: &Stats) -> Self {
         Self {
-            hashmap_size: stats.new_event_counter("hashmap_size", true, true),
             threaded: stats.new_event_counter("threaded", true, true),
             seen: stats.new_event_counter("seen", true, true),
-            distances: (0..48).map(|v| stats.new_event_counter(&format!("distance.{v}"), true, true)).collect(),
+            #[cfg(feature = "distances")]
+            distances: (0..48)
+                .map(|v| stats.new_event_counter(&format!("distance.{v}"), true, true))
+                .collect(),
         }
     }
 }
@@ -210,30 +213,36 @@ impl<VM: VMBinding> OnePassSpace<VM> {
     pub fn new(args: crate::policy::space::PlanCreateSpaceArgs<VM>) -> Self {
         let vm_map = args.vm_map;
         assert!(
-            !args.vmrequest.is_discontiguous(),
-            "The Compressor requires a contiguous heap"
-        );
-        assert!(
             VM::VMObjectModel::UNIFIED_OBJECT_REFERENCE_ADDRESS,
-            "The Compressor requires a unified object reference address model"
+            "The One Pass Compactor requires a unified object reference address model"
         );
         let local_specs = extract_side_metadata(&[
             MetadataSpec::OnSide(forwarding::MARK_SPEC),
             MetadataSpec::OnSide(forwarding::OFFSET_VECTOR_SPEC),
+            MetadataSpec::OnSide(forwarding::SELECTED_SPEC),
         ]);
+        let is_discontiguous = args.vmrequest.is_discontiguous();
+        let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
-
         OnePassSpace {
-            pr: MonotonePageResource::new_contiguous(common.start, common.extent, vm_map),
-            forwarding: forwarding::ForwardingMetadata::new(common.start),
+            pr: if is_discontiguous {
+                RegionPageResource::new_discontiguous(vm_map)
+            } else {
+                RegionPageResource::new_contiguous(common.start, common.extent, vm_map)
+            },
+            forwarding: forwarding::ForwardingMetadata::new(forwarding::AlwaysCompact),
             common,
+            scheduler,
         }
     }
 
     pub fn prepare(&self) {
-        for (from_start, size) in self.pr.iterate_allocated_regions() {
-            forwarding::MARK_SPEC.bzero_metadata(from_start, size);
-        }
+        self.pr
+            .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
+                forwarding::MARK_SPEC
+                    .bzero_metadata(r.region.start(), r.region.end() - r.region.start());
+                locking::reset_metadata(r.region.start(), r.region.end() - r.region.start());
+            });
     }
 
     pub fn release(&self) {
@@ -305,147 +314,180 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         ret
     }
 
-    pub fn compact(
-        &self,
-        worker: &mut GCWorker<VM>,
-        los: &LargeObjectSpace<VM>,
-        counters: &Counters,
-    ) {
-        #[cfg(feature = "vo_bit")]
-        {
-            let start = self.forwarding.first_address;
-            let end = self.pr.cursor();
-            #[cfg(debug_assertions)]
-            self.forwarding
-                .scan_marked_objects(start, end, &mut |object: ObjectReference| {
-                    debug_assert!(
-                        crate::util::metadata::vo_bit::is_vo_bit_set(object),
-                        "{:x}: VO bit not set",
-                        object
-                    );
-                });
-            for (region_start, size) in self.pr.iterate_allocated_regions() {
-                crate::util::metadata::vo_bit::bzero_vo_bit(region_start, size);
-            }
-        }
-        type SlotTable<VM> = HashMap<ObjectReference, <VM as VMBinding>::VMSlot>;
-        let mut max_size: u64 = 0;
-        let end_of_list =
-            unsafe { ObjectReference::from_raw_address(Address::from_usize(8)).unwrap() };
-        let add_forwards_slot =
-            &mut |forwards_slots: &mut SlotTable<VM>, object: ObjectReference, s: VM::VMSlot| {
-                if let Option::Some(v) = forwards_slots.get_mut(&object) {
-                    s.store(ObjectReference::from_raw_address(v.as_address()).unwrap());
-                    *v = s;
-                } else {
-                    forwards_slots.insert(object, s);
-                    s.store(end_of_list);
-                    max_size = std::cmp::max(max_size, forwards_slots.len().try_into().unwrap());
-                }
-            };
+    pub fn add_compact_tasks(&'static self) {
+        let packets: Vec<Box<dyn GCWork<VM>>> = self.pr.with_regions(&|r| {
+            (0..r.len())
+                .map(|r| Box::new(Compact::<VM>::new(self, r)) as Box<dyn GCWork<VM>>)
+                .collect()
+        });
+        self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding].bulk_add(packets);
+    }
+
+    pub fn compact_region(&self, worker: &mut GCWorker<VM>, index: usize, counters: &Counters) {
         let mut seen: u64 = 0;
         let mut threaded: u64 = 0;
+        #[cfg(feature = "distances")]
         let mut local_counters: Vec<u64> = counters.distances.iter().map(|_| 0).collect();
-        let thread_references = &mut |forwards_slots: &mut SlotTable<VM>,
-                                      object: ObjectReference,
-                                      old: ObjectReference| {
+        let thread_references = &mut |object: ObjectReference, old: ObjectReference| {
             if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
                 VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
-                    if let Some(o) = s.load() {
-                        if self.in_space(o) {
+                    if let Some(target) = s.load() {
+                        if self.in_space(target) {
                             seen += 1;
-                            if o > old {
-                                let bits = (o.to_raw_address().as_usize() ^ s.as_address().as_usize()).ilog2();
+                            #[cfg(feature = "distances")]
+                            {
+                                let bits = (target.to_raw_address().as_usize()
+                                    ^ s.as_address().as_usize())
+                                .ilog2();
                                 local_counters[bits as usize] += 1;
                             }
-                            if forwarding::block_number(o) > forwarding::block_number(old) {
-                                threaded += 1;
-                                trace!("threading {o}");
-                                add_forwards_slot(forwards_slots, o, s);
-                            } else {
-                                trace!("forwarding {o} to {}", self.forward(o, true));
-                                s.store(self.forward(o, true));
-                            }
+                            locking::thread_or_forward(old, target, &|action| match action {
+                                locking::Thread => {
+                                    threaded += 1;
+                                    trace!("threading {target}");
+                                    Self::push_threading_list(target, s);
+                                }
+                                locking::Forward => {
+                                    trace!("forwarding {target} to {}", self.forward(target, true));
+                                    s.store(self.forward(target, true));
+                                }
+                            });
                         }
                     }
-                });
+                })
             } else {
                 panic!("nah I've really got to look at slots here");
             }
         };
-        let update_references = &mut |object: ObjectReference| {
-            if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
-                VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
-                    if let Some(o) = s.load() {
-                        trace!("forwarding {o} to {}", self.forward(o, true));
-                        s.store(self.forward(o, true));
-                    }
-                });
-            } else {
-                panic!("nah I've really got to look at slots here");
+
+        self.pr.with_regions(&mut |regions| {
+            let r = &regions[index];
+            let start = r.region.start();
+            let end = r.cursor();
+            #[cfg(feature = "vo_bit")]
+            {
+                #[cfg(debug_assertions)]
+                self.forwarding
+                    .scan_marked_objects(start, end, &mut |object: ObjectReference| {
+                        debug_assert!(
+                            crate::util::metadata::vo_bit::is_vo_bit_set(object),
+                            "{:x}: VO bit not set",
+                            object
+                        );
+                    });
             }
-        };
-        let mut forwards_slots: SlotTable<VM> = HashMap::new();
-        let mut to = Address::ZERO;
-        self.forwarding
-            .calculate_offset_vector(&self.pr, &mut |obj: ObjectReference| {
-                // We set the end bits based on the sizes of objects when they are
-                // marked, and we compute the live data and thus the forwarding
-                // addresses based on those sizes. The forwarding addresses would be
-                // incorrect if the sizes of objects were to change.
-                let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
-                debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
-                let new_object = self.forward(obj, false);
-                if let Option::Some(v) = forwards_slots.get(&obj) {
-                    let mut slot = *v;
-                    while slot.as_address() != end_of_list.to_raw_address() {
-                        let next = slot
-                            .load()
-                            .expect("threading list should only have ObjectReferences");
+
+            let mut to = start;
+            self.forwarding.calculate_and_walk_offset_vector(
+                r,
+                &mut |b, f| locking::forward(b, f),
+                &mut |obj: ObjectReference| {
+                    let new_object = self.forward(obj, false);
+                    while let Some(slot) = Self::pop_threading_list(obj) {
                         slot.store(new_object);
-                        slot = VM::VMSlot::from_address(next.to_raw_address());
                     }
-                }
-                forwards_slots.remove(&obj);
-                debug_assert!(
-                    new_object.to_raw_address() >= to,
-                    "{0} < {to}",
-                    new_object.to_raw_address()
-                );
-                // copy object
-                trace!(" copy from {} to {}", obj, new_object);
-                let end_of_new_object = VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
-                // update VO bit
-                #[cfg(feature = "vo_bit")]
-                vo_bit::set_vo_bit(new_object);
-                to = new_object.to_object_start::<VM>() + copied_size;
-                debug_assert_eq!(end_of_new_object, to);
-                thread_references(&mut forwards_slots, new_object, obj);
-            });
-        // Update references from the LOS to Compressor too.
-        los.enumerate_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
-            update_references,
-        ));
-        assert_eq!(
-            forwards_slots.len(),
-            0,
-            "Should not have to forward any more slots"
-        );
-        debug!("Compact end: to = {}", to);
-        counters
-            .hashmap_size
-            .clone()
-            .lock()
-            .unwrap()
-            .inc_by(max_size);
+                    // We set the end bits based on the sizes of objects when they are
+                    // marked, and we compute the live data and thus the forwarding
+                    // addresses based on those sizes. The forwarding addresses would be
+                    // incorrect if the sizes of objects were to change.
+                    let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
+                    debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
+                    debug_assert!(
+                        new_object.to_raw_address() >= to,
+                        "{0} < {to}",
+                        new_object.to_raw_address()
+                    );
+                    // copy object
+                    trace!(" copy from {} to {}", obj, new_object);
+                    let end_of_new_object =
+                        VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
+                    // update VO bit
+                    #[cfg(feature = "vo_bit")]
+                    vo_bit::set_vo_bit(new_object);
+                    to = new_object.to_object_start::<VM>() + copied_size;
+                    debug_assert_eq!(end_of_new_object, to);
+                    thread_references(new_object, obj);
+                },
+            );
+            debug!("Compact end: to = {}", to);
+            self.pr.reset_cursor(r, to);
+        });
+
         counters.threaded.clone().lock().unwrap().inc_by(threaded);
         counters.seen.clone().lock().unwrap().inc_by(seen);
+        #[cfg(feature = "distances")]
         for (local, global) in std::iter::zip(local_counters.iter(), counters.distances.iter()) {
             global.clone().lock().unwrap().inc_by(*local);
         }
-        //println!("{threaded} / {seen} = {:.2}%", 100.0 * threaded as f64 / seen as f64);
-        //println!("HashMap had {max_size} maximum entries");
-        // reset the bump pointer
-        self.pr.reset_cursor(to);
+    }
+
+    pub fn after_compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
+        self.pr.reset_allocator();
+        // Update references from the LOS to OnePassSpace too.
+        los.enumerate_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
+            &mut |object: ObjectReference| {
+                if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
+                    VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
+                        if let Some(o) = s.load() {
+                            trace!("forwarding {o} to {}", self.forward(o, true));
+                            s.store(self.forward(o, true));
+                        }
+                    });
+                } else {
+                    panic!("nah I've really got to look at slots here");
+                }
+            },
+        ));
+    }
+
+    fn threading_list(o: ObjectReference) -> Address {
+        VM::VMObjectModel::ref_to_header(o) + 8usize
+    }
+
+    const SLOT_TAG_BIT: usize = 1 << 63;
+
+    fn pop_threading_list(o: ObjectReference) -> Option<VM::VMSlot> {
+        todo!("CAS");
+        let list = Self::threading_list(o);
+        let word = unsafe { list.load::<usize>() };
+        if word & Self::SLOT_TAG_BIT != 0 {
+            unsafe {
+                let address = Address::from_usize(word & !Self::SLOT_TAG_BIT);
+                let next = address.load::<usize>();
+                list.store::<usize>(next);
+                Some(VM::VMSlot::from_address(address))
+            }
+        } else {
+            None
+        }
+    }
+
+    fn push_threading_list(o: ObjectReference, slot: VM::VMSlot) {
+        todo!("CAS");
+        let list = Self::threading_list(o);
+        let next = unsafe { Address::from_usize(list.load::<usize>()) };
+        slot.store(ObjectReference::from_raw_address(next).unwrap());
+        unsafe { list.store::<usize>(slot.as_address().as_usize() | Self::SLOT_TAG_BIT) };
+    }
+}
+
+/// Compact live objects in a region.
+pub struct Compact<VM: VMBinding> {
+    one_pass_space: &'static OnePassSpace<VM>,
+    index: usize,
+}
+
+impl<VM: VMBinding> GCWork<VM> for Compact<VM> {
+    fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.one_pass_space.compact_region(worker, self.index);
+    }
+}
+
+impl<VM: VMBinding> Compact<VM> {
+    pub fn new(one_pass_space: &'static OnePassSpace<VM>, index: usize) -> Self {
+        Self {
+            one_pass_space,
+            index,
+        }
     }
 }

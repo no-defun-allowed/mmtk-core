@@ -94,8 +94,13 @@ impl Transducer {
     }
 }
 
+enum CompactLimit {
+    AlwaysCompact,
+    Percent(usize),
+}
+
 pub struct ForwardingMetadata<VM: VMBinding> {
-    max_compact_percent: usize,
+    compact_limit: CompactLimit,
     calculated: AtomicBool,
     vm: PhantomData<VM>,
 }
@@ -121,9 +126,9 @@ pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR
 pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
-    pub fn new(max_compact_percent: usize) -> ForwardingMetadata<VM> {
+    pub fn new(compact_limit: usize) -> ForwardingMetadata<VM> {
         ForwardingMetadata {
-            max_compact_percent,
+            compact_limit,
             calculated: AtomicBool::new(false),
             vm: PhantomData,
         }
@@ -226,11 +231,50 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         };
         self.calculated.store(true, Ordering::Relaxed);
         let percent = used / (CompressorRegion::BYTES / 100);
-        SELECTED_SPEC.store_atomic::<u8>(
-            region.start(),
-            (percent < self.max_compact_percent) as u8,
-            Ordering::Relaxed,
-        );
+        let will_compact = match self.compact_limit {
+            AlwaysCompact => true,
+            Percent(percent) => percent < self.max_compact_percent,
+        };
+        SELECTED_SPEC.store_atomic::<u8>(region.start(), will_compact as u8, Ordering::Relaxed);
+    }
+
+    pub fn calculate_and_walk_offset_vector(
+        &self,
+        region: CompressorRegion,
+        cursor: Address,
+        block_lock: &mut impl FnMut(Block, &mut impl FnMut()),
+        f: &mut impl FnMut(ObjectReference),
+    ) {
+        let mut state = Transducer::new();
+        let first_block = Block::from_aligned_address(region.start());
+        let last_block = Block::from_aligned_address(cursor);
+        for block in RegionIterator::<Block>::new(first_block, last_block) {
+            OFFSET_VECTOR_SPEC.store_atomic::<usize>(
+                block.start(),
+                state.encode(block.start()),
+                Ordering::Relaxed,
+            );
+            block_lock(&mut || {
+                MARK_SPEC.scan_non_zero_values::<u8>(
+                    block.start(),
+                    block.end(),
+                    &mut |addr: Address| {
+                        state.visit_mark_bit(addr);
+                        if state.in_object {
+                            f(ObjectReference::from_raw_address(addr).unwrap())
+                        }
+                    },
+                );
+            });
+        }
+        let used = state.to - region.start();
+        let percent = used / (CompressorRegion::BYTES / 100);
+        let will_compact = match self.compact_limit {
+            AlwaysCompact => true,
+            Percent(percent) => percent < self.max_compact_percent,
+        };
+        SELECTED_SPEC.store_atomic::<u8>(region.start(), will_compact as u8, Ordering::Relaxed);
+        self.calculated.store(true, Ordering::Relaxed);
     }
 
     pub fn release(&self) {

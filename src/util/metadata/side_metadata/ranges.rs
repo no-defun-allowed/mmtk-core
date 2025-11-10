@@ -168,14 +168,8 @@ where
 }
 
 pub enum ByteWordRange {
-    Bytes {
-        start: Address,
-        end: Address,
-    },
-    Words {
-        start: Address,
-        end: Address,
-    },
+    Bytes { start: Address, end: Address },
+    Words { start: Address, end: Address },
 }
 
 pub fn break_byte_range(

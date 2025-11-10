@@ -258,5 +258,8 @@ malloc_mark_sweep = []
 immortal_as_nonmoving = []
 marksweep_as_nonmoving = []
 
+# Group:onepassspace
+distances = []
+
 # If there are more groups, they should be inserted above this line
 # Group:end
