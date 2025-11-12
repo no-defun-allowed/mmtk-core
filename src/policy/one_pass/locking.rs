@@ -57,24 +57,16 @@ pub(crate) enum ThreadOrForward {
 }
 
 pub(crate) fn thread_or_forward(
-    source: ObjectReference,
     target: ObjectReference,
     body: &mut impl FnMut(ThreadOrForward),
 ) {
-    if forwarding::block_number(source.to_raw_address())
-        == forwarding::block_number(target.to_raw_address())
-    {
-        body(ThreadOrForward::Forward);
-        return;
-    }
     let target_block = forwarding::Block::from_unaligned_address(target.to_raw_address());
     loop {
         match status(target_block) {
-            Status::Forwarded => {
+            Status::Forwarded | Status::Forwarding => {
                 body(ThreadOrForward::Forward);
                 return;
             }
-            Status::Forwarding => { /* spin until forwarded */ }
             Status::Threading(n) => {
                 // increment threading worker count
                 if cas_status(target_block, Status::Threading(n), Status::Threading(n + 1)) {

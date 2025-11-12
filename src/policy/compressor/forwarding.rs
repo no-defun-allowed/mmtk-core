@@ -121,10 +121,6 @@ impl Region for Block {
     }
 }
 
-pub(crate) fn block_number(a: Address) -> usize {
-    a.as_usize() >> Block::LOG_BYTES
-}
-
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
 pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;

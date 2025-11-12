@@ -25,6 +25,7 @@ use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
 use atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicUsize;
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
 pub(crate) const TRACE_KIND_FORWARD_ROOT: TraceKind = 1;
@@ -230,10 +231,6 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
         assert!(scheduler.num_workers() <= locking::Status::MAX_WORKERS);
-        assert!(
-            scheduler.num_workers() == 1,
-            "write the CAS list code first"
-        );
         OnePassSpace {
             pr: if is_discontiguous {
                 RegionPageResource::new_discontiguous(vm_map)
@@ -341,13 +338,13 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         let mut threaded: u64 = 0;
         #[cfg(feature = "distances")]
         let mut local_counters: Vec<u64> = counters.distances.iter().map(|_| 0).collect();
-        let thread_references = &mut |object: ObjectReference, old: ObjectReference| {
+        let thread_references = &mut |object: ObjectReference| {
             if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
                 VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
                     if let Some(target) = s.load() {
                         if self.in_space(target) {
                             seen += 1;
-                            locking::thread_or_forward(old, target, &mut |action| match action {
+                            locking::thread_or_forward(target, &mut |action| match action {
                                 locking::ThreadOrForward::Thread => {
                                     threaded += 1;
                                     trace!("threading {target}");
@@ -422,7 +419,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                     vo_bit::set_vo_bit(new_object);
                     to = new_object.to_object_start::<VM>() + copied_size;
                     debug_assert_eq!(end_of_new_object, to);
-                    thread_references(new_object, obj);
+                    thread_references(new_object);
                 },
             );
             debug!("Compact end: to = {}", to);
@@ -463,7 +460,8 @@ impl<VM: VMBinding> OnePassSpace<VM> {
     const SLOT_TAG_BIT: usize = 1 << 63;
 
     fn pop_threading_list(o: ObjectReference) -> Option<VM::VMSlot> {
-        // TODO: CAS
+        // Only one thread pops at a time under lock_for_forwarding,
+        // so this function doesn't have to be very thread-safe.
         let list = Self::threading_list(o);
         let word = unsafe { list.load::<usize>() };
         if word & Self::SLOT_TAG_BIT != 0 {
@@ -481,9 +479,19 @@ impl<VM: VMBinding> OnePassSpace<VM> {
     fn push_threading_list(o: ObjectReference, slot: VM::VMSlot) {
         // TODO: CAS
         let list = Self::threading_list(o);
-        let next = unsafe { Address::from_usize(list.load::<usize>()) };
-        slot.store(ObjectReference::from_raw_address(next).unwrap());
-        unsafe { list.store::<usize>(slot.as_address().as_usize() | Self::SLOT_TAG_BIT) };
+        loop {
+            let next = unsafe { Address::from_usize(list.atomic_load::<AtomicUsize>(Ordering::SeqCst)) };
+            slot.store(ObjectReference::from_raw_address(next).unwrap());
+            let cas = unsafe {
+                list.compare_exchange::<AtomicUsize>(
+                    next.as_usize(),
+                    slot.as_address().as_usize() | Self::SLOT_TAG_BIT,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+            };
+            if cas.is_ok() { return }
+        }
     }
 }
 
