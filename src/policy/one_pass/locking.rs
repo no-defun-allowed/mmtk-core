@@ -56,10 +56,7 @@ pub(crate) enum ThreadOrForward {
     Forward,
 }
 
-pub(crate) fn thread_or_forward(
-    target: ObjectReference,
-    body: &mut impl FnMut(ThreadOrForward),
-) {
+pub(crate) fn thread_or_forward(target: ObjectReference, body: &mut impl FnMut(ThreadOrForward)) {
     let target_block = forwarding::Block::from_unaligned_address(target.to_raw_address());
     loop {
         match status(target_block) {

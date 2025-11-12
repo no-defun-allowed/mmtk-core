@@ -240,7 +240,6 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             CompactLimit::Percent(limit) => percent < limit,
         };
         SELECTED_SPEC.store_atomic::<u8>(region.start(), will_compact as u8, Ordering::Relaxed);
-
     }
 
     pub fn calculate_and_walk_offset_vector(

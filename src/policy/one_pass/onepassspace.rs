@@ -24,8 +24,8 @@ use crate::vm::slot::Slot;
 use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
 use atomic::Ordering;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
 pub(crate) const TRACE_KIND_FORWARD_ROOT: TraceKind = 1;
@@ -351,8 +351,8 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                                     #[cfg(feature = "distances")]
                                     {
                                         let bits = (target.to_raw_address().as_usize()
-                                                    ^ s.as_address().as_usize())
-                                            .ilog2();
+                                            ^ s.as_address().as_usize())
+                                        .ilog2();
                                         local_counters[bits as usize] += 1;
                                     }
                                     Self::push_threading_list(target, s);
@@ -480,7 +480,8 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         // TODO: CAS
         let list = Self::threading_list(o);
         loop {
-            let next = unsafe { Address::from_usize(list.atomic_load::<AtomicUsize>(Ordering::SeqCst)) };
+            let next =
+                unsafe { Address::from_usize(list.atomic_load::<AtomicUsize>(Ordering::SeqCst)) };
             slot.store(ObjectReference::from_raw_address(next).unwrap());
             let cas = unsafe {
                 list.compare_exchange::<AtomicUsize>(
@@ -490,7 +491,9 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                     Ordering::SeqCst,
                 )
             };
-            if cas.is_ok() { return }
+            if cas.is_ok() {
+                return;
+            }
         }
     }
 }
