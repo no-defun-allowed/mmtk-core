@@ -457,7 +457,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         VM::VMObjectModel::ref_to_header(o) + 8usize
     }
 
-    const SLOT_TAG_BIT: usize = 1 << 63;
+    const SLOT_TAG_BIT: usize = 1;
 
     fn pop_threading_list(o: ObjectReference) -> Option<VM::VMSlot> {
         // Only one thread pops at a time under lock_for_forwarding,
@@ -477,7 +477,6 @@ impl<VM: VMBinding> OnePassSpace<VM> {
     }
 
     fn push_threading_list(o: ObjectReference, slot: VM::VMSlot) {
-        // TODO: CAS
         let list = Self::threading_list(o);
         loop {
             let next =

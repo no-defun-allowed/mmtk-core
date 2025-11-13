@@ -1,5 +1,5 @@
 use crate::policy::compressor::GC_MARK_BIT_MASK;
-use crate::util::constants::BYTES_IN_WORD;
+use crate::util::constants::{BYTES_IN_WORD, BITS_IN_BYTE};
 use crate::util::linear_scan::{Region, RegionIterator};
 use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
@@ -41,19 +41,22 @@ impl Region for CompressorRegion {
 /// using [`Transducer::decode`].
 #[derive(Debug)]
 struct Transducer {
-    /// The address for the next object to be copied to, following preceding
-    /// objects which were visited by the transducer.
-    to: Address,
+    /// The offset from the start of the region at which the Compressor
+    /// will move the next object to, following preceding objects which
+    /// were visited by the transducer.
+    offset: u32,
     /// The address of the last mark bit which the transducer visited.
     last_bit_visited: Address,
     /// Whether or not the transducer is currently inside an object
     /// (i.e. if it has seen a first bit but no matching last bit yet).
     in_object: bool,
 }
+type EncodedTransducer = u32;
+pub(crate) const LOG_BITS_IN_ENCODED: usize = (BITS_IN_BYTE * std::mem::size_of::<EncodedTransducer>()).ilog2() as usize;
 impl Transducer {
-    pub fn new(to: Address) -> Self {
+    pub fn new() -> Self {
         Self {
-            to,
+            offset: 0,
             last_bit_visited: Address::ZERO,
             in_object: false,
         }
@@ -68,35 +71,35 @@ impl Transducer {
             let first_word = self.last_bit_visited;
             let last_word = address;
             let size = last_word - first_word + BYTES_IN_WORD;
-            self.to += size;
+            self.offset += size as u32;
         }
         self.in_object = !self.in_object;
         self.last_bit_visited = address;
     }
 
-    pub fn encode(&self, current_position: Address) -> usize {
+    pub fn encode(&self, current_position: Address) -> EncodedTransducer {
         if self.in_object {
             // We count the space between the last mark bit and
             // the current address as live when we stop in the
             // middle of an object.
-            self.to.as_usize() + (current_position - self.last_bit_visited) + 1
+            self.offset + (current_position - self.last_bit_visited) as u32 + 1
         } else {
-            self.to.as_usize()
+            self.offset
         }
     }
 
-    pub fn decode(offset: usize, current_position: Address) -> Self {
+    pub fn decode(value: EncodedTransducer, current_position: Address) -> Self {
         Transducer {
-            to: unsafe { Address::from_usize(offset & !1) },
+            offset: value & !1,
             last_bit_visited: current_position,
-            in_object: (offset & 1) == 1,
+            in_object: (value & 1) == 1,
         }
     }
 }
 
 pub(crate) enum CompactLimit {
     AlwaysCompact,
-    Percent(usize),
+    Percent(u32),
 }
 
 pub(crate) struct ForwardingMetadata<VM: VMBinding> {
@@ -162,14 +165,18 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         &self,
         region: CompressorRegion,
         cursor: Address,
-    ) -> usize {
+    ) -> u32 {
         #[target_feature(enable = "pclmulqdq,popcnt")]
-        unsafe fn inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
+        unsafe fn inner(offset: &mut u32, in_object: &mut i64, word: usize, addr: Address) {
             use std::arch::x86_64;
             // encode state to offset vector
-            let encoded = (*to).as_usize() + ((*in_object as usize) >> 63);
+            let encoded = *offset + (((*in_object as usize) >> 63) as u32);
             if addr.is_aligned_to(Block::BYTES) {
-                OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
+                OFFSET_VECTOR_SPEC.store_atomic::<EncodedTransducer>(
+                    addr,
+                    encoded,
+                    Ordering::Relaxed,
+                );
             }
             // update by clmul
             let ones = unsafe { x86_64::_mm_set1_epi8(0xFFu8 as i8) };
@@ -178,10 +185,10 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 unsafe { x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0)) };
             let flipped = mask ^ *in_object;
             *in_object = flipped >> 63;
-            *to += (((flipped as usize | word).count_ones()) * 8) as usize;
+            *offset += (((flipped as usize | word).count_ones()) * 8) as u32;
         }
 
-        let mut to = region.start();
+        let mut offset: u32 = 0;
         let mut in_object: i64 = 0;
         MARK_SPEC.scan_words::<u8>(
             region.start(),
@@ -189,18 +196,18 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             &mut |_, _| panic!("should be word aligned, got a bit instead"),
             &mut |_, _| panic!("should be word aligned, got a byte instead"),
             &mut |word: usize, addr: Address| {
-                inner(&mut to, &mut in_object, word, addr);
+                inner(&mut offset, &mut in_object, word, addr);
             },
         );
-        to - region.start()
+        offset
     }
 
-    fn calculate_offset_vector_base(&self, region: CompressorRegion, cursor: Address) -> usize {
-        let mut state = Transducer::new(region.start());
+    fn calculate_offset_vector_base(&self, region: CompressorRegion, cursor: Address) -> u32 {
+        let mut state = Transducer::new();
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
         for block in RegionIterator::<Block>::new(first_block, last_block) {
-            OFFSET_VECTOR_SPEC.store_atomic::<usize>(
+            OFFSET_VECTOR_SPEC.store_atomic::<EncodedTransducer>(
                 block.start(),
                 state.encode(block.start()),
                 Ordering::Relaxed,
@@ -213,7 +220,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 },
             );
         }
-        state.to - region.start()
+        state.offset
     }
 
     pub fn select_region(&self, region: CompressorRegion) {
@@ -234,7 +241,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             self.calculate_offset_vector_base(region, cursor)
         };
         self.calculated.store(true, Ordering::Relaxed);
-        let percent = used / (CompressorRegion::BYTES / 100);
+        let percent = used / ((CompressorRegion::BYTES / 100) as u32);
         let will_compact = match self.compact_limit {
             CompactLimit::AlwaysCompact => true,
             CompactLimit::Percent(limit) => percent < limit,
@@ -249,12 +256,12 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         block_lock: &mut (impl FnMut(Block, &mut dyn FnMut()) + ?Sized),
         f: &mut impl FnMut(ObjectReference),
     ) {
-        let mut state = Transducer::new(region.start());
+        let mut state = Transducer::new();
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
         self.calculated.store(true, Ordering::Relaxed);
         for block in RegionIterator::<Block>::new(first_block, last_block) {
-            OFFSET_VECTOR_SPEC.store_atomic::<usize>(
+            OFFSET_VECTOR_SPEC.store_atomic::<EncodedTransducer>(
                 block.start(),
                 state.encode(block.start()),
                 Ordering::Relaxed,
@@ -290,18 +297,19 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         if SELECTED_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) == 0 {
             return address;
         }
+        let region = CompressorRegion::from_unaligned_address(address);
         let block = Block::from_unaligned_address(address);
         let mut state = Transducer::decode(
-            OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
+            OFFSET_VECTOR_SPEC.load_atomic::<EncodedTransducer>(block.start(), Ordering::Relaxed),
             block.start(),
         );
-        // The transducer in this implementation computes the final
-        // address of an object; whereas Total-Live-Data in the paper computes
-        // the distance of the object from the start of the block.
+        // The transducer in this implementation computes the distance of
+        // an object from the start of the region; whereas Total-Live-Data in
+        // the paper computes the distance of the object from the start of the block.
         MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
             state.visit_mark_bit(addr)
         });
-        state.to
+        region.start() + state.offset as usize
     }
 
     pub fn scan_marked_objects(
