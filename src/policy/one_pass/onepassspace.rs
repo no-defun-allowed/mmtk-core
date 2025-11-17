@@ -24,7 +24,6 @@ use crate::vm::slot::Slot;
 use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
 use atomic::Ordering;
-use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
@@ -355,7 +354,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                                         .ilog2();
                                         local_counters[bits as usize] += 1;
                                     }
-                                    Self::push_threading_list(target, s);
+                                    VM::VMObjectModel::push_threading_list(target, s);
                                 }
                                 locking::ThreadOrForward::Forward => {
                                     trace!("forwarding {target} to {}", self.forward(target, true));
@@ -396,7 +395,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 &mut |b, f| locking::lock_for_forwarding(b, f),
                 &mut |obj: ObjectReference| {
                     let new_object = self.forward(obj, false);
-                    while let Some(slot) = Self::pop_threading_list(obj) {
+                    while let Some(slot) = VM::VMObjectModel::pop_threading_list(obj) {
                         slot.store(new_object);
                     }
                     // We set the end bits based on the sizes of objects when they are
@@ -451,49 +450,6 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 }
             },
         ));
-    }
-
-    fn threading_list(o: ObjectReference) -> Address {
-        VM::VMObjectModel::ref_to_header(o) + 8usize
-    }
-
-    const SLOT_TAG_BIT: usize = 1;
-
-    fn pop_threading_list(o: ObjectReference) -> Option<VM::VMSlot> {
-        // Only one thread pops at a time under lock_for_forwarding,
-        // so this function doesn't have to be very thread-safe.
-        let list = Self::threading_list(o);
-        let word = unsafe { list.load::<usize>() };
-        if word & Self::SLOT_TAG_BIT != 0 {
-            unsafe {
-                let address = Address::from_usize(word & !Self::SLOT_TAG_BIT);
-                let next = address.load::<usize>();
-                list.store::<usize>(next);
-                Some(VM::VMSlot::from_address(address))
-            }
-        } else {
-            None
-        }
-    }
-
-    fn push_threading_list(o: ObjectReference, slot: VM::VMSlot) {
-        let list = Self::threading_list(o);
-        loop {
-            let next =
-                unsafe { Address::from_usize(list.atomic_load::<AtomicUsize>(Ordering::SeqCst)) };
-            slot.store(ObjectReference::from_raw_address(next).unwrap());
-            let cas = unsafe {
-                list.compare_exchange::<AtomicUsize>(
-                    next.as_usize(),
-                    slot.as_address().as_usize() | Self::SLOT_TAG_BIT,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                )
-            };
-            if cas.is_ok() {
-                return;
-            }
-        }
     }
 }
 

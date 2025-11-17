@@ -1,5 +1,5 @@
 use crate::policy::compressor::GC_MARK_BIT_MASK;
-use crate::util::constants::{BYTES_IN_WORD, BITS_IN_BYTE};
+use crate::util::constants::{BITS_IN_BYTE, BYTES_IN_WORD};
 use crate::util::linear_scan::{Region, RegionIterator};
 use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
@@ -52,7 +52,8 @@ struct Transducer {
     in_object: bool,
 }
 type EncodedTransducer = u32;
-pub(crate) const LOG_BITS_IN_ENCODED: usize = (BITS_IN_BYTE * std::mem::size_of::<EncodedTransducer>()).ilog2() as usize;
+pub(crate) const LOG_BITS_IN_ENCODED: usize =
+    (BITS_IN_BYTE * std::mem::size_of::<EncodedTransducer>()).ilog2() as usize;
 impl Transducer {
     pub fn new() -> Self {
         Self {

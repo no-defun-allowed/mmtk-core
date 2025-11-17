@@ -476,6 +476,13 @@ pub trait ObjectModel<VM: VMBinding> {
     fn is_object_sane(_object: ObjectReference) -> bool {
         true
     }
+
+    fn push_threading_list(_object: ObjectReference, _slot: VM::VMSlot) {
+        unimplemented!();
+    }
+    fn pop_threading_list(_object: ObjectReference) -> Option<VM::VMSlot> {
+        unimplemented!();
+    }
 }
 
 pub mod specs {
