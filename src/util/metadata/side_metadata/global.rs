@@ -1261,30 +1261,22 @@ impl SideMetadataSpec {
         let end_meta_shift = meta_byte_lshift(self, data_end_addr);
 
         let mut visit_bytes = |start: Address, end: Address| {
-            ranges::break_byte_range(
-                start,
-                end,
-                &mut |range| {
-                    match range {
-                        ByteWordRange::Bytes { start, end } => {
-                            for meta in start.iter_to(end, 1) {
-                                let addr = contiguous_meta_address_to_address(self, meta, 0);
-                                let byte = unsafe { meta.load::<u8>() };
-                                visit_byte(byte, addr);
-                            }
-                        }
-                        ByteWordRange::Words { start, end } => {
-                            for meta in start
-                                .iter_to(end, crate::util::constants::BYTES_IN_ADDRESS)
-                            {
-                                let addr = contiguous_meta_address_to_address(self, meta, 0);
-                                let word = unsafe { meta.load::<usize>() };
-                                visit_word(word, addr);
-                            }
-                        }
+            ranges::break_byte_range(start, end, &mut |range| match range {
+                ByteWordRange::Bytes { start, end } => {
+                    for meta in start.iter_to(end, 1) {
+                        let addr = contiguous_meta_address_to_address(self, meta, 0);
+                        let byte = unsafe { meta.load::<u8>() };
+                        visit_byte(byte, addr);
                     }
                 }
-            );
+                ByteWordRange::Words { start, end } => {
+                    for meta in start.iter_to(end, crate::util::constants::BYTES_IN_ADDRESS) {
+                        let addr = contiguous_meta_address_to_address(self, meta, 0);
+                        let word = unsafe { meta.load::<usize>() };
+                        visit_word(word, addr);
+                    }
+                }
+            });
         };
 
         ranges::break_bit_range(
