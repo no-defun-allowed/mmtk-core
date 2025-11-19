@@ -1,7 +1,6 @@
 use crate::plan::VectorObjectQueue;
 use crate::policy::compressor::forwarding;
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
-use crate::policy::largeobjectspace::LargeObjectSpace;
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
 use crate::scheduler::{GCWork, GCWorkScheduler, GCWorker, WorkBucketStage};
@@ -13,7 +12,7 @@ use crate::util::metadata::extract_side_metadata;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
-use crate::util::object_enum::{self, ObjectEnumerator};
+use crate::util::object_enum::ObjectEnumerator;
 use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
 use crate::MMTK;
@@ -364,10 +363,16 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         }
     }
 
-    pub fn add_compact_tasks(&'static self) {
+    pub fn add_compact_tasks(&'static self, remset: &crate::util::remset::RemSet<VM>) {
         let compact_packets: Vec<Box<dyn GCWork<VM>>> =
             self.generate_tasks(&mut |_, i| Box::new(Compact::<VM>::new(self, i)));
         self.scheduler.work_buckets[WorkBucketStage::Compact].bulk_add(compact_packets);
+        let mut update_packets: Vec<Box<dyn GCWork<VM>>> = vec![];
+        remset.flush_all(&mut |entries| {
+            let slots = entries.iter().map(|e| e.decode().0).collect();
+            update_packets.push(Box::new(UpdateSlots::new(self, slots)))
+        });
+        self.scheduler.work_buckets[WorkBucketStage::Compact].bulk_add(update_packets);
     }
 
     pub fn compact_region(&self, worker: &mut GCWorker<VM>, index: usize) {
@@ -424,14 +429,16 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         });
     }
 
-    pub fn after_compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
+    pub fn update_slots(&self, slots: &Vec<VM::VMSlot>) {
+        for s in slots.iter() {
+            if let Some(o) = s.load() {
+                s.store(self.forward(o, false));
+            }
+        }
+    }
+
+    pub fn after_compact(&self) {
         self.pr.reset_allocator();
-        // Update references from the LOS to Compressor too.
-        los.enumerate_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
-            &mut |o: ObjectReference| {
-                self.update_references(worker, o);
-            },
-        ));
     }
 }
 
@@ -479,6 +486,27 @@ impl<VM: VMBinding> Compact<VM> {
         Self {
             compressor_space,
             index,
+        }
+    }
+}
+
+/// Update references in a vector of remembered slots.
+pub struct UpdateSlots<VM: VMBinding> {
+    compressor_space: &'static CompressorSpace<VM>,
+    slots: Vec<VM::VMSlot>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for UpdateSlots<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.compressor_space.update_slots(&self.slots);
+    }
+}
+
+impl<VM: VMBinding> UpdateSlots<VM> {
+    pub fn new(compressor_space: &'static CompressorSpace<VM>, slots: Vec<VM::VMSlot>) -> Self {
+        Self {
+            compressor_space,
+            slots,
         }
     }
 }

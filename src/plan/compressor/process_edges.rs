@@ -26,11 +26,15 @@ impl<VM: VMBinding> RemsetCondition<Compressor<VM>, VM> for CompressorCondition<
     }
 }
 
+pub trait PlanRemember<VM: VMBinding> {
+    fn record(&self, source: VM::VMSlot, target: ObjectReference);
+}
+
 /// This provides an implementation of [`crate::scheduler::gc_work::ProcessEdgesWork`]. A plan that implements
 /// `PlanTraceObject` can use this work packet for tracing objects.
 pub struct PlanProcessEdges<
     VM: VMBinding,
-    P: Plan<VM = VM> + PlanTraceObject<VM>,
+    P: Plan<VM = VM> + PlanTraceObject<VM> + PlanRemember<VM>,
     C: RemsetCondition<P, VM>,
     const KIND: TraceKind,
 > {
@@ -41,7 +45,7 @@ pub struct PlanProcessEdges<
 
 impl<
         VM: VMBinding,
-        P: PlanTraceObject<VM> + Plan<VM = VM>,
+        P: PlanTraceObject<VM> + Plan<VM = VM> + PlanRemember<VM>,
         C: RemsetCondition<P, VM> + 'static,
         const KIND: TraceKind,
     > ProcessEdgesWork for PlanProcessEdges<VM, P, C, KIND>
@@ -81,7 +85,7 @@ impl<
             return;
         };
         if C::relevant(self.plan, slot, object) {
-            println!("yes");
+            self.plan.record(slot, object);
         }
         let new_object = self.trace_object(object);
         if P::may_move_objects::<KIND>() && new_object != object {
@@ -93,7 +97,7 @@ impl<
 // Impl Deref/DerefMut to ProcessEdgesBase for PlanProcessEdges
 impl<
         VM: VMBinding,
-        P: PlanTraceObject<VM> + Plan<VM = VM>,
+        P: PlanTraceObject<VM> + Plan<VM = VM> + PlanRemember<VM>,
         C: RemsetCondition<P, VM>,
         const KIND: TraceKind,
     > Deref for PlanProcessEdges<VM, P, C, KIND>
@@ -106,7 +110,7 @@ impl<
 
 impl<
         VM: VMBinding,
-        P: PlanTraceObject<VM> + Plan<VM = VM>,
+        P: PlanTraceObject<VM> + Plan<VM = VM> + PlanRemember<VM>,
         C: RemsetCondition<P, VM>,
         const KIND: TraceKind,
     > DerefMut for PlanProcessEdges<VM, P, C, KIND>
