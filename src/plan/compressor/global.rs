@@ -41,7 +41,6 @@ pub struct Compressor<VM: VMBinding> {
 pub const COMPRESSOR_CONSTRAINTS: PlanConstraints = PlanConstraints {
     max_non_los_default_alloc_bytes: MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN,
     moves_objects: true,
-    needs_forward_after_liveness: true,
     ..PlanConstraints::default()
 };
 
@@ -104,8 +103,12 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
         // scan roots to update their references
         //scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
 
+        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(
+            || self.compressor_space.add_remset_tasks(&self.remset),
+        ));
+        
         scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
-            || self.compressor_space.add_compact_tasks(&self.remset),
+            || self.compressor_space.add_compact_tasks(),
         ));
 
         scheduler.work_buckets[WorkBucketStage::Compact].set_sentinel(Box::new(

@@ -350,16 +350,19 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         }
     }
 
-    pub fn add_compact_tasks(&'static self, remset: &crate::util::remset::RemSet<VM>) {
-        let compact_packets: Vec<Box<dyn GCWork<VM>>> =
-            self.generate_tasks(&mut |_, i| Box::new(Compact::<VM>::new(self, i)));
-        self.scheduler.work_buckets[WorkBucketStage::Compact].bulk_add(compact_packets);
+    pub fn add_remset_tasks(&'static self, remset: &crate::util::remset::RemSet<VM>) {
         let mut update_packets: Vec<Box<dyn GCWork<VM>>> = vec![];
         remset.flush_all(&mut |entries| {
             let slots = entries.iter().map(|e| e.decode().0).collect();
             update_packets.push(Box::new(UpdateSlots::new(self, slots)))
         });
         self.scheduler.work_buckets[WorkBucketStage::Compact].bulk_add(update_packets);
+    }
+
+    pub fn add_compact_tasks(&'static self) {
+        let compact_packets: Vec<Box<dyn GCWork<VM>>> =
+            self.generate_tasks(&mut |_, i| Box::new(Compact::<VM>::new(self, i)));
+        self.scheduler.work_buckets[WorkBucketStage::Compact].bulk_add(compact_packets);
     }
 
     pub fn compact_region(&self, worker: &mut GCWorker<VM>, index: usize) {
