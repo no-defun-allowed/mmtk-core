@@ -21,7 +21,6 @@ use atomic::Ordering;
 use std::sync::Arc;
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
-pub(crate) const TRACE_KIND_FORWARD_ROOT: TraceKind = 1;
 
 /// [`CompressorSpace`] is a stop-the-world implementation of
 /// the Compressor, as described in Kermany and Petrank,
@@ -194,8 +193,6 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for Compressor
         );
         if KIND == TRACE_KIND_MARK {
             self.trace_mark_object(queue, object)
-        } else if KIND == TRACE_KIND_FORWARD_ROOT {
-            self.trace_forward_root(queue, object)
         } else {
             unreachable!()
         }
@@ -203,8 +200,6 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for Compressor
     fn may_move_objects<const KIND: crate::policy::gc_work::TraceKind>() -> bool {
         if KIND == TRACE_KIND_MARK {
             false
-        } else if KIND == TRACE_KIND_FORWARD_ROOT {
-            true
         } else {
             unreachable!()
         }
@@ -267,14 +262,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             self.forwarding.mark_last_word_of_object(object);
         }
         object
-    }
-
-    pub fn trace_forward_root<Q: ObjectQueue>(
-        &self,
-        _queue: &mut Q,
-        object: ObjectReference,
-    ) -> ObjectReference {
-        self.forward(object, true)
     }
 
     pub fn test_and_mark(object: ObjectReference) -> bool {
