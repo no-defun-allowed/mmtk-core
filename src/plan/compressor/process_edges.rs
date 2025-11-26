@@ -85,6 +85,7 @@ impl<
             return;
         };
         if C::relevant(self.plan, slot, object) {
+            trace!("Recording {:x} -> {:x}", slot.as_address(), object);
             self.plan.record(slot, object);
         }
         let new_object = self.trace_object(object);

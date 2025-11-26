@@ -350,13 +350,17 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         }
     }
 
-    pub fn add_remset_tasks(&'static self, remset: &crate::util::remset::RemSet<VM>) {
+    pub fn add_remset_tasks(
+        &'static self,
+        remset: &crate::util::remset::RemSet<VM>,
+        stage: WorkBucketStage,
+    ) {
         let mut update_packets: Vec<Box<dyn GCWork<VM>>> = vec![];
         remset.flush_all(&mut |entries| {
             let slots = entries.iter().map(|e| e.decode().0).collect();
             update_packets.push(Box::new(UpdateSlots::new(self, slots)))
         });
-        self.scheduler.work_buckets[WorkBucketStage::Compact].bulk_add(update_packets);
+        self.scheduler.work_buckets[stage].bulk_add(update_packets);
     }
 
     pub fn add_compact_tasks(&'static self) {
@@ -381,10 +385,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                             object
                         );
                     });
-                crate::util::metadata::vo_bit::bzero_vo_bit(start, end - start);
             }
             let mut to = start;
             if self.forwarding.is_forwarding_region(r.region) {
+                #[cfg(feature = "vo_bit")]
+                crate::util::metadata::vo_bit::bzero_vo_bit(start, end - start);
                 self.forwarding
                     .scan_marked_objects(start, end, &mut |obj: ObjectReference| {
                         // We set the end bits based on the sizes of objects when they are
@@ -419,9 +424,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         });
     }
 
-    pub fn update_slots(&self, slots: &Vec<VM::VMSlot>) {
+    pub fn update_slots(&self, slots: &[VM::VMSlot]) {
         for s in slots.iter() {
             if let Some(o) = s.load() {
+                trace!("Forwarding {o} -> {}", self.forward(o, false));
                 s.store(self.forward(o, false));
             }
         }

@@ -1,9 +1,6 @@
 use super::gc_work::CompressorWorkContext;
-use super::gc_work::{
-    AfterCompact, GenerateWork, MarkingProcessEdges,
-};
+use super::gc_work::{AfterCompact, GenerateWork, MarkingProcessEdges};
 use super::process_edges::PlanRemember;
-use crate::util::remset::RemSet;
 use crate::plan::compressor::mutator::ALLOCATOR_MAPPING;
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
@@ -20,6 +17,7 @@ use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::opaque_pointer::*;
+use crate::util::remset::RemSet;
 use crate::util::ObjectReference;
 use crate::vm::VMBinding;
 use enum_map::EnumMap;
@@ -96,24 +94,24 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
         scheduler.work_buckets[WorkBucketStage::Prepare]
             .add(Prepare::<CompressorWorkContext<VM>>::new(self));
 
-        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new(
-            || self.compressor_space.add_offset_vector_tasks()
-        ));
+        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new(|| {
+            self.compressor_space.add_offset_vector_tasks()
+        }));
 
         // scan roots to update their references
         //scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
 
-        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(
-            || self.compressor_space.add_remset_tasks(&self.remset),
-        ));
-        
-        scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(
-            || self.compressor_space.add_compact_tasks(),
-        ));
+        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
+            self.compressor_space
+                .add_remset_tasks(&self.remset, WorkBucketStage::SecondRoots)
+        }));
 
-        scheduler.work_buckets[WorkBucketStage::Compact].set_sentinel(Box::new(
-            AfterCompact::<VM>::new(&self.compressor_space),
-        ));
+        scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(|| {
+            self.compressor_space.add_compact_tasks()
+        }));
+
+        scheduler.work_buckets[WorkBucketStage::Compact]
+            .set_sentinel(Box::new(AfterCompact::<VM>::new(&self.compressor_space)));
 
         // Release global/collectors/mutators
         scheduler.work_buckets[WorkBucketStage::Release]
@@ -135,7 +133,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             use crate::util::reference_processor::RefForwarding;
             scheduler.work_buckets[WorkBucketStage::RefForwarding]
                 .add(RefForwarding::<ForwardingProcessEdges<VM>>::new());
-            */
+             */
 
             use crate::util::reference_processor::RefEnqueue;
             scheduler.work_buckets[WorkBucketStage::Release].add(RefEnqueue::<VM>::new());
@@ -143,7 +141,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
 
         // Finalization
         if !*self.base().options.no_finalizer {
-            use crate::util::finalizable_processor::{Finalization, ForwardFinalization};
+            use crate::util::finalizable_processor::Finalization;
             // finalization
             // treat finalizable objects as roots and perform a closure (marking)
             // must be done before calculating forwarding pointers
@@ -193,7 +191,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
 impl<VM: VMBinding> Compressor<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
         let scheduler = args.scheduler.clone();
-        
+
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &COMPRESSOR_CONSTRAINTS,
@@ -208,7 +206,7 @@ impl<VM: VMBinding> Compressor<VM> {
                 VMRequest::discontiguous(),
             )),
             common: CommonPlan::new(plan_args),
-            remset: RemSet::new(scheduler.num_workers())
+            remset: RemSet::new(scheduler.num_workers()),
         };
 
         res.verify_side_metadata_sanity();

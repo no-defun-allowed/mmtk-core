@@ -13,9 +13,7 @@ pub struct GenerateWork<VM: VMBinding, F: Fn() + Send + 'static> {
     _p: PhantomData<VM>,
 }
 
-impl<VM: VMBinding, F: Fn() + Send + 'static> GCWork<VM>
-    for GenerateWork<VM, F>
-{
+impl<VM: VMBinding, F: Fn() + Send + 'static> GCWork<VM> for GenerateWork<VM, F> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         (self.f)();
     }
@@ -23,10 +21,7 @@ impl<VM: VMBinding, F: Fn() + Send + 'static> GCWork<VM>
 
 impl<VM: VMBinding, F: Fn() + Send + 'static> GenerateWork<VM, F> {
     pub fn new(f: F) -> Self {
-        Self {
-            f,
-            _p: PhantomData
-        }
+        Self { f, _p: PhantomData }
     }
 }
 
@@ -42,12 +37,8 @@ impl<VM: VMBinding> GCWork<VM> for AfterCompact<VM> {
 }
 
 impl<VM: VMBinding> AfterCompact<VM> {
-    pub fn new(
-        compressor_space: &'static CompressorSpace<VM>,
-    ) -> Self {
-        Self {
-            compressor_space,
-        }
+    pub fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
+        Self { compressor_space }
     }
 }
 

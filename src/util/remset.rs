@@ -23,7 +23,7 @@ pub struct RemSet<VM: VMBinding> {
     size: AtomicUsize,
 }
 
-unsafe impl<VM: VMBinding> Sync for RemSet<VM> { }
+unsafe impl<VM: VMBinding> Sync for RemSet<VM> {}
 
 const BUFFER_CAPACITY: usize = 1024;
 
