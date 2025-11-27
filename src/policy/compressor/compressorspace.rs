@@ -53,6 +53,7 @@ pub(crate) const GC_MARK_BIT_MASK: u8 = 1;
 /// and we are often swamped by scheduling overhead when we
 /// only process one region per work packet.
 const OFFSET_VECTOR_PACKET_BYTES: usize = 1 << 21;
+const UPDATE_SLOTS_BUCKET_SIZE: usize = 1 << 10;
 
 impl<VM: VMBinding> SFT for CompressorSpace<VM> {
     fn name(&self) -> &'static str {
@@ -355,12 +356,28 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         remset: &crate::util::remset::RemSet<VM>,
         stage: WorkBucketStage,
     ) {
-        let mut update_packets: Vec<Box<dyn GCWork<VM>>> = vec![];
+        // The remset can contain duplicated slots, and updating a slot is
+        // not idempotent. We use a mostly-parallel deduplication algorithm:
+        // this method partitions slots into buckets, such that duplicated slots
+        // will be in the same bucket. Then the [`UpdateSlots`] work packet will
+        // deduplicate the contents of a bucket.
+        use crate::util::constants::LOG_BYTES_IN_PAGE;
+        let count = (remset.size() / UPDATE_SLOTS_BUCKET_SIZE).next_power_of_two();
+        let mut buckets: Vec<Vec<VM::VMSlot>> = vec![];
+        buckets.resize(count, vec![]);
         remset.flush_all(&mut |entries| {
-            let slots = entries.iter().map(|e| e.decode().0).collect();
-            update_packets.push(Box::new(UpdateSlots::new(self, slots)))
+            for entry in entries.iter() {
+                let slot = entry.decode().0;
+                let id = (slot.as_address().as_usize() >> LOG_BYTES_IN_PAGE) & (count - 1);
+                buckets[id].push(slot);
+            }
         });
-        self.scheduler.work_buckets[stage].bulk_add(update_packets);
+        self.scheduler.work_buckets[stage].bulk_add(
+            buckets
+                .into_iter()
+                .map(|slots| Box::new(UpdateSlots::<VM>::new(self, slots)) as Box<dyn GCWork<VM>>)
+                .collect(),
+        );
     }
 
     pub fn add_compact_tasks(&'static self) {
@@ -425,7 +442,13 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     pub fn update_slots(&self, slots: &[VM::VMSlot]) {
-        for s in slots.iter() {
+        // Here we continue with the deduplication algorithm in
+        // [`CompressorSpace::add_remset_tasks`]. We just have to
+        // deduplicate our bucket.
+        let mut deduped = slots.to_vec();
+        deduped.sort_by_key(VM::VMSlot::as_address);
+        deduped.dedup();
+        for s in deduped.iter() {
             if let Some(o) = s.load() {
                 trace!("Forwarding {o} -> {}", self.forward(o, false));
                 s.store(self.forward(o, false));

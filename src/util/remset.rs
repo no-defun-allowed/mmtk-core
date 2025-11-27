@@ -66,6 +66,10 @@ impl<VM: VMBinding> RemSet<VM> {
         }
     }
 
+    pub fn size(&self) -> usize {
+        self.size.load(Ordering::Relaxed)
+    }
+
     #[cold]
     fn flush(&self, id: usize) {
         if !self.gc_buffer(id).is_empty() {

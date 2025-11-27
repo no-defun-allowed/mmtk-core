@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 #[derive(Copy, Clone, PartialEq, PartialOrd)]
 pub(crate) struct CompressorRegion(Address);
 impl Region for CompressorRegion {
-    const LOG_BYTES: usize = 18; // 1 MiB
+    const LOG_BYTES: usize = 18; // 256 KiB
     fn from_aligned_address(address: Address) -> Self {
         assert!(
             address.is_aligned_to(Self::BYTES),
