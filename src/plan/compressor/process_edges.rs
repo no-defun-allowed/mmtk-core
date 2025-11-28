@@ -32,7 +32,7 @@ pub trait PlanRemember<VM: VMBinding> {
 
 /// This provides an implementation of [`crate::scheduler::gc_work::ProcessEdgesWork`]. A plan that implements
 /// `PlanTraceObject` can use this work packet for tracing objects.
-pub struct PlanProcessEdges<
+pub struct PlanProcessEdgesRemset<
     VM: VMBinding,
     P: Plan<VM = VM> + PlanTraceObject<VM> + PlanRemember<VM>,
     C: RemsetCondition<P, VM>,
@@ -48,7 +48,7 @@ impl<
         P: PlanTraceObject<VM> + Plan<VM = VM> + PlanRemember<VM>,
         C: RemsetCondition<P, VM> + 'static,
         const KIND: TraceKind,
-    > ProcessEdgesWork for PlanProcessEdges<VM, P, C, KIND>
+    > ProcessEdgesWork for PlanProcessEdgesRemset<VM, P, C, KIND>
 {
     type VM = VM;
     type ScanObjectsWorkType = PlanScanObjects<Self, P>;
@@ -95,13 +95,13 @@ impl<
     }
 }
 
-// Impl Deref/DerefMut to ProcessEdgesBase for PlanProcessEdges
+// Impl Deref/DerefMut to ProcessEdgesBase for PlanProcessEdgesRemset
 impl<
         VM: VMBinding,
         P: PlanTraceObject<VM> + Plan<VM = VM> + PlanRemember<VM>,
         C: RemsetCondition<P, VM>,
         const KIND: TraceKind,
-    > Deref for PlanProcessEdges<VM, P, C, KIND>
+    > Deref for PlanProcessEdgesRemset<VM, P, C, KIND>
 {
     type Target = ProcessEdgesBase<VM>;
     fn deref(&self) -> &Self::Target {
@@ -114,7 +114,7 @@ impl<
         P: PlanTraceObject<VM> + Plan<VM = VM> + PlanRemember<VM>,
         C: RemsetCondition<P, VM>,
         const KIND: TraceKind,
-    > DerefMut for PlanProcessEdges<VM, P, C, KIND>
+    > DerefMut for PlanProcessEdgesRemset<VM, P, C, KIND>
 {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.base

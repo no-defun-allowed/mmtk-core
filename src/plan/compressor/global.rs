@@ -1,5 +1,5 @@
 use super::gc_work::CompressorWorkContext;
-use super::gc_work::{AfterCompact, GenerateWork, MarkingProcessEdges};
+use super::gc_work::{AfterCompact, ForwardingProcessEdges, GenerateWork, MarkingProcessEdges};
 use super::process_edges::PlanRemember;
 use crate::plan::compressor::mutator::ALLOCATOR_MAPPING;
 use crate::plan::global::CreateGeneralPlanArgs;
@@ -39,6 +39,7 @@ pub struct Compressor<VM: VMBinding> {
 pub const COMPRESSOR_CONSTRAINTS: PlanConstraints = PlanConstraints {
     max_non_los_default_alloc_bytes: MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN,
     moves_objects: true,
+    needs_forward_after_liveness: true,
     ..PlanConstraints::default()
 };
 
@@ -98,9 +99,6 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             self.compressor_space.add_offset_vector_tasks()
         }));
 
-        // scan roots to update their references
-        //scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
-
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
             self.compressor_space
                 .add_remset_tasks(&self.remset, WorkBucketStage::SecondRoots)
@@ -129,11 +127,9 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             scheduler.work_buckets[WorkBucketStage::PhantomRefClosure]
                 .add(PhantomRefProcessing::<VM>::new());
 
-            /*
             use crate::util::reference_processor::RefForwarding;
             scheduler.work_buckets[WorkBucketStage::RefForwarding]
                 .add(RefForwarding::<ForwardingProcessEdges<VM>>::new());
-             */
 
             use crate::util::reference_processor::RefEnqueue;
             scheduler.work_buckets[WorkBucketStage::Release].add(RefEnqueue::<VM>::new());
@@ -141,7 +137,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
 
         // Finalization
         if !*self.base().options.no_finalizer {
-            use crate::util::finalizable_processor::Finalization;
+            use crate::util::finalizable_processor::{Finalization, ForwardFinalization};
             // finalization
             // treat finalizable objects as roots and perform a closure (marking)
             // must be done before calculating forwarding pointers
@@ -149,10 +145,8 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
                 .add(Finalization::<MarkingProcessEdges<VM>>::new());
             // update finalizable object references
             // must be done before compacting
-            /*
             scheduler.work_buckets[WorkBucketStage::FinalizableForwarding]
                 .add(ForwardFinalization::<ForwardingProcessEdges<VM>>::new());
-            */
         }
 
         // VM-specific weak ref processing
@@ -160,10 +154,8 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             .set_sentinel(Box::new(VMProcessWeakRefs::<MarkingProcessEdges<VM>>::new()));
 
         // VM-specific weak ref forwarding
-        /*
         scheduler.work_buckets[WorkBucketStage::VMRefForwarding]
             .add(VMForwardWeakRefs::<ForwardingProcessEdges<VM>>::new());
-        */
 
         // VM-specific work after forwarding, possible to implement ref enququing.
         scheduler.work_buckets[WorkBucketStage::Release].add(VMPostForwarding::<VM>::default());

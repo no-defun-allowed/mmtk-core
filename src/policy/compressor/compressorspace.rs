@@ -21,6 +21,7 @@ use atomic::Ordering;
 use std::sync::Arc;
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
+pub(crate) const TRACE_KIND_FORWARD: TraceKind = 1;
 
 /// [`CompressorSpace`] is a stop-the-world implementation of
 /// the Compressor, as described in Kermany and Petrank,
@@ -194,6 +195,8 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for Compressor
         );
         if KIND == TRACE_KIND_MARK {
             self.trace_mark_object(queue, object)
+        } else if KIND == TRACE_KIND_FORWARD {
+            self.forward(object, true)
         } else {
             unreachable!()
         }
@@ -201,6 +204,8 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for Compressor
     fn may_move_objects<const KIND: crate::policy::gc_work::TraceKind>() -> bool {
         if KIND == TRACE_KIND_MARK {
             false
+        } else if KIND == TRACE_KIND_FORWARD {
+            true
         } else {
             unreachable!()
         }
@@ -341,7 +346,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
             VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
                 if let Some(o) = s.load() {
-                    s.store(self.forward(o, false));
+                    // SecondRoots is scheduled before Compact, so we haven't yet
+                    // clobbered the VO bits.
+                    s.store(self.forward(o, true));
                 }
             });
         } else {
