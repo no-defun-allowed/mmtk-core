@@ -363,28 +363,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         remset: &crate::util::remset::RemSet<VM>,
         stage: WorkBucketStage,
     ) {
-        // The remset can contain duplicated slots, and updating a slot is
-        // not idempotent. We use a mostly-parallel deduplication algorithm:
-        // this method partitions slots into buckets, such that duplicated slots
-        // will be in the same bucket. Then the [`UpdateSlots`] work packet will
-        // deduplicate the contents of a bucket.
-        use crate::util::constants::LOG_BYTES_IN_PAGE;
-        let count = (remset.size() / UPDATE_SLOTS_BUCKET_SIZE).next_power_of_two();
-        let mut buckets: Vec<Vec<VM::VMSlot>> = vec![];
-        buckets.resize(count, vec![]);
+        let mut packets = vec![];
         remset.flush_all(&mut |entries| {
-            for entry in entries.iter() {
-                let slot = entry.decode().0;
-                let id = (slot.as_address().as_usize() >> LOG_BYTES_IN_PAGE) & (count - 1);
-                buckets[id].push(slot);
-            }
+            let slots = entries.iter().map(|e| e.decode().0).collect();
+            packets.push(Box::new(UpdateSlots::<VM>::new(self, slots)) as Box<dyn GCWork<VM>>);
         });
-        self.scheduler.work_buckets[stage].bulk_add(
-            buckets
-                .into_iter()
-                .map(|slots| Box::new(UpdateSlots::<VM>::new(self, slots)) as Box<dyn GCWork<VM>>)
-                .collect(),
-        );
+        self.scheduler.work_buckets[stage].bulk_add(packets);
     }
 
     pub fn add_compact_tasks(&'static self) {
@@ -449,13 +433,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     pub fn update_slots(&self, slots: &[VM::VMSlot]) {
-        // Here we continue with the deduplication algorithm in
-        // [`CompressorSpace::add_remset_tasks`]. We just have to
-        // deduplicate our bucket.
-        let mut deduped = slots.to_vec();
-        deduped.sort_by_key(VM::VMSlot::as_address);
-        deduped.dedup();
-        for s in deduped.iter() {
+        for s in slots {
             if let Some(o) = s.load() {
                 trace!("Forwarding {o} -> {}", self.forward(o, false));
                 s.store(self.forward(o, false));
