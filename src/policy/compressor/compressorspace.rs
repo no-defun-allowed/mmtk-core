@@ -54,7 +54,6 @@ pub(crate) const GC_MARK_BIT_MASK: u8 = 1;
 /// and we are often swamped by scheduling overhead when we
 /// only process one region per work packet.
 const OFFSET_VECTOR_PACKET_BYTES: usize = 1 << 21;
-const UPDATE_SLOTS_BUCKET_SIZE: usize = 1 << 10;
 
 impl<VM: VMBinding> SFT for CompressorSpace<VM> {
     fn name(&self) -> &'static str {

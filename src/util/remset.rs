@@ -74,6 +74,7 @@ impl<VM: VMBinding> RemSet<VM> {
     fn flush(&self, id: usize) {
         if !self.gc_buffer(id).is_empty() {
             let remset = std::mem::take(self.gc_buffer(id));
+            self.gc_buffer(id).reserve_exact(BUFFER_CAPACITY);
             self.size.fetch_add(remset.len(), Ordering::SeqCst);
             let packet_buffer = unsafe { &mut *self.saved_buffers[id].get() };
             packet_buffer.push(remset);
