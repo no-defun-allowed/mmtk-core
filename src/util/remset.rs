@@ -16,16 +16,27 @@ impl<VM: VMBinding> RemSetEntry<VM> {
     }
 }
 
+// We put each RemSetBuffer on its own cache line, to avoid false sharing
+// when each worker uses its own element of a Vec<RemSetEntry<VM>>.
+#[repr(align(64))]
+struct RemSetBuffer<VM: VMBinding>(UnsafeCell<Vec<RemSetEntry<VM>>>);
+
+const BUFFER_CAPACITY: usize = 1024;
+
+impl<VM: VMBinding> RemSetBuffer<VM> {
+    fn new() -> Self {
+        Self(UnsafeCell::new(Vec::with_capacity(BUFFER_CAPACITY)))
+    }
+}
+
 pub struct RemSet<VM: VMBinding> {
-    pub(super) gc_buffers: Vec<UnsafeCell<Vec<RemSetEntry<VM>>>>,
+    gc_buffers: Vec<RemSetBuffer<VM>>,
     saved_buffers: Vec<UnsafeCell<Vec<Vec<RemSetEntry<VM>>>>>,
     _p: PhantomData<VM>,
     size: AtomicUsize,
 }
 
 unsafe impl<VM: VMBinding> Sync for RemSet<VM> {}
-
-const BUFFER_CAPACITY: usize = 1024;
 
 impl<VM: VMBinding> RemSet<VM> {
     pub fn new(workers: usize) -> Self {
@@ -36,7 +47,7 @@ impl<VM: VMBinding> RemSet<VM> {
             size: AtomicUsize::new(0),
         };
         rs.gc_buffers
-            .resize_with(workers, || UnsafeCell::new(vec![]));
+            .resize_with(workers, RemSetBuffer::new);
         rs.saved_buffers
             .resize_with(workers, || UnsafeCell::new(vec![]));
         rs
@@ -44,7 +55,7 @@ impl<VM: VMBinding> RemSet<VM> {
 
     #[allow(clippy::mut_from_ref)]
     fn gc_buffer(&self, id: usize) -> &mut Vec<RemSetEntry<VM>> {
-        unsafe { &mut *self.gc_buffers[id].get() }
+        unsafe { &mut *self.gc_buffers[id].0.get() }
     }
 
     pub fn flush_all(&self, buffer_consumer: &mut impl FnMut(Vec<RemSetEntry<VM>>)) {
