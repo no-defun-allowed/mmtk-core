@@ -270,6 +270,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     pub fn test_and_mark(object: ObjectReference) -> bool {
+        // Test...
+        if forwarding::MARK_SPEC.load_atomic::<u8>(object.to_raw_address(), Ordering::Relaxed) == GC_MARK_BIT_MASK {
+            return false
+        }
+        // ...and test-and-set.
         let old = forwarding::MARK_SPEC.fetch_or_atomic(
             object.to_raw_address(),
             GC_MARK_BIT_MASK,
