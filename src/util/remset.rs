@@ -1,5 +1,6 @@
 use crate::util::ObjectReference;
 use crate::vm::VMBinding;
+use crate::scheduler::GCWorker;
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -92,8 +93,8 @@ impl<VM: VMBinding> RemSet<VM> {
         }
     }
 
-    pub fn record(&self, s: VM::VMSlot, o: ObjectReference) {
-        let id = crate::scheduler::current_worker_ordinal();
+    pub fn record(&self, s: VM::VMSlot, o: ObjectReference, worker: &GCWorker<VM>) {
+        let id = worker.ordinal;
         self.gc_buffer(id).push(RemSetEntry::encode(s, o));
         if self.gc_buffer(id).len() >= BUFFER_CAPACITY {
             self.flush(id)

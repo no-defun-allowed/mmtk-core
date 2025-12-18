@@ -4,7 +4,7 @@ use crate::plan::{Plan, PlanTraceObject, VectorObjectQueue};
 use crate::policy::gc_work::TraceKind;
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::{PlanScanObjects, ProcessEdgesBase, SlotOf};
-use crate::scheduler::{ProcessEdgesWork, WorkBucketStage};
+use crate::scheduler::{GCWorker, ProcessEdgesWork, WorkBucketStage};
 use crate::util::ObjectReference;
 use crate::vm::slot::Slot;
 use crate::vm::VMBinding;
@@ -27,7 +27,7 @@ impl<VM: VMBinding> RemsetCondition<Compressor<VM>, VM> for CompressorCondition<
 }
 
 pub trait PlanRemember<VM: VMBinding> {
-    fn record(&self, source: VM::VMSlot, target: ObjectReference);
+    fn record(&self, source: VM::VMSlot, target: ObjectReference, worker: &GCWorker<VM>);
 }
 
 /// This provides an implementation of [`crate::scheduler::gc_work::ProcessEdgesWork`]. A plan that implements
@@ -86,7 +86,8 @@ impl<
         };
         if C::relevant(self.plan, slot, object) {
             trace!("Recording {:x} -> {:x}", slot.as_address(), object);
-            self.plan.record(slot, object);
+            let worker = self.worker();
+            self.plan.record(slot, object, worker);
         }
         let new_object = self.trace_object(object);
         if P::may_move_objects::<KIND>() && new_object != object {

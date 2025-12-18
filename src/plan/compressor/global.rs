@@ -10,7 +10,7 @@ use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
 use crate::policy::compressor::CompressorSpace;
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
-use crate::scheduler::{GCWorkScheduler, WorkBucketStage};
+use crate::scheduler::{GCWorker, GCWorkScheduler, WorkBucketStage};
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::heap::gc_trigger::SpaceStats;
 #[allow(unused_imports)]
@@ -208,7 +208,7 @@ impl<VM: VMBinding> Compressor<VM> {
 }
 
 impl<VM: VMBinding> PlanRemember<VM> for Compressor<VM> {
-    fn record(&self, source: VM::VMSlot, target: ObjectReference) {
-        self.remset.record(source, target);
+    fn record(&self, source: VM::VMSlot, target: ObjectReference, worker: &GCWorker<VM>) {
+        self.remset.record(source, target, worker);
     }
 }
