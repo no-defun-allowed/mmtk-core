@@ -1,4 +1,3 @@
-use crate::policy::compressor::GC_MARK_BIT_MASK;
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::{Region, RegionIterator};
 use crate::util::metadata::side_metadata::spec_defs::{
@@ -149,7 +148,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             );
         }
 
-        MARK_SPEC.fetch_or_atomic(last_word_of_object, GC_MARK_BIT_MASK, Ordering::SeqCst);
+        // We only mark the last word as input to computing forwarding
+        // information, so relaxed consistency is okay.
+        MARK_SPEC.fetch_or_atomic::<u8>(last_word_of_object, 1, Ordering::Relaxed);
     }
 
     // SAFETY: Only call this function when the processor supports pclmulqdq and popcnt.

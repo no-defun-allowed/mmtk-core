@@ -47,8 +47,6 @@ pub struct CompressorSpace<VM: VMBinding> {
     scheduler: Arc<GCWorkScheduler<VM>>,
 }
 
-pub(crate) const GC_MARK_BIT_MASK: u8 = 1;
-
 /// The number of bytes of the heap that each CalculateOffsetVector
 /// work packet should process. Calculating the offset vector is very fast,
 /// and we are often swamped by scheduling overhead when we
@@ -270,24 +268,26 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     pub fn test_and_mark(object: ObjectReference) -> bool {
-        // Test...
-        if forwarding::MARK_SPEC.load_atomic::<u8>(object.to_raw_address(), Ordering::Relaxed) == GC_MARK_BIT_MASK {
-            return false
-        }
-        // ...and test-and-set.
-        let old = forwarding::MARK_SPEC.fetch_or_atomic(
-            object.to_raw_address(),
-            GC_MARK_BIT_MASK,
-            Ordering::SeqCst,
-        );
-        (old & GC_MARK_BIT_MASK) == 0
+        forwarding::MARK_SPEC
+            .fetch_update_atomic::<u8, _>(
+                object.to_raw_address(),
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |v| {
+                    if v == 0 {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .is_ok()
     }
 
     pub fn is_marked(object: ObjectReference) -> bool {
-        let old_value =
+        let mark_bit =
             forwarding::MARK_SPEC.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst);
-        let mark_bit = old_value & GC_MARK_BIT_MASK;
-        mark_bit != 0
+        mark_bit == 1
     }
 
     fn generate_tasks(
