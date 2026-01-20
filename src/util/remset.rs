@@ -1,6 +1,6 @@
+use crate::scheduler::GCWorker;
 use crate::util::ObjectReference;
 use crate::vm::VMBinding;
-use crate::scheduler::GCWorker;
 use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,8 +47,7 @@ impl<VM: VMBinding> RemSet<VM> {
             _p: PhantomData,
             size: AtomicUsize::new(0),
         };
-        rs.gc_buffers
-            .resize_with(workers, RemSetBuffer::new);
+        rs.gc_buffers.resize_with(workers, RemSetBuffer::new);
         rs.saved_buffers
             .resize_with(workers, || UnsafeCell::new(vec![]));
         rs

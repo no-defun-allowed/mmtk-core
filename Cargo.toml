@@ -199,6 +199,9 @@ nogc_multi_space = []
 # non-moving objects; but compacting all objects will be more space-efficient.
 compressor_single_space = []
 
+# Use Android/Clozure Common Lisp-style mark bitmaps instead of Compressor-style.
+compressor_art_marking = []
+
 # To collect statistics for each GC work packet. Enabling this may introduce a small overhead (several percentage slowdown on benchmark time).
 work_packet_stats = []
 

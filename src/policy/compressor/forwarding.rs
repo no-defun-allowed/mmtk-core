@@ -150,7 +150,16 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 
         // We only mark the last word as input to computing forwarding
         // information, so relaxed consistency is okay.
-        MARK_SPEC.fetch_or_atomic::<u8>(last_word_of_object, 1, Ordering::Relaxed);
+        if cfg!(feature = "compressor_art_marking") {
+            let first_word_of_object = object.to_object_start::<VM>();
+            // XXX: this will SeqCst and we don't need that.
+            MARK_SPEC.bset_metadata(
+                first_word_of_object,
+                last_word_of_object - first_word_of_object,
+            );
+        } else {
+            MARK_SPEC.fetch_or_atomic::<u8>(last_word_of_object, 1, Ordering::Relaxed);
+        }
     }
 
     // SAFETY: Only call this function when the processor supports pclmulqdq and popcnt.
@@ -168,10 +177,10 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
             }
             // update by clmul
-            let ones = unsafe { x86_64::_mm_set1_epi8(0xFFu8 as i8) };
-            let vector = unsafe { x86_64::_mm_set_epi64x(0, word as i64) };
+            let ones = x86_64::_mm_set1_epi8(0xFFu8 as i8);
+            let vector = x86_64::_mm_set_epi64x(0, word as i64);
             let mask: i64 =
-                unsafe { x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0)) };
+                x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0));
             let flipped = mask ^ *in_object;
             *in_object = flipped >> 63;
             *to += (((flipped as usize | word).count_ones()) * 8) as usize;
@@ -179,7 +188,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 
         let mut to = region.start();
         let mut in_object: i64 = 0;
-        MARK_SPEC.scan_words::<u8>(
+        MARK_SPEC.scan_words(
             region.start(),
             cursor.align_up(Block::BYTES),
             &mut |word, _, start, end| {
@@ -213,11 +222,35 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         state.to - region.start()
     }
 
+    fn calculate_offset_vector_art(&self, region: CompressorRegion, cursor: Address) -> usize {
+        let mut to = region.start();
+        MARK_SPEC.scan_words(
+            region.start(),
+            cursor.align_up(Block::BYTES),
+            &mut |word, _, start, end| {
+                panic!("should be word aligned, got {word}[{start}:{end}] instead")
+            },
+            &mut |word: usize, addr: Address| {
+                if addr.is_aligned_to(Block::BYTES) {
+                    OFFSET_VECTOR_SPEC.store_atomic::<usize>(
+                        addr,
+                        to.as_usize(),
+                        Ordering::Relaxed,
+                    );
+                }
+                to += 8 * word.count_ones() as usize
+            },
+        );
+        to - region.start()
+    }
+
     pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
         let blocks_large_enough = Block::LOG_BYTES >= 9;
         let cpu_supports_features =
             is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt");
-        let used = if blocks_large_enough && cpu_supports_features {
+        let used = if cfg!(feature = "compressor_art_marking") {
+            self.calculate_offset_vector_art(region, cursor)
+        } else if blocks_large_enough && cpu_supports_features {
             unsafe {
                 // SAFETY: We checked the processor supports the
                 // necessary instructions.
@@ -249,20 +282,41 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             "forward() should only be called when we have calculated an offset vector"
         );
         if SELECTED_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) == 0 {
-            return address;
+            address
+        } else if cfg!(feature = "compressor_art_marking") {
+            let block = Block::from_unaligned_address(address);
+            let base = unsafe {
+                Address::from_usize(
+                    OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
+                )
+            };
+            let mut part_offset: usize = 0;
+            let mut word_offset: usize = 0;
+            MARK_SPEC.scan_words(
+                block.start(),
+                address,
+                &mut |word, _, start, end| {
+                    assert_eq!(start, 0);
+                    let mask = (1 << end) - 1;
+                    part_offset += 8 * (word & mask).count_ones() as usize
+                },
+                &mut |word, _| word_offset += 8 * word.count_ones() as usize,
+            );
+            base + part_offset + word_offset
+        } else {
+            let block = Block::from_unaligned_address(address);
+            let mut state = Transducer::decode(
+                OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
+                block.start(),
+            );
+            // The transducer in this implementation computes the final
+            // address of an object; whereas Total-Live-Data in the paper computes
+            // the distance of the object from the start of the block.
+            MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
+                state.visit_mark_bit(addr)
+            });
+            state.to
         }
-        let block = Block::from_unaligned_address(address);
-        let mut state = Transducer::decode(
-            OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
-            block.start(),
-        );
-        // The transducer in this implementation computes the final
-        // address of an object; whereas Total-Live-Data in the paper computes
-        // the distance of the object from the start of the block.
-        MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
-            state.visit_mark_bit(addr)
-        });
-        state.to
     }
 
     pub fn scan_marked_objects(
@@ -271,14 +325,18 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         end: Address,
         f: &mut impl FnMut(ObjectReference),
     ) {
-        let mut in_object = false;
-        MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
-            if !in_object {
-                let object = ObjectReference::from_raw_address(addr).unwrap();
-                f(object);
-            }
-            in_object = !in_object;
-        });
+        if cfg!(feature = "compressor_art_marking") {
+            unimplemented!();
+        } else {
+            let mut in_object = false;
+            MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
+                if !in_object {
+                    let object = ObjectReference::from_raw_address(addr).unwrap();
+                    f(object);
+                }
+                in_object = !in_object;
+            });
+        }
     }
 
     pub fn has_calculated_forwarding_addresses(&self) -> bool {

@@ -10,7 +10,7 @@ use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
 use crate::policy::compressor::CompressorSpace;
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
-use crate::scheduler::{GCWorker, GCWorkScheduler, WorkBucketStage};
+use crate::scheduler::{GCWorkScheduler, GCWorker, WorkBucketStage};
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::heap::gc_trigger::SpaceStats;
 #[allow(unused_imports)]
