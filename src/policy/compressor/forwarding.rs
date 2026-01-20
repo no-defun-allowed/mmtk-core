@@ -322,17 +322,14 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         f: &mut impl FnMut(ObjectReference),
     ) {
         if cfg!(feature = "compressor_art_marking") {
-            let mut addr = start;
-            while addr < end {
-                if MARK_SPEC.load_atomic::<u8>(addr, Ordering::Relaxed) == 1 {
+            let mut last_end = Address::ZERO;
+            MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
+                if addr >= last_end {
                     let object = ObjectReference::from_raw_address(addr).unwrap();
-                    addr += VM::VMObjectModel::get_current_size(object);
-                    f(object)
-                } else {
-                    // XXX: This is ridiculous.
-                    addr += VM::MIN_ALIGNMENT
+                    last_end = addr + VM::VMObjectModel::get_current_size(object);
+                    f(object);
                 }
-            }
+            });
         } else {
             let mut in_object = false;
             MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
