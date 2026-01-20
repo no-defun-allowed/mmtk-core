@@ -129,35 +129,31 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 
     pub fn mark_last_word_of_object(&self, object: ObjectReference) {
-        let last_word_of_object = object.to_object_start::<VM>()
-            + VM::VMObjectModel::get_current_size(object)
-            - BYTES_IN_WORD;
-        #[cfg(debug_assertions)]
-        {
-            // We require to be able to iterate upon first and last bits in the
-            // same bitmap. Therefore the first and last bits cannot be the
-            // same, else we would only encounter one of the two bits.
-            // This requirement implies that objects must be at least two words
-            // large.
-            debug_assert!(
-                MARK_SPEC.are_different_metadata_bits(
-                    object.to_object_start::<VM>(),
-                    last_word_of_object
-                ),
-                "The first and last mark bits should be different bits."
-            );
-        }
-
-        // We only mark the last word as input to computing forwarding
-        // information, so relaxed consistency is okay.
         if cfg!(feature = "compressor_art_marking") {
-            let first_word_of_object = object.to_object_start::<VM>();
             // XXX: this will SeqCst and we don't need that.
             MARK_SPEC.bset_metadata(
-                first_word_of_object,
-                last_word_of_object - first_word_of_object,
+                object.to_object_start::<VM>(),
+                VM::VMObjectModel::get_current_size(object),
             );
         } else {
+            let last_word_of_object = object.to_object_start::<VM>()
+                + VM::VMObjectModel::get_current_size(object)
+                - BYTES_IN_WORD;
+            #[cfg(debug_assertions)]
+            {
+                // We require to be able to iterate upon first and last bits in the
+                // same bitmap. Therefore the first and last bits cannot be the
+                // same, else we would only encounter one of the two bits.
+                // This requirement implies that objects must be at least two words
+                // large.
+                debug_assert!(
+                    MARK_SPEC.are_different_metadata_bits(
+                        object.to_object_start::<VM>(),
+                        last_word_of_object
+                    ),
+                    "The first and last mark bits should be different bits."
+                );
+            }
             MARK_SPEC.fetch_or_atomic::<u8>(last_word_of_object, 1, Ordering::Relaxed);
         }
     }
@@ -326,7 +322,17 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         f: &mut impl FnMut(ObjectReference),
     ) {
         if cfg!(feature = "compressor_art_marking") {
-            unimplemented!();
+            let mut addr = start;
+            while addr < end {
+                if MARK_SPEC.load_atomic::<u8>(addr, Ordering::Relaxed) == 1 {
+                    let object = ObjectReference::from_raw_address(addr).unwrap();
+                    addr += VM::VMObjectModel::get_current_size(object);
+                    f(object)
+                } else {
+                    // XXX: This is ridiculous.
+                    addr += VM::MIN_ALIGNMENT
+                }
+            }
         } else {
             let mut in_object = false;
             MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
