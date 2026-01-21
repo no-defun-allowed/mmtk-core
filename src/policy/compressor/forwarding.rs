@@ -1,5 +1,6 @@
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::{Region, RegionIterator};
+use crate::util::metadata::side_metadata::ranges::Bits;
 use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
 };
@@ -116,6 +117,7 @@ impl Region for Block {
 }
 
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
+const BYTES_PER_MARK_BIT: usize = 1usize << MARK_SPEC.log_num_of_bits;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
 pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
 
@@ -166,20 +168,12 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     ) -> usize {
         #[target_feature(enable = "pclmulqdq,popcnt")]
         unsafe fn inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
-            use std::arch::x86_64;
             // encode state to offset vector
             let encoded = (*to).as_usize() + ((*in_object as usize) >> 63);
             if addr.is_aligned_to(Block::BYTES) {
                 OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
             }
-            // update by clmul
-            let ones = x86_64::_mm_set1_epi8(0xFFu8 as i8);
-            let vector = x86_64::_mm_set_epi64x(0, word as i64);
-            let mask: i64 =
-                x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0));
-            let flipped = mask ^ *in_object;
-            *in_object = flipped >> 63;
-            *to += (((flipped as usize | word).count_ones()) * 8) as usize;
+            clmul_step(to, in_object, word)
         }
 
         let mut to = region.start();
@@ -187,11 +181,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         MARK_SPEC.scan_words(
             region.start(),
             cursor.align_up(Block::BYTES),
-            &mut |word, _, start, end| {
-                panic!("should be word aligned, got {word}[{start}:{end}] instead")
-            },
-            &mut |word: usize, addr: Address| {
-                inner(&mut to, &mut in_object, word, addr);
+            &mut |word, addr, bits| match bits {
+                Bits::Range { start, end } => {
+                    panic!("should be word aligned, got {word}[{start}:{end}] instead")
+                }
+                Bits::All => inner(&mut to, &mut in_object, word, addr),
             },
         );
         to - region.start()
@@ -223,18 +217,20 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         MARK_SPEC.scan_words(
             region.start(),
             cursor.align_up(Block::BYTES),
-            &mut |word, _, start, end| {
-                panic!("should be word aligned, got {word}[{start}:{end}] instead")
-            },
-            &mut |word: usize, addr: Address| {
-                if addr.is_aligned_to(Block::BYTES) {
-                    OFFSET_VECTOR_SPEC.store_atomic::<usize>(
-                        addr,
-                        to.as_usize(),
-                        Ordering::Relaxed,
-                    );
+            &mut |word, addr, bits| match bits {
+                Bits::Range { start, end } => {
+                    panic!("should be word aligned, got {word}[{start}:{end}] instead")
                 }
-                to += 8 * word.count_ones() as usize
+                Bits::All => {
+                    if addr.is_aligned_to(Block::BYTES) {
+                        OFFSET_VECTOR_SPEC.store_atomic::<usize>(
+                            addr,
+                            to.as_usize(),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    to += BYTES_PER_MARK_BIT * word.count_ones() as usize
+                }
             },
         );
         to - region.start()
@@ -281,24 +277,20 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             address
         } else if cfg!(feature = "compressor_art_marking") {
             let block = Block::from_unaligned_address(address);
-            let base = unsafe {
+            let mut to = unsafe {
                 Address::from_usize(
                     OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
                 )
             };
-            let mut part_offset: usize = 0;
-            let mut word_offset: usize = 0;
-            MARK_SPEC.scan_words(
-                block.start(),
-                address,
-                &mut |word, _, start, end| {
+            MARK_SPEC.scan_words(block.start(), address, &mut |word, _, bits| match bits {
+                Bits::Range { start, end } => {
                     assert_eq!(start, 0);
                     let mask = (1 << end) - 1;
-                    part_offset += 8 * (word & mask).count_ones() as usize
-                },
-                &mut |word, _| word_offset += 8 * word.count_ones() as usize,
-            );
-            base + part_offset + word_offset
+                    to += BYTES_PER_MARK_BIT * (word & mask).count_ones() as usize
+                }
+                Bits::All => to += BYTES_PER_MARK_BIT * word.count_ones() as usize,
+            });
+            to
         } else {
             let block = Block::from_unaligned_address(address);
             let mut state = Transducer::decode(
@@ -313,6 +305,26 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             });
             state.to
         }
+    }
+
+    pub unsafe fn forward_clmul(&self, address: Address) -> Address {
+        let block = Block::from_unaligned_address(address);
+        let (mut address, mut in_object) = {
+            let state = Transducer::decode(
+                OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
+                block.start(),
+            );
+            (state.to, if state.in_object { -1i64 } else { 0i64 })
+        };
+        MARK_SPEC.scan_words(block.start(), address, &mut |word, _, bits| match bits {
+            Bits::Range { start, end } => {
+                assert_eq!(start, 0);
+                let mask = (1 << end) - 1;
+                clmul_step(&mut address, &mut in_object, word & mask)
+            }
+            Bits::All => clmul_step(&mut address, &mut in_object, word),
+        });
+        address
     }
 
     pub fn scan_marked_objects(
@@ -345,4 +357,15 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     pub fn has_calculated_forwarding_addresses(&self) -> bool {
         self.calculated.load(Ordering::Relaxed)
     }
+}
+
+#[target_feature(enable = "pclmulqdq,popcnt")]
+unsafe fn clmul_step(to: &mut Address, in_object: &mut i64, word: usize) {
+    use std::arch::x86_64;
+    let ones = x86_64::_mm_set1_epi8(0xFFu8 as i8);
+    let vector = x86_64::_mm_set_epi64x(0, word as i64);
+    let mask: i64 = x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0));
+    let flipped = mask ^ *in_object;
+    *in_object = flipped >> 63;
+    *to += (((flipped as usize | word).count_ones()) * 8) as usize;
 }

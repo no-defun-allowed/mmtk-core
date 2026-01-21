@@ -190,6 +190,11 @@ pub enum BitWordRange {
     },
 }
 
+pub enum Bits {
+    All,
+    Range { start: BitOffset, end: BitOffset },
+}
+
 pub fn break_bit_word_range(
     start_addr: Address,
     start_bit: BitOffset,
