@@ -326,7 +326,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.forwarding.calculate_offset_vector(region, cursor);
     }
 
-    pub fn forward<const CAN_CLMUL: bool>(&self, object: ObjectReference, _vo_bit_valid: bool) -> ObjectReference {
+    pub fn forward<const CAN_CLMUL: bool>(
+        &self,
+        object: ObjectReference,
+        _vo_bit_valid: bool,
+    ) -> ObjectReference {
         if !self.in_space(object) {
             return object;
         }
@@ -343,18 +347,17 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 object
             );
         }
-        let to = if CAN_CLMUL {
-            #[cfg(target_arch = "x86_64")]
-            unsafe { self.forwarding.forward_clmul(object.to_raw_address()) }
-            #[cfg(not(target_arch = "x86_64"))]
-            unreachable!()
-        } else {
-            self.forwarding.forward(object.to_raw_address())
-        };
+        let to = self
+            .forwarding
+            .forward::<CAN_CLMUL>(object.to_raw_address());
         ObjectReference::from_raw_address(to).unwrap()
     }
 
-    fn update_references<const CAN_CLMUL: bool>(&self, worker: &mut GCWorker<VM>, object: ObjectReference) {
+    fn update_references<const CAN_CLMUL: bool>(
+        &self,
+        worker: &mut GCWorker<VM>,
+        object: ObjectReference,
+    ) {
         if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
             VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
                 if let Some(o) = s.load() {
@@ -498,7 +501,8 @@ pub struct Compact<VM: VMBinding, const CAN_CLMUL: bool> {
 
 impl<VM: VMBinding, const CAN_CLMUL: bool> GCWork<VM> for Compact<VM, CAN_CLMUL> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.compressor_space.compact_region::<CAN_CLMUL>(worker, self.index);
+        self.compressor_space
+            .compact_region::<CAN_CLMUL>(worker, self.index);
     }
 }
 

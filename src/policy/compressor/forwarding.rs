@@ -161,11 +161,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 
     #[target_feature(enable = "pclmulqdq,popcnt")]
-    fn calculate_offset_vector_clmul(
-        &self,
-        region: CompressorRegion,
-        cursor: Address,
-    ) -> usize {
+    fn calculate_offset_vector_clmul(&self, region: CompressorRegion, cursor: Address) -> usize {
         #[target_feature(enable = "pclmulqdq,popcnt")]
         fn inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
             // encode state to offset vector
@@ -266,7 +262,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         SELECTED_SPEC.load_atomic::<u8>(region.start(), Ordering::Relaxed) != 0
     }
 
-    pub fn forward(&self, address: Address) -> Address {
+    pub fn forward<const CAN_CLMUL: bool>(&self, address: Address) -> Address {
         debug_assert!(
             self.calculated.load(Ordering::Relaxed),
             "forward() should only be called when we have calculated an offset vector"
@@ -274,43 +270,58 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         if SELECTED_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) == 0 {
             address
         } else if cfg!(feature = "compressor_art_marking") {
-            let block = Block::from_unaligned_address(address);
-            let mut to = unsafe {
-                Address::from_usize(
-                    OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
-                )
-            };
-            MARK_SPEC.scan_words(block.start(), address, &mut |word, _, bits| match bits {
-                Bits::Range { start, end } => {
-                    assert_eq!(start, 0);
-                    let mask = (1 << end) - 1;
-                    to += BYTES_PER_MARK_BIT * (word & mask).count_ones() as usize
-                }
-                Bits::All => to += BYTES_PER_MARK_BIT * word.count_ones() as usize,
-            });
-            to
+            self.forward_art(address)
+        } else if CAN_CLMUL {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                self.forward_clmul(address)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!()
         } else {
-            let block = Block::from_unaligned_address(address);
-            let mut state = Transducer::decode(
-                OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
-                block.start(),
-            );
-            // The transducer in this implementation computes the final
-            // address of an object; whereas Total-Live-Data in the paper computes
-            // the distance of the object from the start of the block.
-            MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
-                state.visit_mark_bit(addr)
-            });
-            state.to
+            self.forward_base(address)
         }
+    }
+
+    fn forward_art(&self, address: Address) -> Address {
+        let block = Block::from_unaligned_address(address);
+        let mut to = unsafe {
+            Address::from_usize(
+                OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
+            )
+        };
+        MARK_SPEC.scan_words(block.start(), address, &mut |word, _, bits| match bits {
+            Bits::Range { start, end } => {
+                assert_eq!(start, 0);
+                let mask = (1 << end) - 1;
+                to += BYTES_PER_MARK_BIT * (word & mask).count_ones() as usize
+            }
+            Bits::All => to += BYTES_PER_MARK_BIT * word.count_ones() as usize,
+        });
+        to
+    }
+
+    fn forward_base(&self, address: Address) -> Address {
+        let block = Block::from_unaligned_address(address);
+        let mut state = Transducer::decode(
+            OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
+            block.start(),
+        );
+        // The transducer in this implementation computes the final
+        // address of an object; whereas Total-Live-Data in the paper computes
+        // the distance of the object from the start of the block.
+        MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
+            state.visit_mark_bit(addr)
+        });
+        state.to
     }
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "pclmulqdq,popcnt")]
-    pub fn forward_clmul(&self, address: Address) -> Address {
+    fn forward_clmul(&self, address: Address) -> Address {
         debug_assert!(cpu_supports_clmul());
         let block = Block::from_unaligned_address(address);
-        let (mut address, mut in_object) = {
+        let (mut to, mut in_object) = {
             let state = Transducer::decode(
                 OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
                 block.start(),
@@ -321,11 +332,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             Bits::Range { start, end } => {
                 assert_eq!(start, 0);
                 let mask = (1 << end) - 1;
-                clmul_step(&mut address, &mut in_object, word & mask)
+                clmul_step(&mut to, &mut in_object, word & mask)
             }
-            Bits::All => clmul_step(&mut address, &mut in_object, word),
+            Bits::All => clmul_step(&mut to, &mut in_object, word),
         });
-        address
+        to
     }
 
     pub fn scan_marked_objects(
@@ -373,7 +384,9 @@ fn clmul_step(to: &mut Address, in_object: &mut i64, word: usize) {
 
 pub(crate) fn cpu_supports_clmul() -> bool {
     #[cfg(target_arch = "x86_64")]
-    { is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt") }
+    {
+        is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt")
+    }
     #[cfg(not(target_arch = "x86_64"))]
     false
 }
