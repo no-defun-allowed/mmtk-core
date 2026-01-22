@@ -160,14 +160,14 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         }
     }
 
-    // SAFETY: Only call this function when the processor supports pclmulqdq and popcnt.
-    unsafe fn calculate_offset_vector_clmul(
+    #[target_feature(enable = "pclmulqdq,popcnt")]
+    fn calculate_offset_vector_clmul(
         &self,
         region: CompressorRegion,
         cursor: Address,
     ) -> usize {
         #[target_feature(enable = "pclmulqdq,popcnt")]
-        unsafe fn inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
+        fn inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
             // encode state to offset vector
             let encoded = (*to).as_usize() + ((*in_object as usize) >> 63);
             if addr.is_aligned_to(Block::BYTES) {
@@ -238,11 +238,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 
     pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
         let blocks_large_enough = Block::LOG_BYTES >= 9;
-        let cpu_supports_features =
-            is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt");
         let used = if cfg!(feature = "compressor_art_marking") {
             self.calculate_offset_vector_art(region, cursor)
-        } else if blocks_large_enough && cpu_supports_features {
+        } else if blocks_large_enough && cpu_supports_clmul() {
             unsafe {
                 // SAFETY: We checked the processor supports the
                 // necessary instructions.
@@ -307,7 +305,10 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         }
     }
 
-    pub unsafe fn forward_clmul(&self, address: Address) -> Address {
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "pclmulqdq,popcnt")]
+    pub fn forward_clmul(&self, address: Address) -> Address {
+        debug_assert!(cpu_supports_clmul());
         let block = Block::from_unaligned_address(address);
         let (mut address, mut in_object) = {
             let state = Transducer::decode(
@@ -360,12 +361,19 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 }
 
 #[target_feature(enable = "pclmulqdq,popcnt")]
-unsafe fn clmul_step(to: &mut Address, in_object: &mut i64, word: usize) {
+fn clmul_step(to: &mut Address, in_object: &mut i64, word: usize) {
     use std::arch::x86_64;
-    let ones = x86_64::_mm_set1_epi8(0xFFu8 as i8);
+    let ones = x86_64::_mm_set1_epi8(-1i8);
     let vector = x86_64::_mm_set_epi64x(0, word as i64);
     let mask: i64 = x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0));
     let flipped = mask ^ *in_object;
     *in_object = flipped >> 63;
     *to += (((flipped as usize | word).count_ones()) * 8) as usize;
+}
+
+pub(crate) fn cpu_supports_clmul() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    { is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt") }
+    #[cfg(not(target_arch = "x86_64"))]
+    false
 }
