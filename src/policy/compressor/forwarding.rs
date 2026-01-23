@@ -146,7 +146,27 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         false
     }
 
-    pub fn mark_last_word_of_object(&self, object: ObjectReference) {
+    pub fn mark_rest_of_object(&self, object: ObjectReference) {
+        // We implement two styles of mark bitmap:
+        //
+        // - When `cfg(not(feature = "compressor_art_marking"))`, we follow the style
+        //   in the original Compressor paper, where we mark bits corresponding to
+        //   the first and last words of each live object. The live data then
+        //   corresponds to the bits between and including each pair of set bits.
+        // - When `cfg(feature = "compressor_art_marking")`, we use a style as in
+        //   the Android Runtime and Clozure Common Lisp, where we mark every
+        //   bit corresponding to a word in each live object.
+        //
+        // The original style requires fewer words to be marked, but then any
+        // use of the bitmap must keep track of if a bit is inside or outside a
+        // pair of mark bits, in order to determine if the bit designates a live word
+        // or not. (The `Transducer` and carryless multiply-based algorithms track
+        // the state in the `in_object` field and `carry` variable respectively.)
+        // The Android Runtime style sets more bits, but does not require
+        // any state to be tracked when using the bitmap. But most objects are
+        // small, and we set a contiguous range of bits which tend to reside in the
+        // same bytes, words, cache lines, etc.; so setting more bits is not actually
+        // that inefficient in practice.
         if cfg!(feature = "compressor_art_marking") {
             // XXX: this will SeqCst and we don't need that.
             MARK_SPEC.bset_metadata(
@@ -183,11 +203,14 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         let used = self.calculate_offset_vector_art(region, cursor);
         #[cfg(not(feature = "compressor_art_marking"))]
         let used = if self.supports_clmul() {
+            #[cfg(target_arch = "x86_64")]
             unsafe {
                 // SAFETY: We checked the processor supports the
                 // necessary instructions.
                 self.calculate_offset_vector_clmul(region, cursor)
             }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!("Shouldn't have self.supports_clmul() = true on non-x86_64")
         } else {
             self.calculate_offset_vector_base(region, cursor)
         };
@@ -200,21 +223,27 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         );
     }
 
-    #[target_feature(enable = "pclmulqdq,popcnt")]
+    #[cfg(target_arch = "x86_64")]
     #[cfg(not(feature = "compressor_art_marking"))]
+    #[target_feature(enable = "pclmulqdq,popcnt")]
     fn calculate_offset_vector_clmul(&self, region: CompressorRegion, cursor: Address) -> usize {
+        // We need a local function to use #[target_feature], which in turn
+        // allows rustc to inline `clmul_step` into this function, as the two
+        // functions have matching #[target_feature]s.
         #[target_feature(enable = "pclmulqdq,popcnt")]
-        fn inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
-            // encode state to offset vector
-            let encoded = (*to).as_usize() + ((*in_object as usize) >> 63);
+        fn inner(to: &mut Address, carry: &mut i64, word: usize, addr: Address) {
+            // Write the state of the start of the block.
+            // We extract one in-object bit from the carry, in order to
+            // match the format used by  `Transducer::encode`,
+            let encoded = (*to).as_usize() + ((*carry as usize) & 1);
             if addr.is_aligned_to(Block::BYTES) {
                 OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
             }
-            clmul_step(to, in_object, word)
+            clmul_step(to, carry, word)
         }
 
         let mut to = region.start();
-        let mut in_object: i64 = 0;
+        let mut carry: i64 = 0;
         MARK_SPEC.scan_words(
             region.start(),
             cursor.align_up(Block::BYTES),
@@ -222,7 +251,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 Bits::Range { start, end } => {
                     panic!("should be word aligned, got {word}[{start}:{end}] instead")
                 }
-                Bits::All => inner(&mut to, &mut in_object, word, addr),
+                Bits::All => inner(&mut to, &mut carry, word, addr),
             },
         );
         to - region.start()
@@ -259,7 +288,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             cursor.align_up(Block::BYTES),
             &mut |word, addr, bits| match bits {
                 Bits::Range { start, end } => {
-                    panic!("should be word aligned, got {word}[{start}:{end}] instead")
+                    unreachable!("Blocks should be bitmap-word aligned, but we got a misaligned {word}[{start}:{end}] instead")
                 }
                 Bits::All => {
                     if addr.is_aligned_to(Block::BYTES) {
@@ -269,6 +298,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                             Ordering::Relaxed,
                         );
                     }
+                    // The live data in a block is proportional to how many
+                    // bits have been marked in the block.
                     to += BYTES_PER_MARK_BIT * word.count_ones() as usize
                 }
             },
@@ -289,11 +320,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             self.calculated.load(Ordering::Relaxed),
             "forward() should only be called when we have calculated an offset vector"
         );
-        // This could be less of a mess, and with more compile-time checks,
-        // if enums could be used in const generics (in stable Rust). Alas.
         if SELECTED_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) == 0 {
             address
         } else {
+            // This could be less of a mess, and with more compile-time checks,
+            // if enums could be used in const generics (in stable Rust). Alas.
             #[cfg(feature = "compressor_art_marking")]
             {
                 self.forward_art(address)
@@ -304,6 +335,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 unsafe {
                     self.forward_clmul(address)
                 }
+                // In particular, I would like to make the equivalent of
+                // `CAN_CLMUL = false` on non-x86_64 unrepresentable.
+                // (The same applies for the test in `calculate_offset_vector` too.)
                 #[cfg(not(target_arch = "x86_64"))]
                 unreachable!("Shouldn't have CAN_CLMUL = true on non-x86_64")
             } else {
@@ -322,7 +356,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         };
         MARK_SPEC.scan_words(block.start(), address, &mut |word, _, bits| match bits {
             Bits::Range { start, end } => {
+                // The start of a block should always be bitmap-word-aligned;
+                // only the address to forward will be (very likely) bitmap-word-unaligned.
                 assert_eq!(start, 0);
+                // We count the bits preceding the bit corresponding
+                // to the address to forward.
                 let mask = (1 << end) - 1;
                 to += BYTES_PER_MARK_BIT * (word & mask).count_ones() as usize
             }
@@ -341,6 +379,13 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         // The transducer in this implementation computes the final
         // address of an object; whereas Total-Live-Data in the paper computes
         // the distance of the object from the start of the block.
+        //
+        // XXX: But it should compute the distance from the start of the block --
+        // that would let me compress the offset vector to 32b elements on a 64-bit
+        // system, seeing that regions are 256 kiB, and offsets in a region thus
+        // only actually need 16 bits (18 bits offset - 3 bit alignment + 1 bit tag).
+        // (Though fitting in 16b just lucky, and 32 bits would cover up to
+        // 1 chunk = 4 MiB regions if you really wanted to have large regions.)
         MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
             state.visit_mark_bit(addr)
         });
@@ -353,7 +398,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     fn forward_clmul(&self, address: Address) -> Address {
         debug_assert!(self.supports_clmul());
         let block = Block::from_unaligned_address(address);
-        let (mut to, mut in_object) = {
+        let (mut to, mut carry) = {
             let state = Transducer::decode(
                 OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
                 block.start(),
@@ -364,9 +409,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             Bits::Range { start, end } => {
                 assert_eq!(start, 0);
                 let mask = (1 << end) - 1;
-                clmul_step(&mut to, &mut in_object, word & mask)
+                clmul_step(&mut to, &mut carry, word & mask)
             }
-            Bits::All => clmul_step(&mut to, &mut in_object, word),
+            Bits::All => clmul_step(&mut to, &mut carry, word),
         });
         to
     }
@@ -378,6 +423,10 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         f: &mut impl FnMut(ObjectReference),
     ) {
         if cfg!(feature = "compressor_art_marking") {
+            // Recall that we mark every word in each live object.
+            // We skip over every word which precedes the end of the last object
+            // we visited; the first word which doesn't precede the last object
+            // is the start of the next live object.
             let mut last_end = Address::ZERO;
             MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
                 if addr >= last_end {
@@ -387,6 +436,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 }
             });
         } else {
+            // Recall that we mark the first and last words of each live object.
+            // We skip over every second marked word, in order to only visit
+            // the words at the starts of objects.
             let mut in_object = false;
             MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
                 if !in_object {
@@ -403,14 +455,28 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 }
 
-#[target_feature(enable = "pclmulqdq,popcnt")]
+// #[target_feature] allows rustc to generate the POPCNT and PCLMULQDQ
+// instructions inline in this function.
+#[cfg(target_arch = "x86_64")]
 #[cfg(not(feature = "compressor_art_marking"))]
-fn clmul_step(to: &mut Address, in_object: &mut i64, word: usize) {
+#[target_feature(enable = "pclmulqdq,popcnt")]
+fn clmul_step(to: &mut Address, carry: &mut i64, word: usize) {
     use std::arch::x86_64;
+    // Compute the prefix sum of this word of mark bitmap.
     let ones = x86_64::_mm_set1_epi8(-1i8);
     let vector = x86_64::_mm_set_epi64x(0, word as i64);
     let mask: i64 = x86_64::_mm_cvtsi128_si64(x86_64::_mm_clmulepi64_si128(vector, ones, 0));
-    let flipped = mask ^ *in_object;
-    *in_object = flipped >> 63;
+    // Carry-in from the last word. If the last word ended in the
+    // middle of an object, we need to invert the in/out-of-object
+    // states in this word.
+    let flipped = mask ^ *carry;
+    // Produce the carry-out for the next word. This shift replicates
+    // the most significant bit to all bit positions.
+    *carry = flipped >> 63;
+    // Now count the in-object bits. The marked bits on either
+    // end of an object are both in an object, despite that the
+    // prefix sum for the bit at the end of an object will be zero,
+    // so we bitwise-or the original word with the prefix sum to
+    // find all in-object bits.
     *to += (((flipped as usize | word).count_ones()) * 8) as usize;
 }
