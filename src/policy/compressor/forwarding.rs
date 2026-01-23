@@ -119,7 +119,7 @@ impl Region for Block {
 }
 
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
-const BYTES_PER_MARK_BIT: usize = 1usize << MARK_SPEC.log_num_of_bits;
+const BYTES_PER_MARK_BIT: usize = 1usize << MARK_SPEC.log_bytes_in_region;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
 pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
 
