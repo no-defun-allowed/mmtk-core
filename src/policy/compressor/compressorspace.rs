@@ -225,13 +225,14 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
         let percent = *common.options.compressor_compact_max_percent;
+        let use_clmul = *common.options.compressor_use_clmul;
         CompressorSpace {
             pr: if is_discontiguous {
                 RegionPageResource::new_discontiguous(vm_map)
             } else {
                 RegionPageResource::new_contiguous(common.start, common.extent, vm_map)
             },
-            forwarding: forwarding::ForwardingMetadata::new(percent),
+            forwarding: forwarding::ForwardingMetadata::new(percent, use_clmul),
             common,
             scheduler,
         }
@@ -390,7 +391,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             });
             this.scheduler.work_buckets[stage].bulk_add(packets);
         }
-        if forwarding::cpu_supports_clmul() {
+        if self.forwarding.supports_clmul() {
             inner::<VM, true>(self, remset, stage)
         } else {
             inner::<VM, false>(self, remset, stage)
@@ -403,7 +404,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 this.generate_tasks(&mut |_, i| Box::new(Compact::<VM, CAN_CLMUL>::new(this, i)));
             this.scheduler.work_buckets[WorkBucketStage::Compact].bulk_add(compact_packets);
         }
-        if forwarding::cpu_supports_clmul() {
+        if self.forwarding.supports_clmul() {
             inner::<VM, true>(self)
         } else {
             inner::<VM, false>(self)

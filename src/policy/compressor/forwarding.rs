@@ -96,12 +96,6 @@ impl Transducer {
     }
 }
 
-pub struct ForwardingMetadata<VM: VMBinding> {
-    max_compact_percent: usize,
-    calculated: AtomicBool,
-    vm: PhantomData<VM>,
-}
-
 // A block in the Compressor is the granularity at which we cache
 // the amount of live data preceding an address. We set it to 512 bytes
 // following the paper.
@@ -123,13 +117,33 @@ const BYTES_PER_MARK_BIT: usize = 1usize << MARK_SPEC.log_bytes_in_region;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
 pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
 
+pub struct ForwardingMetadata<VM: VMBinding> {
+    max_compact_percent: usize,
+    calculated: AtomicBool,
+    vm: PhantomData<VM>,
+    // This field is only used on x86_64.
+    _use_clmul: bool,
+}
+
 impl<VM: VMBinding> ForwardingMetadata<VM> {
-    pub fn new(max_compact_percent: usize) -> ForwardingMetadata<VM> {
+    pub fn new(max_compact_percent: usize, use_clmul: bool) -> ForwardingMetadata<VM> {
         ForwardingMetadata {
             max_compact_percent,
             calculated: AtomicBool::new(false),
             vm: PhantomData,
+            _use_clmul: use_clmul,
         }
+    }
+
+    pub fn supports_clmul(&self) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            self._use_clmul
+                && is_x86_feature_detected!("pclmulqdq")
+                && is_x86_feature_detected!("popcnt")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        false
     }
 
     pub fn mark_last_word_of_object(&self, object: ObjectReference) {
@@ -168,7 +182,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         #[cfg(feature = "compressor_art_marking")]
         let used = self.calculate_offset_vector_art(region, cursor);
         #[cfg(not(feature = "compressor_art_marking"))]
-        let used = if cpu_supports_clmul() {
+        let used = if self.supports_clmul() {
             unsafe {
                 // SAFETY: We checked the processor supports the
                 // necessary instructions.
@@ -337,7 +351,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     #[cfg(not(feature = "compressor_art_marking"))]
     #[target_feature(enable = "pclmulqdq,popcnt")]
     fn forward_clmul(&self, address: Address) -> Address {
-        debug_assert!(cpu_supports_clmul());
+        debug_assert!(self.supports_clmul());
         let block = Block::from_unaligned_address(address);
         let (mut to, mut in_object) = {
             let state = Transducer::decode(
@@ -399,13 +413,4 @@ fn clmul_step(to: &mut Address, in_object: &mut i64, word: usize) {
     let flipped = mask ^ *in_object;
     *in_object = flipped >> 63;
     *to += (((flipped as usize | word).count_ones()) * 8) as usize;
-}
-
-pub(crate) fn cpu_supports_clmul() -> bool {
-    #[cfg(target_arch = "x86_64")]
-    {
-        is_x86_feature_detected!("pclmulqdq") && is_x86_feature_detected!("popcnt")
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    false
 }
