@@ -376,12 +376,25 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         remset: &crate::util::remset::RemSet<VM>,
         stage: WorkBucketStage,
     ) {
-        let mut packets = vec![];
-        remset.flush_all(&mut |entries| {
-            let slots = entries.iter().map(|e| e.decode().0).collect();
-            packets.push(Box::new(UpdateSlots::<VM>::new(self, slots)) as Box<dyn GCWork<VM>>);
-        });
-        self.scheduler.work_buckets[stage].bulk_add(packets);
+        fn inner<VM: VMBinding, const CAN_CLMUL: bool>(
+            this: &'static CompressorSpace<VM>,
+            remset: &crate::util::remset::RemSet<VM>,
+            stage: WorkBucketStage,
+        ) {
+            let mut packets = vec![];
+            remset.flush_all(&mut |entries| {
+                let slots = entries.iter().map(|e| e.decode().0).collect();
+                packets
+                    .push(Box::new(UpdateSlots::<VM, CAN_CLMUL>::new(this, slots))
+                        as Box<dyn GCWork<VM>>);
+            });
+            this.scheduler.work_buckets[stage].bulk_add(packets);
+        }
+        if forwarding::cpu_supports_clmul() {
+            inner::<VM, true>(self, remset, stage)
+        } else {
+            inner::<VM, false>(self, remset, stage)
+        }
     }
 
     pub fn add_compact_tasks(&'static self) {
@@ -452,11 +465,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         });
     }
 
-    pub fn update_slots(&self, slots: &[VM::VMSlot]) {
+    pub fn update_slots<const CAN_CLMUL: bool>(&self, slots: &[VM::VMSlot]) {
         for s in slots {
             if let Some(o) = s.load() {
                 trace!("Forwarding {o} -> {}", self.forward::<false>(o, false));
-                s.store(self.forward::<false>(o, false));
+                s.store(self.forward::<CAN_CLMUL>(o, false));
             }
         }
     }
@@ -516,18 +529,18 @@ impl<VM: VMBinding, const CAN_CLMUL: bool> Compact<VM, CAN_CLMUL> {
 }
 
 /// Update references in a vector of remembered slots.
-pub struct UpdateSlots<VM: VMBinding> {
+pub struct UpdateSlots<VM: VMBinding, const CAN_CLMUL: bool> {
     compressor_space: &'static CompressorSpace<VM>,
     slots: Vec<VM::VMSlot>,
 }
 
-impl<VM: VMBinding> GCWork<VM> for UpdateSlots<VM> {
+impl<VM: VMBinding, const CAN_CLMUL: bool> GCWork<VM> for UpdateSlots<VM, CAN_CLMUL> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.compressor_space.update_slots(&self.slots);
+        self.compressor_space.update_slots::<CAN_CLMUL>(&self.slots);
     }
 }
 
-impl<VM: VMBinding> UpdateSlots<VM> {
+impl<VM: VMBinding, const CAN_CLMUL: bool> UpdateSlots<VM, CAN_CLMUL> {
     pub fn new(compressor_space: &'static CompressorSpace<VM>, slots: Vec<VM::VMSlot>) -> Self {
         Self {
             compressor_space,

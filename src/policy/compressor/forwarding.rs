@@ -1,5 +1,5 @@
 use crate::util::constants::BYTES_IN_WORD;
-use crate::util::linear_scan::{Region, RegionIterator};
+use crate::util::linear_scan::Region;
 use crate::util::metadata::side_metadata::ranges::Bits;
 use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
@@ -39,6 +39,7 @@ impl Region for CompressorRegion {
 /// each block by serialising the state using [`Transducer::encode`], and
 /// then deserialises the state whilst computing forwarding pointers
 /// using [`Transducer::decode`].
+#[cfg(not(feature = "compressor_art_marking"))]
 #[derive(Debug)]
 struct Transducer {
     /// The address for the next object to be copied to, following preceding
@@ -50,6 +51,7 @@ struct Transducer {
     /// (i.e. if it has seen a first bit but no matching last bit yet).
     in_object: bool,
 }
+#[cfg(not(feature = "compressor_art_marking"))]
 impl Transducer {
     pub fn new(to: Address) -> Self {
         Self {
@@ -160,7 +162,32 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         }
     }
 
+    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
+        use crate::util::constants::LOG_BITS_IN_WORD;
+        const_assert!(Block::LOG_BYTES - MARK_SPEC.log_bytes_in_region >= LOG_BITS_IN_WORD);
+        #[cfg(feature = "compressor_art_marking")]
+        let used = self.calculate_offset_vector_art(region, cursor);
+        #[cfg(not(feature = "compressor_art_marking"))]
+        let used = if cpu_supports_clmul() {
+            unsafe {
+                // SAFETY: We checked the processor supports the
+                // necessary instructions.
+                self.calculate_offset_vector_clmul(region, cursor)
+            }
+        } else {
+            self.calculate_offset_vector_base(region, cursor)
+        };
+        self.calculated.store(true, Ordering::Relaxed);
+        let percent = used / (CompressorRegion::BYTES / 100);
+        SELECTED_SPEC.store_atomic::<u8>(
+            region.start(),
+            (percent < self.max_compact_percent) as u8,
+            Ordering::Relaxed,
+        );
+    }
+
     #[target_feature(enable = "pclmulqdq,popcnt")]
+    #[cfg(not(feature = "compressor_art_marking"))]
     fn calculate_offset_vector_clmul(&self, region: CompressorRegion, cursor: Address) -> usize {
         #[target_feature(enable = "pclmulqdq,popcnt")]
         fn inner(to: &mut Address, in_object: &mut i64, word: usize, addr: Address) {
@@ -187,7 +214,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         to - region.start()
     }
 
+    #[cfg(not(feature = "compressor_art_marking"))]
     fn calculate_offset_vector_base(&self, region: CompressorRegion, cursor: Address) -> usize {
+        use crate::util::linear_scan::RegionIterator;
         let mut state = Transducer::new(region.start());
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
@@ -208,6 +237,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         state.to - region.start()
     }
 
+    #[cfg(feature = "compressor_art_marking")]
     fn calculate_offset_vector_art(&self, region: CompressorRegion, cursor: Address) -> usize {
         let mut to = region.start();
         MARK_SPEC.scan_words(
@@ -232,28 +262,6 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         to - region.start()
     }
 
-    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
-        let blocks_large_enough = Block::LOG_BYTES >= 9;
-        let used = if cfg!(feature = "compressor_art_marking") {
-            self.calculate_offset_vector_art(region, cursor)
-        } else if blocks_large_enough && cpu_supports_clmul() {
-            unsafe {
-                // SAFETY: We checked the processor supports the
-                // necessary instructions.
-                self.calculate_offset_vector_clmul(region, cursor)
-            }
-        } else {
-            self.calculate_offset_vector_base(region, cursor)
-        };
-        self.calculated.store(true, Ordering::Relaxed);
-        let percent = used / (CompressorRegion::BYTES / 100);
-        SELECTED_SPEC.store_atomic::<u8>(
-            region.start(),
-            (percent < self.max_compact_percent) as u8,
-            Ordering::Relaxed,
-        );
-    }
-
     pub fn release(&self) {
         self.calculated.store(false, Ordering::Relaxed);
     }
@@ -267,22 +275,30 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             self.calculated.load(Ordering::Relaxed),
             "forward() should only be called when we have calculated an offset vector"
         );
+        // This could be less of a mess, and with more compile-time checks,
+        // if enums could be used in const generics (in stable Rust). Alas.
         if SELECTED_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) == 0 {
             address
-        } else if cfg!(feature = "compressor_art_marking") {
-            self.forward_art(address)
-        } else if CAN_CLMUL {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                self.forward_clmul(address)
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            unreachable!()
         } else {
-            self.forward_base(address)
+            #[cfg(feature = "compressor_art_marking")]
+            {
+                self.forward_art(address)
+            }
+            #[cfg(not(feature = "compressor_art_marking"))]
+            if CAN_CLMUL {
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    self.forward_clmul(address)
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                unreachable!("Shouldn't have CAN_CLMUL = true on non-x86_64")
+            } else {
+                self.forward_base(address)
+            }
         }
     }
 
+    #[cfg(feature = "compressor_art_marking")]
     fn forward_art(&self, address: Address) -> Address {
         let block = Block::from_unaligned_address(address);
         let mut to = unsafe {
@@ -301,6 +317,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         to
     }
 
+    #[cfg(not(feature = "compressor_art_marking"))]
     fn forward_base(&self, address: Address) -> Address {
         let block = Block::from_unaligned_address(address);
         let mut state = Transducer::decode(
@@ -317,6 +334,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[cfg(not(feature = "compressor_art_marking"))]
     #[target_feature(enable = "pclmulqdq,popcnt")]
     fn forward_clmul(&self, address: Address) -> Address {
         debug_assert!(cpu_supports_clmul());
@@ -372,6 +390,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 }
 
 #[target_feature(enable = "pclmulqdq,popcnt")]
+#[cfg(not(feature = "compressor_art_marking"))]
 fn clmul_step(to: &mut Address, in_object: &mut i64, word: usize) {
     use std::arch::x86_64;
     let ones = x86_64::_mm_set1_epi8(-1i8);
