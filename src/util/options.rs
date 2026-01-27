@@ -966,7 +966,7 @@ options! {
     /// headroom between 1% to 3% of the heap size.
     immix_defrag_headroom_percent: usize            [|v: &usize| *v <= 50] = 2,
     /// The maximum density of a region which the Compressor will compact.
-    compressor_compact_max_percent: usize           [|v: &usize| *v <= 100] = 90,
+    compressor_compact_max_percent: u8              [|v: &u8| *v <= 100] = 90,
     /// Enable the use of an algorithm based on carryless multiplication to
     /// compute the offset vector in the Compressor.
     compressor_use_clmul: bool                      [always_valid] = true

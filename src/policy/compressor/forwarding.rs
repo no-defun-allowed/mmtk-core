@@ -31,6 +31,21 @@ impl Region for CompressorRegion {
     }
 }
 
+// We compress the offset vector to 32-bit elements on a 64-bit system, seeing
+// that regions are always smaller than chunks (<= 4MiB), so an offset within
+// a region only needs 22 bits at most. I've presently set the region size to 256 kiB,
+// and so a Transducer state can be made to fit in 16 bits, being
+//     18 bits offset - 3 bits alignment + 1 bit in_object tag
+// But that arrangement wouldn't allow for any larger regions, and I would
+// prefer for all the magic numbers and types in this file to not be fragile like that.
+//
+// We have diminishing returns from shrinking the offset vector anyway:
+// both calculate_offset_vector() and forward() have to pull in a block's worth of
+// mark bitmap as well as the offset for the block, so any reduction in the size of
+// offsets gets Amdahl-ed by the mark bitmap.
+type Offset = u32;
+pub(crate) const LOG_BITS_IN_OFFSET: usize = Offset::BITS.ilog2() as usize;
+
 /// A finite-state machine which visits the positions of marked bits in
 /// the mark bitmap, and accumulates the size of live data that it has
 /// seen between marked bits.
@@ -42,20 +57,21 @@ impl Region for CompressorRegion {
 #[cfg(not(feature = "compressor_art_marking"))]
 #[derive(Debug)]
 struct Transducer {
-    /// The address for the next object to be copied to, following preceding
-    /// objects which were visited by the transducer.
-    to: Address,
+    /// The offset from the start of the region for the next object to be copied
+    /// to, following preceding objects which were visited by the transducer.
+    offset: Offset,
     /// The address of the last mark bit which the transducer visited.
     last_bit_visited: Address,
     /// Whether or not the transducer is currently inside an object
     /// (i.e. if it has seen a first bit but no matching last bit yet).
     in_object: bool,
 }
+
 #[cfg(not(feature = "compressor_art_marking"))]
 impl Transducer {
-    pub fn new(to: Address) -> Self {
+    pub fn new() -> Self {
         Self {
-            to,
+            offset: 0,
             last_bit_visited: Address::ZERO,
             in_object: false,
         }
@@ -70,26 +86,26 @@ impl Transducer {
             let first_word = self.last_bit_visited;
             let last_word = address;
             let size = last_word - first_word + BYTES_IN_WORD;
-            self.to += size;
+            self.offset += size as Offset;
         }
         self.in_object = !self.in_object;
         self.last_bit_visited = address;
     }
 
-    pub fn encode(&self, current_position: Address) -> usize {
+    pub fn encode(&self, current_position: Address) -> Offset {
         if self.in_object {
             // We count the space between the last mark bit and
             // the current address as live when we stop in the
             // middle of an object.
-            self.to.as_usize() + (current_position - self.last_bit_visited) + 1
+            self.offset + (current_position - self.last_bit_visited) as Offset + 1
         } else {
-            self.to.as_usize()
+            self.offset
         }
     }
 
-    pub fn decode(offset: usize, current_position: Address) -> Self {
+    pub fn decode(offset: Offset, current_position: Address) -> Self {
         Transducer {
-            to: unsafe { Address::from_usize(offset & !1) },
+            offset: offset & !1,
             last_bit_visited: current_position,
             in_object: (offset & 1) == 1,
         }
@@ -113,12 +129,13 @@ impl Region for Block {
 }
 
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
-const BYTES_PER_MARK_BIT: usize = 1usize << MARK_SPEC.log_bytes_in_region;
+#[cfg(feature = "compressor_art_marking")]
+const BYTES_PER_MARK_BIT: Offset = (1usize << MARK_SPEC.log_bytes_in_region) as Offset;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
 pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
 
 pub struct ForwardingMetadata<VM: VMBinding> {
-    max_compact_percent: usize,
+    max_compact_percent: u8,
     calculated: AtomicBool,
     vm: PhantomData<VM>,
     // This field is only used on x86_64.
@@ -126,7 +143,7 @@ pub struct ForwardingMetadata<VM: VMBinding> {
 }
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
-    pub fn new(max_compact_percent: usize, use_clmul: bool) -> ForwardingMetadata<VM> {
+    pub fn new(max_compact_percent: u8, use_clmul: bool) -> ForwardingMetadata<VM> {
         ForwardingMetadata {
             max_compact_percent,
             calculated: AtomicBool::new(false),
@@ -215,7 +232,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             self.calculate_offset_vector_base(region, cursor)
         };
         self.calculated.store(true, Ordering::Relaxed);
-        let percent = used / (CompressorRegion::BYTES / 100);
+        let percent = (used / (CompressorRegion::BYTES / 100) as Offset) as u8;
         SELECTED_SPEC.store_atomic::<u8>(
             region.start(),
             (percent < self.max_compact_percent) as u8,
@@ -226,23 +243,23 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     #[cfg(target_arch = "x86_64")]
     #[cfg(not(feature = "compressor_art_marking"))]
     #[target_feature(enable = "pclmulqdq,popcnt")]
-    fn calculate_offset_vector_clmul(&self, region: CompressorRegion, cursor: Address) -> usize {
+    fn calculate_offset_vector_clmul(&self, region: CompressorRegion, cursor: Address) -> Offset {
         // We need a local function to use #[target_feature], which in turn
         // allows rustc to inline `clmul_step` into this function, as the two
         // functions have matching #[target_feature]s.
         #[target_feature(enable = "pclmulqdq,popcnt")]
-        fn inner(to: &mut Address, carry: &mut i64, word: usize, addr: Address) {
+        fn inner(offset: &mut Offset, carry: &mut i64, word: usize, addr: Address) {
             // Write the state of the start of the block.
             // We extract one in-object bit from the carry, in order to
             // match the format used by  `Transducer::encode`,
-            let encoded = (*to).as_usize() + ((*carry as usize) & 1);
+            let encoded = *offset + ((*carry as Offset) & 1);
             if addr.is_aligned_to(Block::BYTES) {
-                OFFSET_VECTOR_SPEC.store_atomic::<usize>(addr, encoded, Ordering::Relaxed);
+                OFFSET_VECTOR_SPEC.store_atomic::<Offset>(addr, encoded, Ordering::Relaxed);
             }
-            clmul_step(to, carry, word)
+            clmul_step(offset, carry, word)
         }
 
-        let mut to = region.start();
+        let mut offset: Offset = 0;
         let mut carry: i64 = 0;
         MARK_SPEC.scan_words(
             region.start(),
@@ -251,20 +268,20 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 Bits::Range { start, end } => {
                     panic!("should be word aligned, got {word}[{start}:{end}] instead")
                 }
-                Bits::All => inner(&mut to, &mut carry, word, addr),
+                Bits::All => inner(&mut offset, &mut carry, word, addr),
             },
         );
-        to - region.start()
+        offset
     }
 
     #[cfg(not(feature = "compressor_art_marking"))]
-    fn calculate_offset_vector_base(&self, region: CompressorRegion, cursor: Address) -> usize {
+    fn calculate_offset_vector_base(&self, region: CompressorRegion, cursor: Address) -> Offset {
         use crate::util::linear_scan::RegionIterator;
-        let mut state = Transducer::new(region.start());
+        let mut state = Transducer::new();
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
         for block in RegionIterator::<Block>::new(first_block, last_block) {
-            OFFSET_VECTOR_SPEC.store_atomic::<usize>(
+            OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
                 block.start(),
                 state.encode(block.start()),
                 Ordering::Relaxed,
@@ -277,12 +294,12 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 },
             );
         }
-        state.to - region.start()
+        state.offset
     }
 
     #[cfg(feature = "compressor_art_marking")]
-    fn calculate_offset_vector_art(&self, region: CompressorRegion, cursor: Address) -> usize {
-        let mut to = region.start();
+    fn calculate_offset_vector_art(&self, region: CompressorRegion, cursor: Address) -> Offset {
+        let mut offset: Offset = 0;
         MARK_SPEC.scan_words(
             region.start(),
             cursor.align_up(Block::BYTES),
@@ -292,19 +309,19 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 }
                 Bits::All => {
                     if addr.is_aligned_to(Block::BYTES) {
-                        OFFSET_VECTOR_SPEC.store_atomic::<usize>(
+                        OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
                             addr,
-                            to.as_usize(),
+                            offset,
                             Ordering::Relaxed,
                         );
                     }
                     // The live data in a block is proportional to how many
                     // bits have been marked in the block.
-                    to += BYTES_PER_MARK_BIT * word.count_ones() as usize
+                    offset += BYTES_PER_MARK_BIT * word.count_ones() as Offset
                 }
             },
         );
-        to - region.start()
+        offset
     }
 
     pub fn release(&self) {
@@ -323,17 +340,18 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         if SELECTED_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) == 0 {
             address
         } else {
+            let region = CompressorRegion::from_unaligned_address(address);
             // This could be less of a mess, and with more compile-time checks,
             // if enums could be used in const generics (in stable Rust). Alas.
             #[cfg(feature = "compressor_art_marking")]
             {
-                self.forward_art(address)
+                region.start() + self.forward_art(address) as usize
             }
             #[cfg(not(feature = "compressor_art_marking"))]
             if CAN_CLMUL {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
-                    self.forward_clmul(address)
+                    region.start() + self.forward_clmul(address) as usize
                 }
                 // In particular, I would like to make the equivalent of
                 // `CAN_CLMUL = false` on non-x86_64 unrepresentable.
@@ -341,19 +359,15 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 #[cfg(not(target_arch = "x86_64"))]
                 unreachable!("Shouldn't have CAN_CLMUL = true on non-x86_64")
             } else {
-                self.forward_base(address)
+                region.start() + self.forward_base(address) as usize
             }
         }
     }
 
     #[cfg(feature = "compressor_art_marking")]
-    fn forward_art(&self, address: Address) -> Address {
+    fn forward_art(&self, address: Address) -> Offset {
         let block = Block::from_unaligned_address(address);
-        let mut to = unsafe {
-            Address::from_usize(
-                OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
-            )
-        };
+        let mut offset = OFFSET_VECTOR_SPEC.load_atomic::<Offset>(block.start(), Ordering::Relaxed);
         MARK_SPEC.scan_words(block.start(), address, &mut |word, _, bits| match bits {
             Bits::Range { start, end } => {
                 // The start of a block should always be bitmap-word-aligned;
@@ -362,58 +376,51 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 // We count the bits preceding the bit corresponding
                 // to the address to forward.
                 let mask = (1 << end) - 1;
-                to += BYTES_PER_MARK_BIT * (word & mask).count_ones() as usize
+                offset += BYTES_PER_MARK_BIT * (word & mask).count_ones() as Offset
             }
-            Bits::All => to += BYTES_PER_MARK_BIT * word.count_ones() as usize,
+            Bits::All => offset += BYTES_PER_MARK_BIT * word.count_ones() as Offset,
         });
-        to
+        offset
     }
 
     #[cfg(not(feature = "compressor_art_marking"))]
-    fn forward_base(&self, address: Address) -> Address {
+    fn forward_base(&self, address: Address) -> Offset {
         let block = Block::from_unaligned_address(address);
         let mut state = Transducer::decode(
-            OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
+            OFFSET_VECTOR_SPEC.load_atomic::<Offset>(block.start(), Ordering::Relaxed),
             block.start(),
         );
-        // The transducer in this implementation computes the final
-        // address of an object; whereas Total-Live-Data in the paper computes
-        // the distance of the object from the start of the block.
-        //
-        // XXX: But it should compute the distance from the start of the block --
-        // that would let me compress the offset vector to 32b elements on a 64-bit
-        // system, seeing that regions are 256 kiB, and offsets in a region thus
-        // only actually need 16 bits (18 bits offset - 3 bit alignment + 1 bit tag).
-        // (Though fitting in 16b just lucky, and 32 bits would cover up to
-        // 1 chunk = 4 MiB regions if you really wanted to have large regions.)
+        // The transducer in this implementation computes the distance of
+        // an object from the start of a region; whereas Total-Live-Data in the
+        // paper computes the distance of the object from the start of the block.
         MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
             state.visit_mark_bit(addr)
         });
-        state.to
+        state.offset
     }
 
     #[cfg(target_arch = "x86_64")]
     #[cfg(not(feature = "compressor_art_marking"))]
     #[target_feature(enable = "pclmulqdq,popcnt")]
-    fn forward_clmul(&self, address: Address) -> Address {
+    fn forward_clmul(&self, address: Address) -> Offset {
         debug_assert!(self.supports_clmul());
         let block = Block::from_unaligned_address(address);
-        let (mut to, mut carry) = {
+        let (mut offset, mut carry) = {
             let state = Transducer::decode(
-                OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
+                OFFSET_VECTOR_SPEC.load_atomic::<Offset>(block.start(), Ordering::Relaxed),
                 block.start(),
             );
-            (state.to, if state.in_object { -1i64 } else { 0i64 })
+            (state.offset, if state.in_object { -1i64 } else { 0i64 })
         };
         MARK_SPEC.scan_words(block.start(), address, &mut |word, _, bits| match bits {
             Bits::Range { start, end } => {
                 assert_eq!(start, 0);
                 let mask = (1 << end) - 1;
-                clmul_step(&mut to, &mut carry, word & mask)
+                clmul_step(&mut offset, &mut carry, word & mask)
             }
-            Bits::All => clmul_step(&mut to, &mut carry, word),
+            Bits::All => clmul_step(&mut offset, &mut carry, word),
         });
-        to
+        offset
     }
 
     pub fn scan_marked_objects(
@@ -460,7 +467,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 #[cfg(target_arch = "x86_64")]
 #[cfg(not(feature = "compressor_art_marking"))]
 #[target_feature(enable = "pclmulqdq,popcnt")]
-fn clmul_step(to: &mut Address, carry: &mut i64, word: usize) {
+fn clmul_step(offset: &mut Offset, carry: &mut i64, word: usize) {
     use std::arch::x86_64;
     // Compute the prefix sum of this word of mark bitmap.
     let ones = x86_64::_mm_set1_epi8(-1i8);
@@ -478,5 +485,5 @@ fn clmul_step(to: &mut Address, carry: &mut i64, word: usize) {
     // prefix sum for the bit at the end of an object will be zero,
     // so we bitwise-or the original word with the prefix sum to
     // find all in-object bits.
-    *to += (((flipped as usize | word).count_ones()) * 8) as usize;
+    *offset += (((flipped as usize | word).count_ones()) * 8) as Offset;
 }
