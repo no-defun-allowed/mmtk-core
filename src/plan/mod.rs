@@ -50,6 +50,7 @@ mod immix;
 mod markcompact;
 mod marksweep;
 mod nogc;
+mod one_pass;
 mod pageprotect;
 mod semispace;
 

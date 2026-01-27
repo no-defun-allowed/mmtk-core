@@ -95,7 +95,7 @@ name = "main"
 harness = false
 
 [features]
-default = ["builtin_env_logger", "log/release_max_level_off", "compressor_art_marking"]
+default = ["builtin_env_logger", "log/release_max_level_off"]
 
 # Built-in env_logger.  This feature is enabled by default.
 # The user can disable this default feature to remove `env_logger` from the dependencies.
@@ -201,6 +201,9 @@ compressor_single_space = []
 
 # Use Android/Clozure Common Lisp-style mark bitmaps instead of Compressor-style.
 compressor_art_marking = []
+
+# Measure pointer distances in OnePass.
+onepass_distances = []
 
 # To collect statistics for each GC work packet. Enabling this may introduce a small overhead (several percentage slowdown on benchmark time).
 work_packet_stats = []

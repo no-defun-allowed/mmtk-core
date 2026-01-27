@@ -115,7 +115,7 @@ impl Transducer {
 // A block in the Compressor is the granularity at which we cache
 // the amount of live data preceding an address. We set it to 512 bytes
 // following the paper.
-#[derive(Copy, Clone, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
 pub(crate) struct Block(Address);
 impl Region for Block {
     const LOG_BYTES: usize = 9;
@@ -128,6 +128,11 @@ impl Region for Block {
     }
 }
 
+pub(crate) enum CompactLimit {
+    AlwaysCompact,
+    Percentage(u8),
+}
+
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
 #[cfg(feature = "compressor_art_marking")]
 const BYTES_PER_MARK_BIT: Offset = (1usize << MARK_SPEC.log_bytes_in_region) as Offset;
@@ -135,14 +140,14 @@ pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR
 pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
 
 pub struct ForwardingMetadata<VM: VMBinding> {
-    max_compact_percent: u8,
+    compact_limit: CompactLimit,
     calculated: AtomicBool,
     vm: PhantomData<VM>,
     supports_clmul: bool,
 }
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
-    pub fn new(max_compact_percent: u8, _use_clmul: bool) -> ForwardingMetadata<VM> {
+    pub fn new(compact_limit: CompactLimit, _use_clmul: bool) -> ForwardingMetadata<VM> {
         cfg_if::cfg_if! { if #[cfg(target_arch = "x86_64")] {
             let supports_clmul = _use_clmul
                 && is_x86_feature_detected!("pclmulqdq")
@@ -151,7 +156,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             let supports_clmul = false;
         }}
         ForwardingMetadata {
-            max_compact_percent,
+            compact_limit,
             calculated: AtomicBool::new(false),
             vm: PhantomData,
             supports_clmul,
@@ -231,10 +236,16 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             };
         }}
         self.calculated.store(true, Ordering::Relaxed);
-        let percent = (used / (CompressorRegion::BYTES / 100) as Offset) as u8;
+        let selected = match self.compact_limit {
+            CompactLimit::AlwaysCompact => true,
+            CompactLimit::Percentage(limit) => {
+                let percent = (used / (CompressorRegion::BYTES / 100) as Offset) as u8;
+                percent < limit
+            },
+        };
         SELECTED_SPEC.store_atomic::<u8>(
             region.start(),
-            (percent < self.max_compact_percent) as u8,
+            selected as u8,
             Ordering::Relaxed,
         );
     }
@@ -354,7 +365,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     unreachable!("Shouldn't have CAN_CLMUL = true on non-x86_64")
                 } else {
                     self.forward_base(address)
-                }
+                };
             }}
             region.start() + offset as usize
         }
@@ -450,6 +461,45 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 in_object = !in_object;
             });
         }
+    }
+
+    // The Big Loop(tm) for OnePass.
+    pub fn calculate_and_walk_offset_vector(
+        &self,
+        region: CompressorRegion,
+        cursor: Address,
+        block_lock: &mut (impl FnMut(Block, &mut dyn FnMut()) + ?Sized),
+        f: &mut impl FnMut(ObjectReference),
+    ) {
+        cfg_if::cfg_if! { if #[cfg(feature="compressor_art_marking")] {
+            todo!();
+        } else {
+            use crate::util::linear_scan::RegionIterator;
+            let mut state = Transducer::new();
+            let first_block = Block::from_aligned_address(region.start());
+            let last_block = Block::from_aligned_address(cursor);
+            self.calculated.store(true, Ordering::Relaxed);
+            for block in RegionIterator::<Block>::new(first_block, last_block) {
+                OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
+                    block.start(),
+                    state.encode(block.start()),
+                    Ordering::Relaxed,
+                );
+                
+                block_lock(block, &mut || {
+                    MARK_SPEC.scan_non_zero_values::<u8>(
+                        block.start(),
+                        block.end(),
+                        &mut |addr: Address| {
+                            state.visit_mark_bit(addr);
+                            if state.in_object {
+                                f(ObjectReference::from_raw_address(addr).unwrap())
+                            }
+                        },
+                    );
+                });
+            }
+        }}
     }
 
     pub fn has_calculated_forwarding_addresses(&self) -> bool {

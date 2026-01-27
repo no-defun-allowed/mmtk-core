@@ -232,7 +232,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             } else {
                 RegionPageResource::new_contiguous(common.start, common.extent, vm_map)
             },
-            forwarding: forwarding::ForwardingMetadata::new(percent, use_clmul),
+            forwarding: forwarding::ForwardingMetadata::new(
+                forwarding::CompactLimit::Percentage(percent),
+                use_clmul,
+            ),
             common,
             scheduler,
         }
