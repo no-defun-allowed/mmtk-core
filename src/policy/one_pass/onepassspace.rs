@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
 pub(crate) const TRACE_KIND_FORWARD_ROOT: TraceKind = 1;
 
-/// OnePassSpace is a stop-the-world and serial implementation of
+/// OnePassSpace is a stop-the-world and parallel implementation of
 /// the One-Pass Compactor, as described in Cory and Petrank,
 /// [The One Pass (OP) Compactor: An Intellectual Abstract](https://dl.acm.org/doi/pdf/10.1145/3652024.3665513).
 pub struct OnePassSpace<VM: VMBinding> {
@@ -38,8 +38,6 @@ pub struct OnePassSpace<VM: VMBinding> {
     forwarding: forwarding::ForwardingMetadata<VM>,
     scheduler: Arc<GCWorkScheduler<VM>>,
 }
-
-pub(crate) const GC_MARK_BIT_MASK: u8 = 1;
 
 impl<VM: VMBinding> SFT for OnePassSpace<VM> {
     fn name(&self) -> &'static str {
@@ -230,8 +228,14 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
         let use_clmul = *common.options.compressor_use_clmul;
-        assert!(*common.options.no_finalizer, "Finalizers should be disabled with MMTK_NO_FINALIZER=true");
-        assert!(*common.options.no_reference_types, "Reference types should be disabled with MMTK_NO_REFERENCE_TYPES=true");
+        assert!(
+            *common.options.no_finalizer,
+            "Finalizers should be disabled with MMTK_NO_FINALIZER=true"
+        );
+        assert!(
+            *common.options.no_reference_types,
+            "Reference types should be disabled with MMTK_NO_REFERENCE_TYPES=true"
+        );
         assert!(scheduler.num_workers() <= locking::Status::MAX_WORKERS);
         OnePassSpace {
             pr: if is_discontiguous {
@@ -253,6 +257,12 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 forwarding::MARK_SPEC
                     .bzero_metadata(r.region.start(), r.region.end() - r.region.start());
+                // XXX: Can we do any region selection policies with OnePassSpace?
+                // We'll provide pre-GC usage like we could do any selection, but we don't
+                // actually do any selection.
+                let used = r.cursor() - r.region.start();
+                self.forwarding
+                    .select_region(r.region, used as forwarding::Offset);
                 locking::reset_metadata(r.region.start(), r.region.end() - r.region.start());
             });
     }
@@ -288,28 +298,41 @@ impl<VM: VMBinding> OnePassSpace<VM> {
     }
 
     pub fn test_and_mark(object: ObjectReference) -> bool {
-        let old = forwarding::MARK_SPEC.fetch_or_atomic(
-            object.to_raw_address(),
-            GC_MARK_BIT_MASK,
-            Ordering::SeqCst,
-        );
-        (old & GC_MARK_BIT_MASK) == 0
+        forwarding::MARK_SPEC
+            .fetch_update_atomic::<u8, _>(
+                object.to_raw_address(),
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+                |v| {
+                    if v == 0 {
+                        Some(1)
+                    } else {
+                        None
+                    }
+                },
+            )
+            .is_ok()
     }
 
     pub fn is_marked(object: ObjectReference) -> bool {
-        let old_value =
+        let mark_bit =
             forwarding::MARK_SPEC.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst);
-        let mark_bit = old_value & GC_MARK_BIT_MASK;
-        mark_bit != 0
+        mark_bit == 1
     }
 
-    pub fn forward<const CAN_CLMUL: bool>(&self, object: ObjectReference, _vo_bit_valid: bool) -> ObjectReference {
+    pub fn forward<const CAN_CLMUL: bool>(
+        &self,
+        object: ObjectReference,
+        _vo_bit_valid: bool,
+    ) -> ObjectReference {
         if !self.in_space(object) {
             return object;
         }
-        let ret =
-            ObjectReference::from_raw_address(self.forwarding.forward::<CAN_CLMUL>(object.to_raw_address()))
-                .unwrap();
+        let ret = ObjectReference::from_raw_address(
+            self.forwarding
+                .forward::<CAN_CLMUL>(object.to_raw_address()),
+        )
+        .unwrap();
         // We can't expect the VO bit to be valid whilst in the compaction loop.
         // If we are fixing a reference to an object which precedes the referent
         // the VO bit will have been cleared already.
@@ -339,7 +362,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         let mut seen: u64 = 0;
         let mut threaded: u64 = 0;
         #[cfg(feature = "onepass_distances")]
-        let mut local_counters: Vec<u64> = counters.distances.iter().map(|_| 0).collect();
+        let mut local_counters: Vec<u64> = vec![0; counters.distances.len()];
         let thread_references = &mut |object: ObjectReference| {
             if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
                 VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
@@ -392,12 +415,13 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             }
 
             let mut to = r.region.start();
-            trace!("forwarding region {:?}", r.region.start());
+            let mut objects = 0;
             self.forwarding.calculate_and_walk_offset_vector(
                 r.region,
                 r.cursor(),
                 &mut |b, f| locking::lock_for_forwarding(b, f),
                 &mut |obj: ObjectReference| {
+                    objects += 1;
                     let new_object = self.forward::<false>(obj, false);
                     while let Some(slot) = VM::VMObjectModel::pop_threading_list(obj) {
                         slot.store(new_object);
@@ -414,7 +438,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                         new_object.to_raw_address()
                     );
                     // copy object
-                    trace!(" copy from {} to {}", obj, new_object);
+                    trace!("copy from {} to {}", obj, new_object);
                     let end_of_new_object =
                         VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
                     // update VO bit
@@ -425,7 +449,11 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                     thread_references(new_object);
                 },
             );
-            debug!("Compact end: to {} -> {to}", r.cursor());
+            debug!(
+                "Compacted region [{}, {}) -> {to} with {objects} objects",
+                r.region.start(),
+                r.cursor()
+            );
             self.pr.reset_cursor(r, to);
         });
 
@@ -439,6 +467,9 @@ impl<VM: VMBinding> OnePassSpace<VM> {
 
     pub fn after_compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
         self.pr.reset_allocator();
+        self.pr
+            .with_regions(&mut |r| crate::policy::compressor::draw_region_usage(r));
+
         // Update references from the LOS to OnePassSpace too.
         los.enumerate_to_space_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
             &mut |object: ObjectReference| {

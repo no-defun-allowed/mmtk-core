@@ -431,12 +431,14 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         );
                     });
             }
-            let mut to = start;
+            let mut to = r.region.start();
+            let mut objects = 0;
             if self.forwarding.is_forwarding_region(r.region) {
                 #[cfg(feature = "vo_bit")]
                 crate::util::metadata::vo_bit::bzero_vo_bit(start, end - start);
                 self.forwarding
                     .scan_marked_objects(start, end, &mut |obj: ObjectReference| {
+                        objects += 1;
                         // We set the end bits based on the sizes of objects when they are
                         // marked, and we compute the live data and thus the forwarding
                         // addresses based on those sizes. The forwarding addresses would be
@@ -450,7 +452,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                             new_object.to_raw_address()
                         );
                         // copy object
-                        trace!(" copy from {} to {}", obj, new_object);
+                        trace!("copy from {} to {}", obj, new_object);
                         let end_of_new_object =
                             VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
                         // update VO bit
@@ -460,6 +462,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         debug_assert_eq!(end_of_new_object, to);
                         self.update_references::<CAN_CLMUL>(worker, new_object);
                     });
+                debug!("Compacted region [{}, {}) -> {to} with {objects} objects", r.region.start(), r.cursor());
                 self.pr.reset_cursor(r, to);
             } else {
                 self.forwarding.scan_marked_objects(start, end, &mut |obj: ObjectReference| {
@@ -480,6 +483,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 
     pub fn after_compact(&self) {
         self.pr.reset_allocator();
+        self.pr.with_regions(&mut |r| draw_region_usage(r));
     }
 }
 
@@ -495,6 +499,22 @@ impl<VM: VMBinding> GCWork<VM> for CalculateOffsetVector<VM> {
             self.compressor_space
                 .calculate_offset_vector_for_region(*region, *cursor);
         }
+    }
+}
+
+pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::CompressorRegion>]) {
+    if log::log_enabled!(log::Level::Debug) {
+        regions
+            .chunks(64)
+            .map(|c| {
+                c.iter().map(|r| {
+                    let scale = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+                    let used = r.cursor() - r.region.start();
+                    let index = (used * (scale.len() - 1)) / forwarding::CompressorRegion::BYTES;
+                    scale[index]
+                })
+            })
+            .for_each(|c| debug!("Region usage: {}", c.collect::<String>()));
     }
 }
 

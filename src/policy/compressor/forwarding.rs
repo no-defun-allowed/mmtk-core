@@ -43,7 +43,7 @@ impl Region for CompressorRegion {
 // both calculate_offset_vector() and forward() have to pull in a block's worth of
 // mark bitmap as well as the offset for the block, so any reduction in the size of
 // offsets gets Amdahl-ed by the mark bitmap.
-type Offset = u32;
+pub(crate) type Offset = u32;
 pub(crate) const LOG_BITS_IN_OFFSET: usize = Offset::BITS.ilog2() as usize;
 
 /// A finite-state machine which visits the positions of marked bits in
@@ -236,18 +236,18 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             };
         }}
         self.calculated.store(true, Ordering::Relaxed);
+        self.select_region(region, used);
+    }
+
+    pub fn select_region(&self, region: CompressorRegion, used: Offset) {
         let selected = match self.compact_limit {
             CompactLimit::AlwaysCompact => true,
             CompactLimit::Percentage(limit) => {
                 let percent = (used / (CompressorRegion::BYTES / 100) as Offset) as u8;
                 percent < limit
-            },
+            }
         };
-        SELECTED_SPEC.store_atomic::<u8>(
-            region.start(),
-            selected as u8,
-            Ordering::Relaxed,
-        );
+        SELECTED_SPEC.store_atomic::<u8>(region.start(), selected as u8, Ordering::Relaxed);
     }
 
     cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
@@ -485,7 +485,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     state.encode(block.start()),
                     Ordering::Relaxed,
                 );
-                
+
                 block_lock(block, &mut || {
                     MARK_SPEC.scan_non_zero_values::<u8>(
                         block.start(),
