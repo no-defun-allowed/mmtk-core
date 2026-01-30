@@ -350,15 +350,33 @@ impl<VM: VMBinding> OnePassSpace<VM> {
     }
 
     pub fn add_compact_tasks(&'static self, counters: &'static Counters) {
-        let packets: Vec<Box<dyn GCWork<VM>>> = self.pr.with_regions(&mut |r| {
-            (0..r.len())
-                .map(|i| Box::new(Compact::<VM>::new(self, i, counters)) as Box<dyn GCWork<VM>>)
-                .collect()
-        });
-        self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding].bulk_add(packets);
+        fn inner<VM: VMBinding, const CAN_CLMUL: bool>(
+            this: &'static OnePassSpace<VM>,
+            counters: &'static Counters,
+        ) {
+            let packets: Vec<Box<dyn GCWork<VM>>> = this.pr.with_regions(&mut |r| {
+                (0..r.len())
+                    .map(|i| {
+                        Box::new(Compact::<VM, CAN_CLMUL>::new(this, i, counters))
+                            as Box<dyn GCWork<VM>>
+                    })
+                    .collect()
+            });
+            this.scheduler.work_buckets[WorkBucketStage::CalculateForwarding].bulk_add(packets);
+        }
+        if self.forwarding.supports_clmul() {
+            inner::<VM, true>(self, counters)
+        } else {
+            inner::<VM, false>(self, counters)
+        }
     }
 
-    pub fn compact_region(&self, worker: &mut GCWorker<VM>, index: usize, counters: &Counters) {
+    pub fn compact_region<const CAN_CLMUL: bool>(
+        &self,
+        worker: &mut GCWorker<VM>,
+        index: usize,
+        counters: &Counters,
+    ) {
         let mut seen: u64 = 0;
         let mut threaded: u64 = 0;
         #[cfg(feature = "onepass_distances")]
@@ -383,7 +401,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                                     VM::VMObjectModel::push_threading_list(target, s);
                                 }
                                 locking::ThreadOrForward::Forward => {
-                                    let to = self.forward::<false>(target, true);
+                                    let to = self.forward::<CAN_CLMUL>(target, true);
                                     trace!("forwarding {target} to {to}");
                                     s.store(to);
                                 }
@@ -422,7 +440,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 &mut |b, f| locking::lock_for_forwarding(b, f),
                 &mut |obj: ObjectReference| {
                     objects += 1;
-                    let new_object = self.forward::<false>(obj, false);
+                    let new_object = self.forward::<CAN_CLMUL>(obj, false);
                     while let Some(slot) = VM::VMObjectModel::pop_threading_list(obj) {
                         slot.store(new_object);
                     }
@@ -447,6 +465,8 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                     to = new_object.to_object_start::<VM>() + copied_size;
                     debug_assert_eq!(end_of_new_object, to);
                     thread_references(new_object);
+                    // Give the size back to the loop, so it can walk an ART-style bitmap.
+                    copied_size as forwarding::Offset
                 },
             );
             debug!(
@@ -490,20 +510,20 @@ impl<VM: VMBinding> OnePassSpace<VM> {
 }
 
 /// Compact live objects in a region.
-pub struct Compact<VM: VMBinding> {
+pub struct Compact<VM: VMBinding, const CAN_CLMUL: bool> {
     one_pass_space: &'static OnePassSpace<VM>,
     index: usize,
     counters: &'static Counters,
 }
 
-impl<VM: VMBinding> GCWork<VM> for Compact<VM> {
+impl<VM: VMBinding, const CAN_CLMUL: bool> GCWork<VM> for Compact<VM, CAN_CLMUL> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         self.one_pass_space
-            .compact_region(worker, self.index, self.counters);
+            .compact_region::<CAN_CLMUL>(worker, self.index, self.counters);
     }
 }
 
-impl<VM: VMBinding> Compact<VM> {
+impl<VM: VMBinding, const CAN_CLMUL: bool> Compact<VM, CAN_CLMUL> {
     pub fn new(
         one_pass_space: &'static OnePassSpace<VM>,
         index: usize,

@@ -1,6 +1,6 @@
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::Region;
-use crate::util::metadata::side_metadata::ranges::Bits;
+use crate::util::metadata::side_metadata::ranges::{Bits, BitOffset};
 use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
 };
@@ -469,23 +469,58 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         region: CompressorRegion,
         cursor: Address,
         block_lock: &mut (impl FnMut(Block, &mut dyn FnMut()) + ?Sized),
-        f: &mut impl FnMut(ObjectReference),
+        f: &mut impl FnMut(ObjectReference) -> Offset,
     ) {
-        cfg_if::cfg_if! { if #[cfg(feature="compressor_art_marking")] {
-            todo!();
+        use crate::util::linear_scan::RegionIterator;
+        let first_block = Block::from_aligned_address(region.start());
+        let last_block = Block::from_aligned_address(cursor);
+        self.calculated.store(true, Ordering::Relaxed);
+
+        cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
+            let mut offset: Offset = 0;
+            let mut last_end = Address::ZERO;
         } else {
-            use crate::util::linear_scan::RegionIterator;
             let mut state = Transducer::new();
-            let first_block = Block::from_aligned_address(region.start());
-            let last_block = Block::from_aligned_address(cursor);
-            self.calculated.store(true, Ordering::Relaxed);
-            for block in RegionIterator::<Block>::new(first_block, last_block) {
+        }}
+
+        for block in RegionIterator::<Block>::new(first_block, last_block) {
+            cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
+                OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
+                    block.start(),
+                    offset,
+                    Ordering::Relaxed,
+                );
+                MARK_SPEC.scan_words(
+                    block.start(),
+                    block.end(),
+                    &mut |word, _, bits| match bits {
+                        Bits::Range { start, end } => {
+                            unreachable!("Blocks should be bitmap-word aligned, but we got a misaligned {word}[{start}:{end}] instead")
+                        }
+                        Bits::All => {
+                            offset += BYTES_PER_MARK_BIT * word.count_ones() as Offset;
+                        }
+                    },
+                );
+                block_lock(block, &mut || {
+                    MARK_SPEC.scan_non_zero_values::<u8>(
+                        block.start(),
+                        block.end(),
+                        &mut |addr: Address| {
+                            if addr >= last_end {
+                                let object = ObjectReference::from_raw_address(addr).unwrap();
+                                let size = f(object);
+                                last_end = addr + size as usize;
+                            }
+                        },
+                    );
+                });
+            } else {
                 OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
                     block.start(),
                     state.encode(block.start()),
                     Ordering::Relaxed,
                 );
-
                 block_lock(block, &mut || {
                     MARK_SPEC.scan_non_zero_values::<u8>(
                         block.start(),
@@ -498,8 +533,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                         },
                     );
                 });
-            }
-        }}
+            }}
+        }
     }
 
     pub fn has_calculated_forwarding_addresses(&self) -> bool {
