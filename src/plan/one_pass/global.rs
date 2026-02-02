@@ -1,10 +1,10 @@
 use super::gc_work::OnePassWorkContext;
 use super::gc_work::{AfterCompact, ForwardingProcessEdges, MarkingProcessEdges};
+use crate::plan::compressor::gc_work::GenerateWork;
+use crate::plan::compressor::process_edges::PlanRemember;
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
 use crate::plan::global::{BasePlan, CommonPlan};
-use crate::plan::compressor::gc_work::GenerateWork;
-use crate::plan::compressor::process_edges::PlanRemember;
 use crate::plan::one_pass::mutator::ALLOCATOR_MAPPING;
 use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
 use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
@@ -99,9 +99,8 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
 
         // Well, yes, but no.
         self.op_space.add_compact_tasks(&self.counters);
-        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].set_sentinel(Box::new(
-            AfterCompact::<VM>::new(&self.op_space),
-        ));
+        scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
+            .set_sentinel(Box::new(AfterCompact::<VM>::new(&self.op_space)));
 
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
             self.op_space

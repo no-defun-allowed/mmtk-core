@@ -5,8 +5,8 @@ use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
 use crate::scheduler::{GCWork, GCWorker};
 use crate::util::ObjectReference;
-use crate::vm::VMBinding;
 use crate::vm::slot::Slot;
+use crate::vm::VMBinding;
 use crate::MMTK;
 use std::marker::PhantomData;
 
@@ -34,8 +34,7 @@ pub struct OnePassCondition<VM: VMBinding> {
 
 impl<VM: VMBinding> RemsetCondition<OnePass<VM>, VM> for OnePassCondition<VM> {
     fn relevant(plan: &OnePass<VM>, source: VM::VMSlot, target: ObjectReference) -> bool {
-        !plan.op_space.address_in_space(source.as_address())
-            && plan.op_space.in_space(target)
+        !plan.op_space.address_in_space(source.as_address()) && plan.op_space.in_space(target)
     }
 }
 

@@ -166,7 +166,7 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for OnePassSpa
         queue: &mut Q,
         object: ObjectReference,
         _copy: Option<CopySemantics>,
-        _worker: &mut GCWorker<VM>
+        _worker: &mut GCWorker<VM>,
     ) -> ObjectReference {
         debug_assert!(
             KIND != TRACE_KIND_TRANSITIVE_PIN,
@@ -388,7 +388,6 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         }
     }
 
-
     pub fn compact_region<const CAN_CLMUL: bool>(
         &self,
         worker: &mut GCWorker<VM>,
@@ -561,9 +560,6 @@ impl<VM: VMBinding, const CAN_CLMUL: bool> GCWork<VM> for UpdateSlots<VM, CAN_CL
 
 impl<VM: VMBinding, const CAN_CLMUL: bool> UpdateSlots<VM, CAN_CLMUL> {
     pub fn new(op_space: &'static OnePassSpace<VM>, slots: Vec<VM::VMSlot>) -> Self {
-        Self {
-            op_space,
-            slots,
-        }
+        Self { op_space, slots }
     }
 }

@@ -30,7 +30,10 @@ impl Status {
     const fn encode(&self) -> u8 {
         match self {
             Status::Forwarded => Status::FORWARDED,
-            Status::Threading(n) => *n,
+            Status::Threading(n) => {
+                debug_assert_ne!(n, FORWARDED);
+                *n
+            }
         }
     }
     const fn decode(n: u8) -> Self {
@@ -80,7 +83,10 @@ pub(crate) fn thread_or_forward(target: ObjectReference, body: &mut impl FnMut(T
                         let Status::Threading(n) = status(target_block) else {
                             panic!("should not see Forwarded before we've finished threading");
                         };
-                        assert!(n > 0, "should not see Threading(0) before we've finished threading");
+                        assert_ne!(
+                            n, 0,
+                            "should not see Threading(0) before we've finished threading"
+                        );
                         if cas_status(target_block, Status::Threading(n), Status::Threading(n - 1))
                         {
                             return;

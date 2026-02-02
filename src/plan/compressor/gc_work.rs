@@ -5,8 +5,8 @@ use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
 use crate::scheduler::{GCWork, GCWorker};
 use crate::util::ObjectReference;
-use crate::vm::VMBinding;
 use crate::vm::slot::Slot;
+use crate::vm::VMBinding;
 use crate::MMTK;
 use std::marker::{PhantomData, Send};
 
