@@ -7,28 +7,35 @@ use atomic::Ordering;
 pub(crate) const STATUS_SPEC: SideMetadataSpec =
     crate::util::metadata::side_metadata::spec_defs::ONE_PASS_STATUS;
 
+/// The status of a One Pass block. If the status of a block is `Forwarded`,
+/// a reference into the block should be forwarded by using the offset vector
+/// and mark bitmap (like the normal Compressor). Else the reference should be
+/// put on the threading list of the referent object (after incrementing the
+/// thread count, and before decrementing the count).
+///
+/// The status contains the "threading count" and status bit of a block as presented
+/// in the One Pass Compactor paper
+/// <https://dl.acm.org/doi/pdf/10.1145/3652024.3665513#page=9>.
+/// The `INITIAL` state in the paper is `Status::Threading(0)`
+/// and the `FINAL` state in the paper is `Status::Forwarded`.
 #[derive(Debug)]
 pub(crate) enum Status {
     Forwarded,
-    Forwarding,
     Threading(u8),
 }
 
 impl Status {
-    pub const MAX_WORKERS: usize = 253;
-    const FORWARDED: u8 = 254;
-    const FORWARDING: u8 = 255;
+    pub const MAX_WORKERS: usize = 254;
+    const FORWARDED: u8 = 255;
     fn encode(&self) -> u8 {
         match self {
             Status::Forwarded => Status::FORWARDED,
-            Status::Forwarding => Status::FORWARDING,
             Status::Threading(n) => *n,
         }
     }
     fn decode(n: u8) -> Self {
         match n {
             Status::FORWARDED => Status::Forwarded,
-            Status::FORWARDING => Status::Forwarding,
             _ => Status::Threading(n),
         }
     }
@@ -60,7 +67,7 @@ pub(crate) fn thread_or_forward(target: ObjectReference, body: &mut impl FnMut(T
     let target_block = forwarding::Block::from_unaligned_address(target.to_raw_address());
     loop {
         match status(target_block) {
-            Status::Forwarded | Status::Forwarding => {
+            Status::Forwarded => {
                 body(ThreadOrForward::Forward);
                 return;
             }
@@ -71,7 +78,7 @@ pub(crate) fn thread_or_forward(target: ObjectReference, body: &mut impl FnMut(T
                     // decrement threading worker count
                     loop {
                         let Status::Threading(n) = status(target_block) else {
-                            panic!("Threading(n > 0) => Forwarded|Forwarding transition");
+                            panic!("Threading(n > 0) => Forwarded transition");
                         };
                         assert!(n > 0, "we're still threading, but saw Threading(0)");
                         if cas_status(target_block, Status::Threading(n), Status::Threading(n - 1))
@@ -89,13 +96,12 @@ pub(crate) fn lock_for_forwarding(block: forwarding::Block, body: &mut (impl FnM
     loop {
         let s = status(block);
         match s {
-            Status::Forwarded | Status::Forwarding => {
+            Status::Forwarded => {
                 panic!("already forwarded {block:?}, in status {s:?}")
             }
             Status::Threading(0) => {
-                if cas_status(block, Status::Threading(0), Status::Forwarding) {
+                if cas_status(block, Status::Threading(0), Status::Forwarded) {
                     body();
-                    assert!(cas_status(block, Status::Forwarding, Status::Forwarded));
                     return;
                 }
             }
