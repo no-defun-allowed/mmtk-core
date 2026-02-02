@@ -1,7 +1,6 @@
 use crate::plan::VectorObjectQueue;
 use crate::policy::compressor::forwarding;
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
-use crate::policy::largeobjectspace::LargeObjectSpace;
 use crate::policy::one_pass::locking;
 use crate::policy::sft::GCWorkerMutRef;
 use crate::policy::sft::SFT;
@@ -16,7 +15,7 @@ use crate::util::metadata::extract_side_metadata;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
-use crate::util::object_enum::{self, ObjectEnumerator};
+use crate::util::object_enum::ObjectEnumerator;
 use crate::util::statistics::counter::EventCounter;
 use crate::util::statistics::stats::Stats;
 use crate::util::{Address, ObjectReference};
@@ -27,7 +26,7 @@ use atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
-pub(crate) const TRACE_KIND_FORWARD_ROOT: TraceKind = 1;
+pub(crate) const TRACE_KIND_FORWARD: TraceKind = 1;
 
 /// OnePassSpace is a stop-the-world and parallel implementation of
 /// the One-Pass Compactor, as described in Cory and Petrank,
@@ -167,7 +166,7 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for OnePassSpa
         queue: &mut Q,
         object: ObjectReference,
         _copy: Option<CopySemantics>,
-        _worker: &mut GCWorker<VM>,
+        _worker: &mut GCWorker<VM>
     ) -> ObjectReference {
         debug_assert!(
             KIND != TRACE_KIND_TRANSITIVE_PIN,
@@ -175,8 +174,8 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for OnePassSpa
         );
         if KIND == TRACE_KIND_MARK {
             self.trace_mark_object(queue, object)
-        } else if KIND == TRACE_KIND_FORWARD_ROOT {
-            self.trace_forward_root(queue, object)
+        } else if KIND == TRACE_KIND_FORWARD {
+            self.forward::<false>(object, true)
         } else {
             unreachable!()
         }
@@ -184,7 +183,7 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for OnePassSpa
     fn may_move_objects<const KIND: crate::policy::gc_work::TraceKind>() -> bool {
         if KIND == TRACE_KIND_MARK {
             false
-        } else if KIND == TRACE_KIND_FORWARD_ROOT {
+        } else if KIND == TRACE_KIND_FORWARD {
             true
         } else {
             unreachable!()
@@ -289,14 +288,6 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         object
     }
 
-    pub fn trace_forward_root<Q: ObjectQueue>(
-        &self,
-        _queue: &mut Q,
-        object: ObjectReference,
-    ) -> ObjectReference {
-        self.forward::<false>(object, true)
-    }
-
     pub fn test_and_mark(object: ObjectReference) -> bool {
         forwarding::MARK_SPEC
             .fetch_update_atomic::<u8, _>(
@@ -370,6 +361,33 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             inner::<VM, false>(self, counters)
         }
     }
+
+    pub fn add_remset_tasks(
+        &'static self,
+        remset: &crate::util::remset::RemSet<VM>,
+        stage: WorkBucketStage,
+    ) {
+        fn inner<VM: VMBinding, const CAN_CLMUL: bool>(
+            this: &'static OnePassSpace<VM>,
+            remset: &crate::util::remset::RemSet<VM>,
+            stage: WorkBucketStage,
+        ) {
+            let mut packets = vec![];
+            remset.flush_all(&mut |entries| {
+                let slots = entries.iter().map(|e| e.decode().0).collect();
+                packets
+                    .push(Box::new(UpdateSlots::<VM, CAN_CLMUL>::new(this, slots))
+                        as Box<dyn GCWork<VM>>);
+            });
+            this.scheduler.work_buckets[stage].bulk_add(packets);
+        }
+        if self.forwarding.supports_clmul() {
+            inner::<VM, true>(self, remset, stage)
+        } else {
+            inner::<VM, false>(self, remset, stage)
+        }
+    }
+
 
     pub fn compact_region<const CAN_CLMUL: bool>(
         &self,
@@ -485,27 +503,19 @@ impl<VM: VMBinding> OnePassSpace<VM> {
         }
     }
 
-    pub fn after_compact(&self, worker: &mut GCWorker<VM>, los: &LargeObjectSpace<VM>) {
+    pub fn update_slots<const CAN_CLMUL: bool>(&self, slots: &[VM::VMSlot]) {
+        for s in slots {
+            if let Some(o) = s.load() {
+                trace!("Forwarding {o} -> {}", self.forward::<false>(o, false));
+                s.store(self.forward::<CAN_CLMUL>(o, false));
+            }
+        }
+    }
+
+    pub fn after_compact(&self) {
         self.pr.reset_allocator();
         self.pr
             .with_regions(&mut |r| crate::policy::compressor::draw_region_usage(r));
-
-        // Update references from the LOS to OnePassSpace too.
-        los.enumerate_to_space_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
-            &mut |object: ObjectReference| {
-                if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
-                    VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
-                        if let Some(o) = s.load() {
-                            let to = self.forward::<false>(o, true);
-                            trace!("forwarding {o} to {to}");
-                            s.store(to);
-                        }
-                    });
-                } else {
-                    panic!("nah I've really got to look at slots here");
-                }
-            },
-        ));
     }
 }
 
@@ -533,6 +543,27 @@ impl<VM: VMBinding, const CAN_CLMUL: bool> Compact<VM, CAN_CLMUL> {
             one_pass_space,
             index,
             counters,
+        }
+    }
+}
+
+/// Update references in a vector of remembered slots.
+pub struct UpdateSlots<VM: VMBinding, const CAN_CLMUL: bool> {
+    op_space: &'static OnePassSpace<VM>,
+    slots: Vec<VM::VMSlot>,
+}
+
+impl<VM: VMBinding, const CAN_CLMUL: bool> GCWork<VM> for UpdateSlots<VM, CAN_CLMUL> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.op_space.update_slots::<CAN_CLMUL>(&self.slots);
+    }
+}
+
+impl<VM: VMBinding, const CAN_CLMUL: bool> UpdateSlots<VM, CAN_CLMUL> {
+    pub fn new(op_space: &'static OnePassSpace<VM>, slots: Vec<VM::VMSlot>) -> Self {
+        Self {
+            op_space,
+            slots,
         }
     }
 }

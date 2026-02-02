@@ -1,24 +1,25 @@
 use super::gc_work::OnePassWorkContext;
-use super::gc_work::{AfterCompact, ForwardingProcessEdges, MarkingProcessEdges, UpdateReferences};
+use super::gc_work::{AfterCompact, ForwardingProcessEdges, MarkingProcessEdges};
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
 use crate::plan::global::{BasePlan, CommonPlan};
+use crate::plan::compressor::gc_work::GenerateWork;
+use crate::plan::compressor::process_edges::PlanRemember;
 use crate::plan::one_pass::mutator::ALLOCATOR_MAPPING;
 use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
-use crate::plan::AllocationSemantics;
-use crate::plan::Plan;
-use crate::plan::PlanConstraints;
+use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
 use crate::policy::one_pass::{Counters, OnePassSpace};
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
-use crate::scheduler::GCWorkScheduler;
-use crate::scheduler::WorkBucketStage;
+use crate::scheduler::{GCWorkScheduler, GCWorker, WorkBucketStage};
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::heap::gc_trigger::SpaceStats;
 #[allow(unused_imports)]
 use crate::util::heap::VMRequest;
 use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::opaque_pointer::*;
+use crate::util::remset::RemSet;
+use crate::util::ObjectReference;
 use crate::vm::VMBinding;
 use enum_map::EnumMap;
 use mmtk_macros::{HasSpaces, PlanTraceObject};
@@ -33,6 +34,7 @@ pub struct OnePass<VM: VMBinding> {
     #[space]
     pub op_space: OnePassSpace<VM>,
     pub counters: Counters,
+    remset: RemSet<VM>,
 }
 
 /// The plan constraints for the OnePass plan.
@@ -98,11 +100,13 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
         // Well, yes, but no.
         self.op_space.add_compact_tasks(&self.counters);
         scheduler.work_buckets[WorkBucketStage::CalculateForwarding].set_sentinel(Box::new(
-            AfterCompact::<VM>::new(&self.op_space, &self.common.los),
+            AfterCompact::<VM>::new(&self.op_space),
         ));
 
-        // do another trace to update references
-        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateReferences::<VM>::new());
+        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
+            self.op_space
+                .add_remset_tasks(&self.remset, WorkBucketStage::SecondRoots)
+        }));
 
         // Release global/collectors/mutators
         scheduler.work_buckets[WorkBucketStage::Release]
@@ -176,6 +180,8 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
 impl<VM: VMBinding> OnePass<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
         let stats = args.stats;
+        let scheduler = args.scheduler.clone();
+
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &ONE_PASS_CONSTRAINTS,
@@ -191,10 +197,17 @@ impl<VM: VMBinding> OnePass<VM> {
             )),
             common: CommonPlan::new(plan_args),
             counters: Counters::new(stats),
+            remset: RemSet::new(scheduler.num_workers()),
         };
 
         res.verify_side_metadata_sanity();
 
         res
+    }
+}
+
+impl<VM: VMBinding> PlanRemember<VM> for OnePass<VM> {
+    fn record(&self, source: VM::VMSlot, target: ObjectReference, worker: &GCWorker<VM>) {
+        self.remset.record(source, target, worker);
     }
 }
