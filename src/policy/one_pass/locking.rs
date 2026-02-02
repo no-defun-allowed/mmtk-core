@@ -31,12 +31,13 @@ impl Status {
         match self {
             Status::Forwarded => Status::FORWARDED,
             Status::Threading(n) => {
-                debug_assert_ne!(n, FORWARDED);
+                // This is a debug_assert! as one cannot assert_eq! in a const fn.
+                debug_assert!(*n != Status::FORWARDED);
                 *n
             }
         }
     }
-    const fn decode(n: u8) -> Self {
+    fn decode(n: u8) -> Self {
         match n {
             Status::FORWARDED => Status::Forwarded,
             _ => Status::Threading(n),
@@ -66,6 +67,10 @@ pub(crate) enum ThreadOrForward {
     Forward,
 }
 
+/// Decide on how to process a reference into a One Pass space.
+/// The `body` argument will be called with the decision; if we must thread
+/// the reference, `thread_or_forward` will increment and decrement the
+/// threading count for the block around the call.
 pub(crate) fn thread_or_forward(target: ObjectReference, body: &mut impl FnMut(ThreadOrForward)) {
     let target_block = forwarding::Block::from_unaligned_address(target.to_raw_address());
     loop {
@@ -98,7 +103,12 @@ pub(crate) fn thread_or_forward(target: ObjectReference, body: &mut impl FnMut(T
     }
 }
 
-pub(crate) fn lock_for_forwarding(block: forwarding::Block, body: &mut (impl FnMut() + ?Sized)) {
+/// Claim a block for moving the contents of the block. This operation
+/// is monotonic; blocks stay in the moved state throughout the collection cycle.
+/// You should set the entry in the offset vector for a block before
+/// claiming the block; `calculate_and_walk_offset_vector` will set
+/// entries before calling its claiming function.
+pub(crate) fn claim_for_moving(block: forwarding::Block) {
     loop {
         let s = status(block);
         match s {
@@ -107,7 +117,6 @@ pub(crate) fn lock_for_forwarding(block: forwarding::Block, body: &mut (impl FnM
             }
             Status::Threading(0) => {
                 if cas_status(block, Status::Threading(0), Status::Forwarded) {
-                    body();
                     return;
                 }
             }

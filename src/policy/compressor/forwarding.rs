@@ -468,7 +468,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         &self,
         region: CompressorRegion,
         cursor: Address,
-        block_lock: &mut (impl FnMut(Block, &mut dyn FnMut()) + ?Sized),
+        claim_block: &impl Fn(Block),
         f: &mut impl FnMut(ObjectReference) -> Offset,
     ) {
         use crate::util::linear_scan::RegionIterator;
@@ -502,27 +502,26 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                         }
                     },
                 );
-                block_lock(block, &mut || {
-                    MARK_SPEC.scan_non_zero_values::<u8>(
-                        block.start(),
-                        block.end(),
-                        &mut |addr: Address| {
-                            if addr >= last_end {
+                claim_block(block);
+                MARK_SPEC.scan_non_zero_values::<u8>(
+                    block.start(),
+                    block.end(),
+                    &mut |addr: Address| {
+                        if addr >= last_end {
                                 let object = ObjectReference::from_raw_address(addr).unwrap();
                                 let size = f(object);
                                 last_end = addr + size as usize;
                             }
                         },
-                    );
-                });
+                );
             } else {
                 OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
                     block.start(),
                     state.encode(block.start()),
                     Ordering::Relaxed,
                 );
-                block_lock(block, &mut || {
-                    MARK_SPEC.scan_non_zero_values::<u8>(
+                claim_block(block);
+                MARK_SPEC.scan_non_zero_values::<u8>(
                         block.start(),
                         block.end(),
                         &mut |addr: Address| {
@@ -532,7 +531,6 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                             }
                         },
                     );
-                });
             }}
         }
     }
