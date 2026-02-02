@@ -1,8 +1,6 @@
-use super::Compressor;
 use crate::mmtk::MMTK;
 use crate::plan::{Plan, PlanTraceObject, VectorObjectQueue};
 use crate::policy::gc_work::TraceKind;
-use crate::policy::space::Space;
 use crate::scheduler::gc_work::{PlanScanObjects, ProcessEdgesBase, SlotOf};
 use crate::scheduler::{GCWorker, ProcessEdgesWork, WorkBucketStage};
 use crate::util::ObjectReference;
@@ -13,17 +11,6 @@ use std::ops::{Deref, DerefMut};
 
 pub trait RemsetCondition<P: Plan<VM = VM>, VM: VMBinding>: Send {
     fn relevant(plan: &P, source: VM::VMSlot, target: ObjectReference) -> bool;
-}
-
-pub struct CompressorCondition<VM: VMBinding> {
-    _p: PhantomData<VM>,
-}
-
-impl<VM: VMBinding> RemsetCondition<Compressor<VM>, VM> for CompressorCondition<VM> {
-    fn relevant(plan: &Compressor<VM>, source: VM::VMSlot, target: ObjectReference) -> bool {
-        !plan.compressor_space.address_in_space(source.as_address())
-            && plan.compressor_space.in_space(target)
-    }
 }
 
 pub trait PlanRemember<VM: VMBinding> {

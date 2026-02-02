@@ -1,9 +1,12 @@
 use super::global::Compressor;
-use super::process_edges::{CompressorCondition, PlanProcessEdgesRemset};
+use super::process_edges::{PlanProcessEdgesRemset, RemsetCondition};
 use crate::policy::compressor::{CompressorSpace, TRACE_KIND_FORWARD, TRACE_KIND_MARK};
+use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
 use crate::scheduler::{GCWork, GCWorker};
+use crate::util::ObjectReference;
 use crate::vm::VMBinding;
+use crate::vm::slot::Slot;
 use crate::MMTK;
 use std::marker::{PhantomData, Send};
 
@@ -43,6 +46,17 @@ impl<VM: VMBinding> AfterCompact<VM> {
 }
 
 /// Marking trace
+pub struct CompressorCondition<VM: VMBinding> {
+    _p: PhantomData<VM>,
+}
+
+impl<VM: VMBinding> RemsetCondition<Compressor<VM>, VM> for CompressorCondition<VM> {
+    fn relevant(plan: &Compressor<VM>, source: VM::VMSlot, target: ObjectReference) -> bool {
+        !plan.compressor_space.address_in_space(source.as_address())
+            && plan.compressor_space.in_space(target)
+    }
+}
+
 pub type MarkingProcessEdges<VM> =
     PlanProcessEdgesRemset<VM, Compressor<VM>, CompressorCondition<VM>, TRACE_KIND_MARK>;
 

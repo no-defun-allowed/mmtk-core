@@ -1,6 +1,6 @@
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::Region;
-use crate::util::metadata::side_metadata::ranges::{Bits, BitOffset};
+use crate::util::metadata::side_metadata::ranges::Bits;
 use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
 };
