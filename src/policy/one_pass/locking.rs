@@ -27,13 +27,13 @@ pub(crate) enum Status {
 impl Status {
     pub const MAX_WORKERS: usize = 254;
     const FORWARDED: u8 = 255;
-    fn encode(&self) -> u8 {
+    const fn encode(&self) -> u8 {
         match self {
             Status::Forwarded => Status::FORWARDED,
             Status::Threading(n) => *n,
         }
     }
-    fn decode(n: u8) -> Self {
+    const fn decode(n: u8) -> Self {
         match n {
             Status::FORWARDED => Status::Forwarded,
             _ => Status::Threading(n),
@@ -42,7 +42,7 @@ impl Status {
 }
 
 pub(crate) fn reset_metadata(start: Address, size: usize) {
-    // Status::Threading(0).encode() == 0
+    const_assert_eq!(Status::Threading(0).encode(), 0);
     STATUS_SPEC.bzero_metadata(start, size);
 }
 
@@ -72,15 +72,15 @@ pub(crate) fn thread_or_forward(target: ObjectReference, body: &mut impl FnMut(T
                 return;
             }
             Status::Threading(n) => {
-                // increment threading worker count
+                // Try to increment the threading worker count.
                 if cas_status(target_block, Status::Threading(n), Status::Threading(n + 1)) {
                     body(ThreadOrForward::Thread);
-                    // decrement threading worker count
+                    // Now decrement the threading worker count.
                     loop {
                         let Status::Threading(n) = status(target_block) else {
-                            panic!("Threading(n > 0) => Forwarded transition");
+                            panic!("should not see Forwarded before we've finished threading");
                         };
-                        assert!(n > 0, "we're still threading, but saw Threading(0)");
+                        assert!(n > 0, "should not see Threading(0) before we've finished threading");
                         if cas_status(target_block, Status::Threading(n), Status::Threading(n - 1))
                         {
                             return;
