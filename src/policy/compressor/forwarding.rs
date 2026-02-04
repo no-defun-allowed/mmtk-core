@@ -240,14 +240,16 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 
     pub fn select_region(&self, region: CompressorRegion, used: Offset) {
-        let selected = match self.compact_limit {
-            CompactLimit::AlwaysCompact => true,
-            CompactLimit::Percentage(limit) => {
-                let percent = (used / (CompressorRegion::BYTES / 100) as Offset) as u8;
-                percent < limit
-            }
-        };
-        SELECTED_SPEC.store_atomic::<u8>(region.start(), selected as u8, Ordering::Relaxed);
+        if cfg!(feature = "compressor_region_selection") {
+            let selected = match self.compact_limit {
+                CompactLimit::AlwaysCompact => true,
+                CompactLimit::Percentage(limit) => {
+                    let percent = (used / (CompressorRegion::BYTES / 100) as Offset) as u8;
+                    percent < limit
+                }
+            };
+            SELECTED_SPEC.store_atomic::<u8>(region.start(), selected as u8, Ordering::Relaxed);
+        }
     }
 
     cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
@@ -338,7 +340,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 
     pub fn is_forwarding_region(&self, region: CompressorRegion) -> bool {
-        SELECTED_SPEC.load_atomic::<u8>(region.start(), Ordering::Relaxed) != 0
+        !cfg!(feature = "compressor_region_selection")
+            || SELECTED_SPEC.load_atomic::<u8>(region.start(), Ordering::Relaxed) != 0
     }
 
     pub fn forward<const CAN_CLMUL: bool>(&self, address: Address) -> Address {
@@ -346,10 +349,10 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             self.calculated.load(Ordering::Relaxed),
             "forward() should only be called when we have calculated an offset vector"
         );
-        if SELECTED_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) == 0 {
+        let region = CompressorRegion::from_unaligned_address(address);
+        if !self.is_forwarding_region(region) {
             address
         } else {
-            let region = CompressorRegion::from_unaligned_address(address);
             // This could be less of a mess, and with more compile-time checks,
             // if enums could be used in const generics (in stable Rust). Alas.
             cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
@@ -527,7 +530,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                         &mut |addr: Address| {
                             state.visit_mark_bit(addr);
                             if state.in_object {
-                                f(ObjectReference::from_raw_address(addr).unwrap())
+                                f(ObjectReference::from_raw_address(addr).unwrap());
                             }
                         },
                     );

@@ -202,6 +202,12 @@ compressor_single_space = []
 # Use Android/Clozure Common Lisp-style mark bitmaps instead of Compressor-style.
 compressor_art_marking = []
 
+# Avoid compacting mostly-live regions in the Compressor. (The threshold is set by
+# the environment variable MMTK_COMPACT_MAX_PERCENT, and defaults to 90%.)
+# I don't think region selection really speeds up GC at present, and the threshold
+# is arguably very silly in tight heaps, so the default is to compact everything.
+compressor_region_selection = []
+
 # Measure pointer distances in OnePass.
 onepass_distances = []
 
