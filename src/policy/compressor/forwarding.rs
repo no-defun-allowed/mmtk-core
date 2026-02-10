@@ -438,19 +438,73 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         end: Address,
         f: &mut impl FnMut(ObjectReference),
     ) {
-        if cfg!(feature = "compressor_art_marking") {
-            // Recall that we mark every word in each live object.
-            // We skip over every word which precedes the end of the last object
-            // we visited; the first word which doesn't precede the last object
-            // is the start of the next live object.
-            let mut last_end = Address::ZERO;
-            MARK_SPEC.scan_non_zero_values::<u8>(start, end, &mut |addr: Address| {
-                if addr >= last_end {
-                    let object = ObjectReference::from_raw_address(addr).unwrap();
-                    last_end = addr + VM::VMObjectModel::get_current_size(object);
+        cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
+            let visit = &mut |start: Address, size: usize| {
+                let mut cursor = start;
+                while cursor < start + size {
+                    let object = ObjectReference::from_raw_address(cursor).unwrap();
+                    let object_size = VM::VMObjectModel::get_current_size(object);
                     f(object);
+                    cursor += object_size;
                 }
-            });
+            };
+            // This is the VisitLiveStrides algorithm in the Android Runtime, in
+            // <https://cs.android.com/android/platform/superproject/main/+/main:art/runtime/gc/collector/mark_compact-inl.h>
+            let mut stride_start: Option<Address> = None;
+            let mut stride_size: usize = 0;
+            MARK_SPEC.scan_words(
+                start,
+                end,
+                &mut |word, addr, bits| match bits {
+                    Bits::Range { start, end } => {
+                        unreachable!("Regions should be bitmap-word aligned, but we got a misaligned {word}[{start}:{end}] instead")
+                    }
+                    Bits::All => {
+                        if word == usize::MAX {
+                            // All bits in the word are marked.
+                            stride_start = stride_start.or(Some(addr));
+                            stride_size += BYTES_PER_MARK_BIT as usize * usize::BITS as usize;
+                        } else {
+                            let mut word = word;
+                            let mut index_in_word: usize = 0;
+                            while word != 0 {
+                                // Discard zeroes.
+                                let shift = word.trailing_zeros();
+                                index_in_word += shift as usize;
+                                word >>= shift;
+                                if let Some(start) = stride_start {
+                                    if shift > 0 {
+                                        visit(start, stride_size);
+                                        stride_start = Some(addr + BYTES_PER_MARK_BIT as usize * index_in_word);
+                                        stride_size = 0;
+                                    }
+                                } else {
+                                    stride_start = Some(addr + BYTES_PER_MARK_BIT as usize * index_in_word);
+                                    stride_size = 0;
+                                }
+                                // Now discard ones.
+                                let shift = word.trailing_ones();
+                                // We discarded all the trailing zeroes, and the word is
+                                // non-zero, so we should have at least one trailing one.
+                                debug_assert_ne!(shift, 0);
+                                index_in_word += shift as usize;
+                                word >>= shift;
+                                stride_size += BYTES_PER_MARK_BIT as usize * shift as usize;
+                            }
+                            if index_in_word < usize::BITS as usize && stride_start.is_some() {
+                                // We haven't consumed all of the word, and the word has
+                                // zeroes at the most significant end. The stride ends here.
+                                visit(stride_start.unwrap(), stride_size);
+                                stride_start = None;
+                                stride_size = 0;
+                            }
+                        }
+                    }
+                }
+            );
+            if let Some(start) = stride_start {
+                visit(start, stride_size);
+            }
         } else {
             // Recall that we mark the first and last words of each live object.
             // We skip over every second marked word, in order to only visit
@@ -463,7 +517,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 }
                 in_object = !in_object;
             });
-        }
+        }}
     }
 
     // The Big Loop(tm) for OnePass.
