@@ -406,16 +406,21 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                             seen += 1;
                             locking::thread_or_forward(target, &mut |action| match action {
                                 locking::ThreadOrForward::Thread => {
-                                    threaded += 1;
-                                    trace!("threading {target}");
-                                    #[cfg(feature = "onepass_distances")]
-                                    {
-                                        let bits = (target.to_raw_address().as_usize()
-                                            ^ s.as_address().as_usize())
-                                        .ilog2();
-                                        local_counters[bits as usize] += 1;
+                                    if VM::VMObjectModel::push_threading_list(target, s) {
+                                        threaded += 1;
+                                        trace!("threading {target}");
+                                        #[cfg(feature = "onepass_distances")]
+                                        {
+                                            let bits = (target.to_raw_address().as_usize()
+                                                        ^ s.as_address().as_usize())
+                                                .ilog2();
+                                            local_counters[bits as usize] += 1;
+                                        }
+                                    } else {
+                                        let to = self.forward::<CAN_CLMUL>(target, true);
+                                        trace!("list is finalised, forwarding {target} to {to}");
+                                        s.store(to);
                                     }
-                                    VM::VMObjectModel::push_threading_list(target, s);
                                 }
                                 locking::ThreadOrForward::Forward => {
                                     let to = self.forward::<CAN_CLMUL>(target, true);
@@ -454,13 +459,17 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             self.forwarding.calculate_and_walk_offset_vector(
                 r.region,
                 r.cursor(),
+                &|obj: ObjectReference| {
+                    let new_object = self.forward::<CAN_CLMUL>(obj, false);
+                    VM::VMObjectModel::walk_threading_list(obj, &mut |slot| {
+                        slot.store(new_object);
+                    })
+                },
                 &locking::claim_for_moving,
-                &mut |obj: ObjectReference| {
+                &mut |obj: ObjectReference, h: usize| {
                     objects += 1;
                     let new_object = self.forward::<CAN_CLMUL>(obj, false);
-                    while let Some(slot) = VM::VMObjectModel::pop_threading_list(obj) {
-                        slot.store(new_object);
-                    }
+                    VM::VMObjectModel::reset_threading_list(obj, h);
                     // We set the end bits based on the sizes of objects when they are
                     // marked, and we compute the live data and thus the forwarding
                     // addresses based on those sizes. The forwarding addresses would be
@@ -482,8 +491,6 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                     to = new_object.to_object_start::<VM>() + copied_size;
                     debug_assert_eq!(end_of_new_object, to);
                     thread_references(new_object);
-                    // Give the size back to the loop, so it can walk an ART-style bitmap.
-                    copied_size as forwarding::Offset
                 },
             );
             debug!(

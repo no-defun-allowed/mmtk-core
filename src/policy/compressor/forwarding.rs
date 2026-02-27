@@ -521,75 +521,61 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 
     // The Big Loop(tm) for OnePass.
+    #[cfg(feature = "compressor_art_marking")]
+    pub fn calculate_and_walk_offset_vector(
+        &self,
+        _region: CompressorRegion,
+        _cursor: Address,
+        _fix_threaded_pointers: &impl Fn(ObjectReference),
+        _claim_block: &impl Fn(Block),
+        _move_object: &mut impl FnMut(ObjectReference),
+    ) {
+        todo!();
+    }
+    #[cfg(not(feature = "compressor_art_marking"))]
     pub fn calculate_and_walk_offset_vector(
         &self,
         region: CompressorRegion,
         cursor: Address,
+        fix_threaded_pointers: &impl Fn(ObjectReference) -> usize,
         claim_block: &impl Fn(Block),
-        f: &mut impl FnMut(ObjectReference) -> Offset,
+        move_object: &mut impl FnMut(ObjectReference, usize),
     ) {
         use crate::util::linear_scan::RegionIterator;
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
         self.calculated.store(true, Ordering::Relaxed);
 
-        cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
-            let mut offset: Offset = 0;
-            let mut last_end = Address::ZERO;
-        } else {
-            let mut state = Transducer::new();
-        }}
-
-        for block in RegionIterator::<Block>::new(first_block, last_block) {
-            cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
-                OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
-                    block.start(),
-                    offset,
-                    Ordering::Relaxed,
-                );
-                MARK_SPEC.scan_words(
-                    block.start(),
-                    block.end(),
-                    &mut |word, _, bits| match bits {
-                        Bits::Range { start, end } => {
-                            unreachable!("Blocks should be bitmap-word aligned, but we got a misaligned {word}[{start}:{end}] instead")
-                        }
-                        Bits::All => {
-                            offset += BYTES_PER_MARK_BIT * word.count_ones() as Offset;
-                        }
-                    },
-                );
-                claim_block(block);
-                MARK_SPEC.scan_non_zero_values::<u8>(
-                    block.start(),
-                    block.end(),
-                    &mut |addr: Address| {
-                        if addr >= last_end {
-                                let object = ObjectReference::from_raw_address(addr).unwrap();
-                                let size = f(object);
-                                last_end = addr + size as usize;
-                            }
-                        },
-                );
-            } else {
+        let mut state = Transducer::new();
+            for block in RegionIterator::<Block>::new(first_block, last_block) {
                 OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
                     block.start(),
                     state.encode(block.start()),
                     Ordering::Relaxed,
                 );
-                claim_block(block);
+                // We need to visit the objects in this block twice;
+                // gather them up and advance the transducer first.
+                // XXX: Use arrayvec or something to not heap allocate here?
+                let mut objects = vec![];
                 MARK_SPEC.scan_non_zero_values::<u8>(
-                        block.start(),
-                        block.end(),
-                        &mut |addr: Address| {
-                            state.visit_mark_bit(addr);
-                            if state.in_object {
-                                f(ObjectReference::from_raw_address(addr).unwrap());
-                            }
-                        },
-                    );
-            }}
-        }
+                    block.start(),
+                    block.end(),
+                    &mut |addr: Address| {
+                        state.visit_mark_bit(addr);
+                        if state.in_object {
+                            objects.push(ObjectReference::from_raw_address(addr).unwrap());
+                        }
+                    },
+                );
+                let headers = objects.iter().map(|o| {
+                    VM::VMObjectModel::finalise_threading_list(*o);
+                    fix_threaded_pointers(*o)
+                }).collect::<Vec<_>>();
+                claim_block(block);
+                for (o, h) in std::iter::zip(objects.into_iter(), headers.into_iter()) {
+                    move_object(o, h);
+                }
+            }
     }
 
     pub fn has_calculated_forwarding_addresses(&self) -> bool {

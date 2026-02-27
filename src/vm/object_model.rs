@@ -477,10 +477,16 @@ pub trait ObjectModel<VM: VMBinding> {
         true
     }
 
-    fn push_threading_list(_object: ObjectReference, _slot: VM::VMSlot) {
+    fn push_threading_list(_object: ObjectReference, _slot: VM::VMSlot) -> bool {
         unimplemented!();
     }
-    fn pop_threading_list(_object: ObjectReference) -> Option<VM::VMSlot> {
+    fn walk_threading_list(_object: ObjectReference, _f: &mut impl FnMut(VM::VMSlot)) -> usize {
+        unimplemented!();
+    }
+    fn finalise_threading_list(_object: ObjectReference) {
+        unimplemented!();
+    }
+    fn reset_threading_list(_object: ObjectReference, _header: usize) {
         unimplemented!();
     }
 }
