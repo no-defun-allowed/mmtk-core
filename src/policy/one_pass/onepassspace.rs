@@ -235,6 +235,10 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             *common.options.no_reference_types,
             "Reference types should be disabled with MMTK_NO_REFERENCE_TYPES=true"
         );
+        assert!(
+            cfg!(not(feature = "compressor_art_marking")),
+            "ART marking for the One Pass Compactor is unimplemented"
+        );
         assert!(scheduler.num_workers() <= locking::Status::MAX_WORKERS);
         OnePassSpace {
             pr: if is_discontiguous {
