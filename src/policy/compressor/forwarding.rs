@@ -541,6 +541,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         claim_block: &impl Fn(Block),
         move_object: &mut impl FnMut(ObjectReference, usize),
     ) {
+        use arrayvec::ArrayVec;
         use crate::util::linear_scan::RegionIterator;
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
@@ -553,10 +554,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     state.encode(block.start()),
                     Ordering::Relaxed,
                 );
-                // We need to visit the objects in this block twice;
-                // gather them up and advance the transducer first.
-                // XXX: Use arrayvec or something to not heap allocate here?
-                let mut objects = vec![];
+                // We need to visit the objects in this block twice, gathering
+                // klass words the first time and putting them down the second
+                // time.
+                const MAXIMUM_OBJECTS_PER_BLOCK: usize = 1 << (Block::LOG_BYTES - MARK_SPEC.log_bytes_in_region);
+                let mut objects = ArrayVec::<_, MAXIMUM_OBJECTS_PER_BLOCK>::new();
                 MARK_SPEC.scan_non_zero_values::<u8>(
                     block.start(),
                     block.end(),
@@ -567,10 +569,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                         }
                     },
                 );
-                let headers = objects.iter().map(|o| {
+                let mut headers = ArrayVec::<_, MAXIMUM_OBJECTS_PER_BLOCK>::new();
+                for o in objects.iter() {
                     VM::VMObjectModel::finalise_threading_list(*o);
-                    fix_threaded_pointers(*o)
-                }).collect::<Vec<_>>();
+                    headers.push(fix_threaded_pointers(*o));
+                }
                 claim_block(block);
                 for (o, h) in std::iter::zip(objects.into_iter(), headers.into_iter()) {
                     move_object(o, h);
