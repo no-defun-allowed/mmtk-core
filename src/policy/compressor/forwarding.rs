@@ -55,7 +55,7 @@ pub(crate) const LOG_BITS_IN_OFFSET: usize = Offset::BITS.ilog2() as usize;
 /// then deserialises the state whilst computing forwarding pointers
 /// using [`Transducer::decode`].
 #[cfg(not(feature = "compressor_art_marking"))]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Transducer {
     /// The offset from the start of the region for the next object to be copied
     /// to, following preceding objects which were visited by the transducer.
@@ -537,11 +537,10 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         &self,
         region: CompressorRegion,
         cursor: Address,
-        fix_threaded_pointers: &impl Fn(ObjectReference) -> usize,
+        fix_threaded_pointers: &impl Fn(ObjectReference),
         claim_block: &impl Fn(Block),
-        move_object: &mut impl FnMut(ObjectReference, usize),
+        move_object: &mut impl FnMut(ObjectReference),
     ) {
-        use arrayvec::ArrayVec;
         use crate::util::linear_scan::RegionIterator;
         let first_block = Block::from_aligned_address(region.start());
         let last_block = Block::from_aligned_address(cursor);
@@ -554,30 +553,34 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     state.encode(block.start()),
                     Ordering::Relaxed,
                 );
-                // We need to visit the objects in this block twice, gathering
-                // klass words the first time and putting them down the second
-                // time.
-                const MAXIMUM_OBJECTS_PER_BLOCK: usize = 1 << (Block::LOG_BYTES - MARK_SPEC.log_bytes_in_region);
-                let mut objects = ArrayVec::<_, MAXIMUM_OBJECTS_PER_BLOCK>::new();
+                // We need to visit the objects in this block twice; make a
+                // temporary copy of the transducer so that we can iterate
+                // a second time, without updating the liveness information.
+                let mut second_state = state.clone();
                 MARK_SPEC.scan_non_zero_values::<u8>(
                     block.start(),
                     block.end(),
                     &mut |addr: Address| {
                         state.visit_mark_bit(addr);
                         if state.in_object {
-                            objects.push(ObjectReference::from_raw_address(addr).unwrap());
+                            let o = ObjectReference::from_raw_address(addr).unwrap();
+                            VM::VMObjectModel::finalise_threading_list(o);
+                            fix_threaded_pointers(o);
                         }
                     },
                 );
-                let mut headers = ArrayVec::<_, MAXIMUM_OBJECTS_PER_BLOCK>::new();
-                for o in objects.iter() {
-                    VM::VMObjectModel::finalise_threading_list(*o);
-                    headers.push(fix_threaded_pointers(*o));
-                }
                 claim_block(block);
-                for (o, h) in std::iter::zip(objects.into_iter(), headers.into_iter()) {
-                    move_object(o, h);
-                }
+                MARK_SPEC.scan_non_zero_values::<u8>(
+                    block.start(),
+                    block.end(),
+                    &mut |addr: Address| {
+                        second_state.visit_mark_bit(addr);
+                        if second_state.in_object {
+                            let o = ObjectReference::from_raw_address(addr).unwrap();
+                            move_object(o);
+                        }
+                    },
+                );
             }
     }
 

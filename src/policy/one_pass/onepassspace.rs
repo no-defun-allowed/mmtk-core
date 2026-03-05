@@ -467,13 +467,13 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                     let new_object = self.forward::<CAN_CLMUL>(obj, false);
                     VM::VMObjectModel::walk_threading_list(obj, &mut |slot| {
                         slot.store(new_object);
-                    })
+                    });
                 },
                 &locking::claim_for_moving,
-                &mut |obj: ObjectReference, h: usize| {
+                &mut |obj: ObjectReference| {
                     objects += 1;
                     let new_object = self.forward::<CAN_CLMUL>(obj, false);
-                    VM::VMObjectModel::reset_threading_list(obj, h);
+                    VM::VMObjectModel::reset_threading_list(obj);
                     // We set the end bits based on the sizes of objects when they are
                     // marked, and we compute the live data and thus the forwarding
                     // addresses based on those sizes. The forwarding addresses would be
