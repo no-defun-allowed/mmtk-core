@@ -29,6 +29,7 @@ pub mod largeobjectspace;
 pub mod lockfreeimmortalspace;
 pub mod markcompactspace;
 pub mod marksweepspace;
+pub mod old_pass;
 pub mod one_pass;
 #[cfg(feature = "vm_space")]
 pub mod vmspace;

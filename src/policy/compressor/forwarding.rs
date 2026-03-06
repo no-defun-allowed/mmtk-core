@@ -524,7 +524,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     #[cfg(feature = "compressor_art_marking")]
     pub fn calculate_and_walk_offset_vector(
         &self,
-        _region: CompressorRegion,
+        _start: Address,
         _cursor: Address,
         _fix_threaded_pointers: &impl Fn(ObjectReference) -> usize,
         _claim_block: &impl Fn(Block),
@@ -535,14 +535,14 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     #[cfg(not(feature = "compressor_art_marking"))]
     pub fn calculate_and_walk_offset_vector(
         &self,
-        region: CompressorRegion,
+        start: Address,
         cursor: Address,
         fix_threaded_pointers: &impl Fn(ObjectReference),
         claim_block: &impl Fn(Block),
         move_object: &mut impl FnMut(ObjectReference),
     ) {
         use crate::util::linear_scan::RegionIterator;
-        let first_block = Block::from_aligned_address(region.start());
+        let first_block = Block::from_aligned_address(start);
         let last_block = Block::from_aligned_address(cursor);
         self.calculated.store(true, Ordering::Relaxed);
 

@@ -461,7 +461,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             let mut to = r.region.start();
             let mut objects = 0;
             self.forwarding.calculate_and_walk_offset_vector(
-                r.region,
+                r.region.start(),
                 r.cursor(),
                 &|obj: ObjectReference| {
                     let new_object = self.forward::<CAN_CLMUL>(obj, false);
