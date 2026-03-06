@@ -1,6 +1,8 @@
+use crate::policy::compressor::forwarding::clmul_step;
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::heap::MonotonePageResource;
 use crate::util::linear_scan::{Region, RegionIterator};
+use crate::util::metadata::side_metadata::ranges::Bits;
 use crate::util::metadata::side_metadata::spec_defs::{COMPRESSOR_MARK, OLD_PASS_OFFSET_VECTOR};
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::util::{Address, ObjectReference};
@@ -76,6 +78,7 @@ pub struct ForwardingMetadata<VM: VMBinding> {
     pub(crate) first_address: Address,
     calculated: AtomicBool,
     vm: PhantomData<VM>,
+    supports_clmul: bool,
 }
 
 // A block in the Compressor is the granularity at which we cache
@@ -103,12 +106,24 @@ pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = OLD_PASS_OFFSET_VECTOR;
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
-    pub fn new(start: Address) -> ForwardingMetadata<VM> {
+    pub fn new(start: Address, _use_clmul: bool) -> ForwardingMetadata<VM> {
+        cfg_if::cfg_if! { if #[cfg(target_arch = "x86_64")] {
+            let supports_clmul = _use_clmul
+                && is_x86_feature_detected!("pclmulqdq")
+                && is_x86_feature_detected!("popcnt");
+        } else {
+            let supports_clmul = false;
+        }}
         ForwardingMetadata {
             first_address: start,
             calculated: AtomicBool::new(false),
             vm: PhantomData,
+            supports_clmul,
         }
+    }
+
+    pub fn supports_clmul(&self) -> bool {
+        self.supports_clmul
     }
 
     pub fn mark_last_word_of_object(&self, object: ObjectReference) {
@@ -166,11 +181,24 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         self.calculated.store(false, Ordering::Relaxed);
     }
 
-    pub fn forward(&self, address: Address) -> Address {
+    pub fn forward<const CAN_CLMUL: bool>(&self, address: Address) -> Address {
         debug_assert!(
             self.calculated.load(Ordering::Relaxed),
             "forward() should only be called when we have calculated an offset vector"
         );
+        if CAN_CLMUL {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                self.forward_clmul(address)
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!("Shouldn't have CAN_CLMUL = true on non-x86_64")
+        } else {
+            self.forward_base(address)
+        }
+    }
+
+    fn forward_base(&self, address: Address) -> Address {
         let block = Block::from_unaligned_address(address);
         let mut state = Transducer::decode(
             OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
@@ -183,6 +211,29 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             state.visit_mark_bit(addr)
         });
         self.first_address + state.live
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "pclmulqdq,popcnt")]
+    fn forward_clmul(&self, address: Address) -> Address {
+        debug_assert!(self.supports_clmul);
+        let block = Block::from_unaligned_address(address);
+        let (mut live, mut carry) = {
+            let state = Transducer::decode(
+                OFFSET_VECTOR_SPEC.load_atomic::<usize>(block.start(), Ordering::Relaxed),
+                block.start(),
+            );
+            (state.live, if state.in_object { -1i64 } else { 0i64 })
+        };
+        MARK_SPEC.scan_words(block.start(), address, &mut |word, _, bits| match bits {
+            Bits::Range { start, end } => {
+                assert_eq!(start, 0);
+                let mask = (1 << end) - 1;
+                live += clmul_step(&mut carry, word & mask) as usize;
+            }
+            Bits::All => live += clmul_step(&mut carry, word) as usize,
+        });
+        self.first_address + live
     }
 
     #[cfg(all(debug_assertions, feature = "vo_bit"))]

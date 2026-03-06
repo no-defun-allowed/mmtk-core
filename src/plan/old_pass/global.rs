@@ -8,7 +8,7 @@ use crate::plan::global::{BasePlan, CommonPlan};
 use crate::plan::old_pass::mutator::ALLOCATOR_MAPPING;
 use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
 use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
-use crate::policy::old_pass::{Compact, Counters, OldPassSpace};
+use crate::policy::old_pass::{Counters, OldPassSpace};
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
 use crate::scheduler::{GCWorkScheduler, GCWorker, WorkBucketStage};
@@ -99,7 +99,7 @@ impl<VM: VMBinding> Plan for OldPass<VM> {
 
         // Well, yes, but no.
         scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
-            .add(Compact::new(&self.op_space, &self.counters));
+            .add_boxed(self.op_space.compact_task(&self.counters));
 
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
             self.op_space

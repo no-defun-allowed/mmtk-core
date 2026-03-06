@@ -294,7 +294,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 if addr.is_aligned_to(Block::BYTES) {
                     OFFSET_VECTOR_SPEC.store_atomic::<Offset>(addr, encoded, Ordering::Relaxed);
                 }
-                clmul_step(offset, carry, word)
+                *offset += clmul_step(carry, word);
             }
 
             let mut offset: Offset = 0;
@@ -424,9 +424,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 Bits::Range { start, end } => {
                     assert_eq!(start, 0);
                     let mask = (1 << end) - 1;
-                    clmul_step(&mut offset, &mut carry, word & mask)
+                    offset += clmul_step(&mut carry, word & mask);
                 }
-                Bits::All => clmul_step(&mut offset, &mut carry, word),
+                Bits::All => offset += clmul_step(&mut carry, word),
             });
             offset
         }
@@ -592,9 +592,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 // #[target_feature] allows rustc to generate the POPCNT and PCLMULQDQ
 // instructions inline in this function.
 #[cfg(target_arch = "x86_64")]
-#[cfg(not(feature = "compressor_art_marking"))]
 #[target_feature(enable = "pclmulqdq,popcnt")]
-fn clmul_step(offset: &mut Offset, carry: &mut i64, word: usize) {
+pub(crate) fn clmul_step(carry: &mut i64, word: usize) -> Offset {
     use std::arch::x86_64;
     // Compute the prefix sum of this word of mark bitmap.
     let ones = x86_64::_mm_set1_epi8(-1i8);
@@ -612,5 +611,5 @@ fn clmul_step(offset: &mut Offset, carry: &mut i64, word: usize) {
     // prefix sum for the bit at the end of an object will be zero,
     // so we bitwise-or the original word with the prefix sum to
     // find all in-object bits.
-    *offset += (((flipped as usize | word).count_ones()) * 8) as Offset;
+    (((flipped as usize | word).count_ones()) * 8) as Offset
 }

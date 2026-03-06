@@ -41,7 +41,7 @@ impl<VM: VMBinding> SFT for OldPassSpace<VM> {
 
     fn get_forwarded_object(&self, object: ObjectReference) -> Option<ObjectReference> {
         if self.forwarding.has_calculated_forwarding_addresses() {
-            Some(self.forward(object, false))
+            Some(self.forward::<false>(object, false))
         } else {
             None
         }
@@ -171,7 +171,7 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for OldPassSpa
         if KIND == TRACE_KIND_MARK {
             self.trace_mark_object(queue, object)
         } else if KIND == TRACE_KIND_FORWARD {
-            self.forward(object, true)
+            self.forward::<false>(object, true)
         } else {
             unreachable!()
         }
@@ -217,6 +217,7 @@ impl<VM: VMBinding> OldPassSpace<VM> {
         ]);
         let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
+        let use_clmul = *common.options.compressor_use_clmul;
         assert!(
             *common.options.no_finalizer,
             "Finalizers should be disabled with MMTK_NO_FINALIZER=true"
@@ -227,7 +228,7 @@ impl<VM: VMBinding> OldPassSpace<VM> {
         );
         OldPassSpace {
             pr: MonotonePageResource::new_contiguous(common.start, common.extent, vm_map),
-            forwarding: forwarding::ForwardingMetadata::new(common.start),
+            forwarding: forwarding::ForwardingMetadata::new(common.start, use_clmul),
             common,
             scheduler,
         }
@@ -284,13 +285,18 @@ impl<VM: VMBinding> OldPassSpace<VM> {
         mark_bit == 1
     }
 
-    pub fn forward(&self, object: ObjectReference, _vo_bit_valid: bool) -> ObjectReference {
+    pub fn forward<const CAN_CLMUL: bool>(
+        &self,
+        object: ObjectReference,
+        _vo_bit_valid: bool,
+    ) -> ObjectReference {
         if !self.in_space(object) {
             return object;
         }
-        let ret =
-            ObjectReference::from_raw_address(self.forwarding.forward(object.to_raw_address()))
-                .unwrap();
+        let addr = self
+            .forwarding
+            .forward::<CAN_CLMUL>(object.to_raw_address());
+        let ret = ObjectReference::from_raw_address(addr).unwrap();
         // We can't expect the VO bit to be valid whilst in the compaction loop.
         // If we are fixing a reference to an object which precedes the referent
         // the VO bit will have been cleared already.
@@ -312,15 +318,36 @@ impl<VM: VMBinding> OldPassSpace<VM> {
         remset: &crate::util::remset::RemSet<VM>,
         stage: WorkBucketStage,
     ) {
-        let mut packets = vec![];
-        remset.flush_all(&mut |entries| {
-            let slots = entries.iter().map(|e| e.decode().0).collect();
-            packets.push(Box::new(UpdateSlots::<VM>::new(self, slots)) as Box<dyn GCWork<VM>>);
-        });
-        self.scheduler.work_buckets[stage].bulk_add(packets);
+        fn inner<VM: VMBinding, const CAN_CLMUL: bool>(
+            this: &'static OldPassSpace<VM>,
+            remset: &crate::util::remset::RemSet<VM>,
+            stage: WorkBucketStage,
+        ) {
+            let mut packets = vec![];
+            remset.flush_all(&mut |entries| {
+                let slots = entries.iter().map(|e| e.decode().0).collect();
+                packets
+                    .push(Box::new(UpdateSlots::<VM, CAN_CLMUL>::new(this, slots))
+                        as Box<dyn GCWork<VM>>);
+            });
+            this.scheduler.work_buckets[stage].bulk_add(packets);
+        }
+        if self.forwarding.supports_clmul() {
+            inner::<VM, true>(self, remset, stage)
+        } else {
+            inner::<VM, false>(self, remset, stage)
+        }
     }
 
-    pub fn compact(&self, worker: &mut GCWorker<VM>, counters: &Counters) {
+    pub fn compact_task(&'static self, counters: &'static Counters) -> Box<dyn GCWork<VM>> {
+        if self.forwarding.supports_clmul() {
+            Box::new(Compact::<VM, true>::new(self, counters))
+        } else {
+            Box::new(Compact::<VM, false>::new(self, counters))
+        }
+    }
+
+    pub fn compact<const CAN_CLMUL: bool>(&self, worker: &mut GCWorker<VM>, counters: &Counters) {
         #[cfg(feature = "vo_bit")]
         {
             let start = self.forwarding.first_address;
@@ -351,8 +378,8 @@ impl<VM: VMBinding> OldPassSpace<VM> {
                                 trace!("threading {o}");
                                 VM::VMObjectModel::push_threading_list(o, s);
                             } else {
-                                trace!("forwarding {o} to {}", self.forward(o, true));
-                                s.store(self.forward(o, true));
+                                trace!("forwarding {o} to {}", self.forward::<CAN_CLMUL>(o, true));
+                                s.store(self.forward::<CAN_CLMUL>(o, true));
                             }
                         }
                     }
@@ -364,7 +391,7 @@ impl<VM: VMBinding> OldPassSpace<VM> {
         let mut to = Address::ZERO;
         self.forwarding
             .calculate_offset_vector(&self.pr, &mut |obj: ObjectReference| {
-                let new_object = self.forward(obj, false);
+                let new_object = self.forward::<CAN_CLMUL>(obj, false);
                 debug_assert!(
                     new_object.to_raw_address() >= to,
                     "{0} < {to}",
@@ -399,47 +426,47 @@ impl<VM: VMBinding> OldPassSpace<VM> {
         self.pr.reset_cursor(to);
     }
 
-    fn update_slots(&self, slots: &[VM::VMSlot]) {
+    fn update_slots<const CAN_CLMUL: bool>(&self, slots: &[VM::VMSlot]) {
         for s in slots {
             if let Some(o) = s.load() {
-                trace!("forwarding {o} to {}", self.forward(o, true));
-                s.store(self.forward(o, true));
+                trace!("forwarding {o} to {}", self.forward::<CAN_CLMUL>(o, true));
+                s.store(self.forward::<CAN_CLMUL>(o, true));
             }
         }
     }
 }
 
 /// Compact live objects in the heap.
-pub struct Compact<VM: VMBinding> {
+pub struct Compact<VM: VMBinding, const CAN_CLMUL: bool> {
     op_space: &'static OldPassSpace<VM>,
     counters: &'static Counters,
 }
 
-impl<VM: VMBinding> GCWork<VM> for Compact<VM> {
+impl<VM: VMBinding, const CAN_CLMUL: bool> GCWork<VM> for Compact<VM, CAN_CLMUL> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.op_space.compact(worker, self.counters);
+        self.op_space.compact::<CAN_CLMUL>(worker, self.counters);
     }
 }
 
-impl<VM: VMBinding> Compact<VM> {
+impl<VM: VMBinding, const CAN_CLMUL: bool> Compact<VM, CAN_CLMUL> {
     pub fn new(op_space: &'static OldPassSpace<VM>, counters: &'static Counters) -> Self {
         Self { op_space, counters }
     }
 }
 
 /// Update references in a vector of remembered slots.
-pub struct UpdateSlots<VM: VMBinding> {
+pub struct UpdateSlots<VM: VMBinding, const CAN_CLMUL: bool> {
     op_space: &'static OldPassSpace<VM>,
     slots: Vec<VM::VMSlot>,
 }
 
-impl<VM: VMBinding> GCWork<VM> for UpdateSlots<VM> {
+impl<VM: VMBinding, const CAN_CLMUL: bool> GCWork<VM> for UpdateSlots<VM, CAN_CLMUL> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.op_space.update_slots(&self.slots);
+        self.op_space.update_slots::<CAN_CLMUL>(&self.slots);
     }
 }
 
-impl<VM: VMBinding> UpdateSlots<VM> {
+impl<VM: VMBinding, const CAN_CLMUL: bool> UpdateSlots<VM, CAN_CLMUL> {
     pub fn new(op_space: &'static OldPassSpace<VM>, slots: Vec<VM::VMSlot>) -> Self {
         Self { op_space, slots }
     }
