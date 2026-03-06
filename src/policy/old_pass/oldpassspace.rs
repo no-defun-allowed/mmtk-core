@@ -1,10 +1,10 @@
+use super::forwarding;
 use crate::plan::VectorObjectQueue;
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
-use crate::policy::largeobjectspace::LargeObjectSpace;
 use crate::policy::sft::GCWorkerMutRef;
 use crate::policy::sft::SFT;
 use crate::policy::space::{CommonSpace, Space};
-use crate::scheduler::GCWorker;
+use crate::scheduler::{GCWork, GCWorkScheduler, GCWorker, WorkBucketStage};
 use crate::util::copy::CopySemantics;
 use crate::util::heap::{MonotonePageResource, PageResource};
 use crate::util::metadata::extract_side_metadata;
@@ -16,13 +16,13 @@ use crate::util::statistics::counter::EventCounter;
 use crate::util::statistics::stats::Stats;
 use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
+use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
-use super::forwarding;
 use atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
-pub(crate) const TRACE_KIND_FORWARD_ROOT: TraceKind = 1;
+pub(crate) const TRACE_KIND_FORWARD: TraceKind = 1;
 
 /// OldPassSpace is a stop-the-world and serial implementation of
 /// the One-Pass Compactor, as described in Cory and Petrank,
@@ -31,6 +31,7 @@ pub struct OldPassSpace<VM: VMBinding> {
     common: CommonSpace<VM>,
     pr: MonotonePageResource<VM>,
     forwarding: forwarding::ForwardingMetadata<VM>,
+    scheduler: Arc<GCWorkScheduler<VM>>,
 }
 
 impl<VM: VMBinding> SFT for OldPassSpace<VM> {
@@ -169,8 +170,8 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for OldPassSpa
         );
         if KIND == TRACE_KIND_MARK {
             self.trace_mark_object(queue, object)
-        } else if KIND == TRACE_KIND_FORWARD_ROOT {
-            self.trace_forward_root(queue, object)
+        } else if KIND == TRACE_KIND_FORWARD {
+            self.forward(object, true)
         } else {
             unreachable!()
         }
@@ -178,7 +179,7 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for OldPassSpa
     fn may_move_objects<const KIND: crate::policy::gc_work::TraceKind>() -> bool {
         if KIND == TRACE_KIND_MARK {
             false
-        } else if KIND == TRACE_KIND_FORWARD_ROOT {
+        } else if KIND == TRACE_KIND_FORWARD {
             true
         } else {
             unreachable!()
@@ -214,12 +215,21 @@ impl<VM: VMBinding> OldPassSpace<VM> {
             MetadataSpec::OnSide(forwarding::MARK_SPEC),
             MetadataSpec::OnSide(forwarding::OFFSET_VECTOR_SPEC),
         ]);
+        let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
-
+        assert!(
+            *common.options.no_finalizer,
+            "Finalizers should be disabled with MMTK_NO_FINALIZER=true"
+        );
+        assert!(
+            *common.options.no_reference_types,
+            "Reference types should be disabled with MMTK_NO_REFERENCE_TYPES=true"
+        );
         OldPassSpace {
             pr: MonotonePageResource::new_contiguous(common.start, common.extent, vm_map),
             forwarding: forwarding::ForwardingMetadata::new(common.start),
             common,
+            scheduler,
         }
     }
 
@@ -249,14 +259,6 @@ impl<VM: VMBinding> OldPassSpace<VM> {
             self.forwarding.mark_last_word_of_object(object);
         }
         object
-    }
-
-    pub fn trace_forward_root<Q: ObjectQueue>(
-        &self,
-        _queue: &mut Q,
-        object: ObjectReference,
-    ) -> ObjectReference {
-        self.forward(object, true)
     }
 
     pub fn test_and_mark(object: ObjectReference) -> bool {
@@ -305,12 +307,20 @@ impl<VM: VMBinding> OldPassSpace<VM> {
         ret
     }
 
-    pub fn compact(
-        &self,
-        worker: &mut GCWorker<VM>,
-        los: &LargeObjectSpace<VM>,
-        counters: &Counters,
+    pub fn add_remset_tasks(
+        &'static self,
+        remset: &crate::util::remset::RemSet<VM>,
+        stage: WorkBucketStage,
     ) {
+        let mut packets = vec![];
+        remset.flush_all(&mut |entries| {
+            let slots = entries.iter().map(|e| e.decode().0).collect();
+            packets.push(Box::new(UpdateSlots::<VM>::new(self, slots)) as Box<dyn GCWork<VM>>);
+        });
+        self.scheduler.work_buckets[stage].bulk_add(packets);
+    }
+
+    pub fn compact(&self, worker: &mut GCWorker<VM>, counters: &Counters) {
         #[cfg(feature = "vo_bit")]
         {
             let start = self.forwarding.first_address;
@@ -330,8 +340,7 @@ impl<VM: VMBinding> OldPassSpace<VM> {
         }
         let mut seen: u64 = 0;
         let mut threaded: u64 = 0;
-        let thread_references = &mut |object: ObjectReference,
-                                      old: ObjectReference| {
+        let thread_references = &mut |object: ObjectReference, old: ObjectReference| {
             if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
                 VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
                     if let Some(o) = s.load() {
@@ -352,27 +361,9 @@ impl<VM: VMBinding> OldPassSpace<VM> {
                 panic!("nah I've really got to look at slots here");
             }
         };
-        let update_references = &mut |object: ObjectReference| {
-            if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
-                VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
-                    if let Some(o) = s.load() {
-                        trace!("forwarding {o} to {}", self.forward(o, true));
-                        s.store(self.forward(o, true));
-                    }
-                });
-            } else {
-                panic!("nah I've really got to look at slots here");
-            }
-        };
         let mut to = Address::ZERO;
         self.forwarding
             .calculate_offset_vector(&self.pr, &mut |obj: ObjectReference| {
-                // We set the end bits based on the sizes of objects when they are
-                // marked, and we compute the live data and thus the forwarding
-                // addresses based on those sizes. The forwarding addresses would be
-                // incorrect if the sizes of objects were to change.                
-                let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
-                debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
                 let new_object = self.forward(obj, false);
                 debug_assert!(
                     new_object.to_raw_address() >= to,
@@ -384,6 +375,12 @@ impl<VM: VMBinding> OldPassSpace<VM> {
                     slot.store(new_object);
                 });
                 VM::VMObjectModel::reset_threading_list(obj);
+                // We set the end bits based on the sizes of objects when they are
+                // marked, and we compute the live data and thus the forwarding
+                // addresses based on those sizes. The forwarding addresses would be
+                // incorrect if the sizes of objects were to change.
+                let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
+                debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
                 // Copy object
                 trace!(" copy from {} to {}", obj, new_object);
                 let end_of_new_object = VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
@@ -395,14 +392,55 @@ impl<VM: VMBinding> OldPassSpace<VM> {
                 to = new_object.to_object_start::<VM>() + copied_size;
                 debug_assert_eq!(end_of_new_object, to);
             });
-        // Update references from the LOS to Compressor too.
-        los.enumerate_objects(&mut object_enum::ClosureObjectEnumerator::<_, VM>::new(
-            update_references,
-        ));
         debug!("Compact end: to = {}", to);
         counters.threaded.clone().lock().unwrap().inc_by(threaded);
         counters.seen.clone().lock().unwrap().inc_by(seen);
         // Reset the bump pointer
         self.pr.reset_cursor(to);
+    }
+
+    fn update_slots(&self, slots: &[VM::VMSlot]) {
+        for s in slots {
+            if let Some(o) = s.load() {
+                trace!("forwarding {o} to {}", self.forward(o, true));
+                s.store(self.forward(o, true));
+            }
+        }
+    }
+}
+
+/// Compact live objects in the heap.
+pub struct Compact<VM: VMBinding> {
+    op_space: &'static OldPassSpace<VM>,
+    counters: &'static Counters,
+}
+
+impl<VM: VMBinding> GCWork<VM> for Compact<VM> {
+    fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.op_space.compact(worker, self.counters);
+    }
+}
+
+impl<VM: VMBinding> Compact<VM> {
+    pub fn new(op_space: &'static OldPassSpace<VM>, counters: &'static Counters) -> Self {
+        Self { op_space, counters }
+    }
+}
+
+/// Update references in a vector of remembered slots.
+pub struct UpdateSlots<VM: VMBinding> {
+    op_space: &'static OldPassSpace<VM>,
+    slots: Vec<VM::VMSlot>,
+}
+
+impl<VM: VMBinding> GCWork<VM> for UpdateSlots<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        self.op_space.update_slots(&self.slots);
+    }
+}
+
+impl<VM: VMBinding> UpdateSlots<VM> {
+    pub fn new(op_space: &'static OldPassSpace<VM>, slots: Vec<VM::VMSlot>) -> Self {
+        Self { op_space, slots }
     }
 }

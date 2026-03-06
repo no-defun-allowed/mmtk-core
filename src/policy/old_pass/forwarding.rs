@@ -1,12 +1,11 @@
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::heap::MonotonePageResource;
 use crate::util::linear_scan::{Region, RegionIterator};
-use crate::util::metadata::side_metadata::spec_defs::{COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR};
+use crate::util::metadata::side_metadata::spec_defs::{COMPRESSOR_MARK, OLD_PASS_OFFSET_VECTOR};
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::util::{Address, ObjectReference};
 use crate::vm::object_model::ObjectModel;
 use crate::vm::VMBinding;
-use super::GC_MARK_BIT_MASK;
 use atomic::Ordering;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicBool;
@@ -101,7 +100,7 @@ pub fn block_number(a: ObjectReference) -> usize {
 }
 
 pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
-pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
+pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = OLD_PASS_OFFSET_VECTOR;
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
     pub fn new(start: Address) -> ForwardingMetadata<VM> {
@@ -132,7 +131,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             );
         }
 
-        MARK_SPEC.fetch_or_atomic(last_word_of_object, GC_MARK_BIT_MASK, Ordering::SeqCst);
+        MARK_SPEC.fetch_or_atomic::<u8>(last_word_of_object, 1, Ordering::SeqCst);
     }
 
     pub fn calculate_offset_vector(

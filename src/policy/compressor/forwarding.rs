@@ -547,41 +547,41 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         self.calculated.store(true, Ordering::Relaxed);
 
         let mut state = Transducer::new();
-            for block in RegionIterator::<Block>::new(first_block, last_block) {
-                OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
-                    block.start(),
-                    state.encode(block.start()),
-                    Ordering::Relaxed,
-                );
-                // We need to visit the objects in this block twice; make a
-                // temporary copy of the transducer so that we can iterate
-                // a second time, without updating the liveness information.
-                let mut second_state = state.clone();
-                MARK_SPEC.scan_non_zero_values::<u8>(
-                    block.start(),
-                    block.end(),
-                    &mut |addr: Address| {
-                        state.visit_mark_bit(addr);
-                        if state.in_object {
-                            let o = ObjectReference::from_raw_address(addr).unwrap();
-                            VM::VMObjectModel::finalise_threading_list(o);
-                            fix_threaded_pointers(o);
-                        }
-                    },
-                );
-                claim_block(block);
-                MARK_SPEC.scan_non_zero_values::<u8>(
-                    block.start(),
-                    block.end(),
-                    &mut |addr: Address| {
-                        second_state.visit_mark_bit(addr);
-                        if second_state.in_object {
-                            let o = ObjectReference::from_raw_address(addr).unwrap();
-                            move_object(o);
-                        }
-                    },
-                );
-            }
+        for block in RegionIterator::<Block>::new(first_block, last_block) {
+            OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
+                block.start(),
+                state.encode(block.start()),
+                Ordering::Relaxed,
+            );
+            // We need to visit the objects in this block twice; make a
+            // temporary copy of the transducer so that we can iterate
+            // a second time, without updating the liveness information.
+            let mut second_state = state.clone();
+            MARK_SPEC.scan_non_zero_values::<u8>(
+                block.start(),
+                block.end(),
+                &mut |addr: Address| {
+                    state.visit_mark_bit(addr);
+                    if state.in_object {
+                        let o = ObjectReference::from_raw_address(addr).unwrap();
+                        VM::VMObjectModel::finalise_threading_list(o);
+                        fix_threaded_pointers(o);
+                    }
+                },
+            );
+            claim_block(block);
+            MARK_SPEC.scan_non_zero_values::<u8>(
+                block.start(),
+                block.end(),
+                &mut |addr: Address| {
+                    second_state.visit_mark_bit(addr);
+                    if second_state.in_object {
+                        let o = ObjectReference::from_raw_address(addr).unwrap();
+                        move_object(o);
+                    }
+                },
+            );
+        }
     }
 
     pub fn has_calculated_forwarding_addresses(&self) -> bool {

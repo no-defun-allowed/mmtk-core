@@ -51,6 +51,9 @@ pub enum PlanSelector {
     /// A mark-compact collector that does compaction in one heap traversal,
     /// blending Compressor-style bitmaps and threading compaction.
     OnePass,
+    /// A mark-compact collector that does compaction in one heap traversal,
+    /// blending Compressor-style bitmaps and threading compaction (but less parallel).
+    OldPass,
     /// An Immix collector that uses a sticky mark bit to allow generational behaviors without a copying nursery.
     StickyImmix,
     /// Concurrent non-moving immix using SATB

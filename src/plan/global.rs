@@ -67,6 +67,7 @@ pub fn create_mutator<VM: VMBinding>(
             crate::plan::compressor::mutator::create_compressor_mutator(tls, mmtk)
         }
         PlanSelector::OnePass => crate::plan::one_pass::mutator::create_onepass_mutator(tls, mmtk),
+        PlanSelector::OldPass => crate::plan::old_pass::mutator::create_oldpass_mutator(tls, mmtk),
     })
 }
 
@@ -109,6 +110,9 @@ pub fn create_plan<VM: VMBinding>(
         }
         PlanSelector::OnePass => {
             Box::new(crate::plan::one_pass::OnePass::new(args)) as Box<dyn Plan<VM = VM>>
+        }
+        PlanSelector::OldPass => {
+            Box::new(crate::plan::old_pass::OldPass::new(args)) as Box<dyn Plan<VM = VM>>
         }
     };
 

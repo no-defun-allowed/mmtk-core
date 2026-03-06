@@ -416,8 +416,8 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                                         #[cfg(feature = "onepass_distances")]
                                         {
                                             let bits = (target.to_raw_address().as_usize()
-                                                        ^ s.as_address().as_usize())
-                                                .ilog2();
+                                                ^ s.as_address().as_usize())
+                                            .ilog2();
                                             local_counters[bits as usize] += 1;
                                         }
                                     } else {

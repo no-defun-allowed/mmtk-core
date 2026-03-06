@@ -1,14 +1,14 @@
-use super::gc_work::OnePassWorkContext;
-use super::gc_work::{AfterCompact, ForwardingProcessEdges, MarkingProcessEdges};
+use super::gc_work::OldPassWorkContext;
+use super::gc_work::{ForwardingProcessEdges, MarkingProcessEdges};
 use crate::plan::compressor::gc_work::GenerateWork;
 use crate::plan::compressor::process_edges::PlanRemember;
 use crate::plan::global::CreateGeneralPlanArgs;
 use crate::plan::global::CreateSpecificPlanArgs;
 use crate::plan::global::{BasePlan, CommonPlan};
-use crate::plan::one_pass::mutator::ALLOCATOR_MAPPING;
+use crate::plan::old_pass::mutator::ALLOCATOR_MAPPING;
 use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
 use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
-use crate::policy::one_pass::{Counters, OnePassSpace};
+use crate::policy::old_pass::{Compact, Counters, OldPassSpace};
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
 use crate::scheduler::{GCWorkScheduler, GCWorker, WorkBucketStage};
@@ -24,30 +24,30 @@ use crate::vm::VMBinding;
 use enum_map::EnumMap;
 use mmtk_macros::{HasSpaces, PlanTraceObject};
 
-/// OnePass implements a stop-the-world and parallel implementation of
+/// OldPass implements a stop-the-world and serial implementation of
 /// the One-Pass Compactor, as described in Cory and Petrank,
 /// [The One Pass (OP) Compactor: An Intellectual Abstract](https://dl.acm.org/doi/pdf/10.1145/3652024.3665513).
 #[derive(HasSpaces, PlanTraceObject)]
-pub struct OnePass<VM: VMBinding> {
+pub struct OldPass<VM: VMBinding> {
     #[parent]
     pub common: CommonPlan<VM>,
     #[space]
-    pub op_space: OnePassSpace<VM>,
+    pub op_space: OldPassSpace<VM>,
     pub counters: Counters,
     remset: RemSet<VM>,
 }
 
-/// The plan constraints for the OnePass plan.
-pub const ONE_PASS_CONSTRAINTS: PlanConstraints = PlanConstraints {
+/// The plan constraints for the OldPass plan.
+pub const OLD_PASS_CONSTRAINTS: PlanConstraints = PlanConstraints {
     max_non_los_default_alloc_bytes: MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN,
     moves_objects: true,
     needs_forward_after_liveness: true,
     ..PlanConstraints::default()
 };
 
-impl<VM: VMBinding> Plan for OnePass<VM> {
+impl<VM: VMBinding> Plan for OldPass<VM> {
     fn constraints(&self) -> &'static PlanConstraints {
-        &ONE_PASS_CONSTRAINTS
+        &OLD_PASS_CONSTRAINTS
     }
 
     fn collection_required(&self, space_full: bool, _space: Option<SpaceStats<Self::VM>>) -> bool {
@@ -91,16 +91,15 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
 
         // Stop & scan mutators (mutator scanning can happen before STW)
         scheduler.work_buckets[WorkBucketStage::Unconstrained]
-            .add(StopMutators::<OnePassWorkContext<VM>>::new());
+            .add(StopMutators::<OldPassWorkContext<VM>>::new());
 
         // Prepare global/collectors/mutators
         scheduler.work_buckets[WorkBucketStage::Prepare]
-            .add(Prepare::<OnePassWorkContext<VM>>::new(self));
+            .add(Prepare::<OldPassWorkContext<VM>>::new(self));
 
         // Well, yes, but no.
-        self.op_space.add_compact_tasks(&self.counters);
         scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
-            .set_sentinel(Box::new(AfterCompact::<VM>::new(&self.op_space)));
+            .add(Compact::new(&self.op_space, &self.counters));
 
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
             self.op_space
@@ -109,7 +108,7 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
 
         // Release global/collectors/mutators
         scheduler.work_buckets[WorkBucketStage::Release]
-            .add(Release::<OnePassWorkContext<VM>>::new(self));
+            .add(Release::<OldPassWorkContext<VM>>::new(self));
 
         // Reference processing
         if !*self.base().options.no_reference_types {
@@ -176,19 +175,19 @@ impl<VM: VMBinding> Plan for OnePass<VM> {
     }
 }
 
-impl<VM: VMBinding> OnePass<VM> {
+impl<VM: VMBinding> OldPass<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
         let stats = args.stats;
         let scheduler = args.scheduler.clone();
 
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
-            constraints: &ONE_PASS_CONSTRAINTS,
+            constraints: &OLD_PASS_CONSTRAINTS,
             global_side_metadata_specs: SideMetadataContext::new_global_specs(&[]),
         };
 
-        let res = OnePass {
-            op_space: OnePassSpace::new(plan_args.get_normal_space_args(
+        let res = OldPass {
+            op_space: OldPassSpace::new(plan_args.get_normal_space_args(
                 "op_space",
                 true,
                 false,
@@ -205,7 +204,7 @@ impl<VM: VMBinding> OnePass<VM> {
     }
 }
 
-impl<VM: VMBinding> PlanRemember<VM> for OnePass<VM> {
+impl<VM: VMBinding> PlanRemember<VM> for OldPass<VM> {
     fn record(&self, source: VM::VMSlot, target: ObjectReference, worker: &GCWorker<VM>) {
         self.remset.record(source, target, worker);
     }
