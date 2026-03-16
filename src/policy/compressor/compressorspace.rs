@@ -503,7 +503,7 @@ impl<VM: VMBinding> GCWork<VM> for CalculateOffsetVector<VM> {
 }
 
 pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::CompressorRegion>]) {
-    if log::log_enabled!(log::Level::Debug) {
+    if log::log_enabled!(log::Level::Info) {
         regions
             .chunks(64)
             .map(|c| {
@@ -514,7 +514,7 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
                     scale[index]
                 })
             })
-            .for_each(|c| debug!("Region usage: {}", c.collect::<String>()));
+            .for_each(|c| info!("Region usage: {}", c.collect::<String>()));
     }
 }
 

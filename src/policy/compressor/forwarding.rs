@@ -526,9 +526,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         &self,
         _start: Address,
         _cursor: Address,
-        _fix_threaded_pointers: &impl Fn(ObjectReference) -> usize,
+        _fix_threaded_pointers: &impl Fn(ObjectReference),
         _claim_block: &impl Fn(Block),
-        _move_object: &mut impl FnMut(ObjectReference, usize),
+        _move_object: &mut impl FnMut(ObjectReference),
     ) {
         todo!();
     }
