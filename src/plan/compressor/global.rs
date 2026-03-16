@@ -10,7 +10,7 @@ use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
 use crate::policy::compressor::CompressorSpace;
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
-use crate::scheduler::{GCWorkScheduler, GCWorker, WorkBucketStage};
+use crate::scheduler::{GCWorkContext, GCWorkScheduler, GCWorker, WorkBucketStage};
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::heap::gc_trigger::SpaceStats;
 #[allow(unused_imports)]
@@ -83,92 +83,13 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
     }
 
     fn schedule_collection(&'static self, scheduler: &GCWorkScheduler<VM>) {
-        // TODO use schedule_common once it can work with the Compressor
-        // The main issue there is that we need to ForwardingProcessEdges
-        // in FinalizableForwarding.
-
-        // Stop & scan mutators (mutator scanning can happen before STW)
-        scheduler.work_buckets[WorkBucketStage::Unconstrained]
-            .add(StopMutators::<CompressorWorkContext<VM>>::new());
-
-        // Prepare global/collectors/mutators
-        scheduler.work_buckets[WorkBucketStage::Prepare]
-            .add(Prepare::<CompressorWorkContext<VM>>::new(self));
-
-        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new(|| {
-            self.compressor_space.add_offset_vector_tasks()
-        }));
-
-        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
-            self.compressor_space
-                .add_remset_tasks(&self.remset, WorkBucketStage::SecondRoots)
-        }));
-
-        scheduler.work_buckets[WorkBucketStage::Compact].add(GenerateWork::new(|| {
-            self.compressor_space.add_compact_tasks()
-        }));
-
-        scheduler.work_buckets[WorkBucketStage::Compact]
-            .set_sentinel(Box::new(AfterCompact::<VM>::new(&self.compressor_space)));
-
-        // Release global/collectors/mutators
-        scheduler.work_buckets[WorkBucketStage::Release]
-            .add(Release::<CompressorWorkContext<VM>>::new(self));
-
-        // Reference processing
-        if !*self.base().options.no_reference_types {
-            use crate::util::reference_processor::{
-                PhantomRefProcessing, SoftRefProcessing, WeakRefProcessing,
-            };
-            scheduler.work_buckets[WorkBucketStage::SoftRefClosure]
-                .add(SoftRefProcessing::<MarkingProcessEdges<VM>>::new());
-            scheduler.work_buckets[WorkBucketStage::WeakRefClosure]
-                .add(WeakRefProcessing::<VM>::new());
-            scheduler.work_buckets[WorkBucketStage::PhantomRefClosure]
-                .add(PhantomRefProcessing::<VM>::new());
-
-            use crate::util::reference_processor::RefForwarding;
-            scheduler.work_buckets[WorkBucketStage::RefForwarding]
-                .add(RefForwarding::<ForwardingProcessEdges<VM>>::new());
-
-            use crate::util::reference_processor::RefEnqueue;
-            scheduler.work_buckets[WorkBucketStage::Release].add(RefEnqueue::<VM>::new());
-        }
-
-        // Finalization
-        if !*self.base().options.no_finalizer {
-            use crate::util::finalizable_processor::{Finalization, ForwardFinalization};
-            // finalization
-            // treat finalizable objects as roots and perform a closure (marking)
-            // must be done before calculating forwarding pointers
-            scheduler.work_buckets[WorkBucketStage::FinalRefClosure]
-                .add(Finalization::<MarkingProcessEdges<VM>>::new());
-            // update finalizable object references
-            // must be done before compacting
-            scheduler.work_buckets[WorkBucketStage::FinalizableForwarding]
-                .add(ForwardFinalization::<ForwardingProcessEdges<VM>>::new());
-        }
-
-        // VM-specific weak ref processing
-        scheduler.work_buckets[WorkBucketStage::VMRefClosure]
-            .set_sentinel(Box::new(VMProcessWeakRefs::<MarkingProcessEdges<VM>>::new()));
-
-        // VM-specific weak ref forwarding
-        scheduler.work_buckets[WorkBucketStage::VMRefForwarding]
-            .add(VMForwardWeakRefs::<ForwardingProcessEdges<VM>>::new());
-
-        // VM-specific work after forwarding, possible to implement ref enququing.
-        scheduler.work_buckets[WorkBucketStage::Release].add(VMPostForwarding::<VM>::default());
-
-        // Analysis GC work
-        #[cfg(feature = "analysis")]
-        {
-            use crate::util::analysis::GcHookWork;
-            scheduler.work_buckets[WorkBucketStage::Unconstrained].add(GcHookWork);
-        }
-        #[cfg(feature = "sanity")]
-        scheduler.work_buckets[WorkBucketStage::Final]
-            .add(crate::util::sanity::sanity_checker::ScheduleSanityGC::<Self>::new(self));
+        schedule_collection::<
+            VM,
+            Compressor<VM>,
+            CompressorWorkContext<VM>,
+            MarkingProcessEdges<VM>,
+            ForwardingProcessEdges<VM>,
+        >(self, scheduler, &self.compressor_space, &self.remset);
     }
 
     fn current_gc_may_move_object(&self) -> bool {
@@ -211,4 +132,106 @@ impl<VM: VMBinding> PlanRemember<VM> for Compressor<VM> {
     fn record(&self, source: VM::VMSlot, target: ObjectReference, worker: &GCWorker<VM>) {
         self.remset.record(source, target, worker);
     }
+}
+
+pub(crate) fn schedule_compaction<
+    VM: VMBinding
+>(
+    scheduler: &GCWorkScheduler<VM>,
+    compressor_space: &'static Compressor<VM>,
+    remset: &'static RemSet<VM>,
+) {
+    scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new(|| {
+        compressor_space.add_offset_vector_tasks()
+    }));
+
+    scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
+        compressor_space.add_remset_tasks(remset, WorkBucketStage::SecondRoots)
+    }));
+
+    scheduler.work_buckets[WorkBucketStage::Compact]
+        .add(GenerateWork::new(|| compressor_space.add_compact_tasks()));
+
+    scheduler.work_buckets[WorkBucketStage::Compact]
+        .set_sentinel(Box::new(AfterCompact::<VM>::new(compressor_space)));
+}
+
+pub(crate) fn schedule_collection<
+    VM: VMBinding,
+    PlanType: Plan<VM = VM>,
+    Context: GCWorkContext<VM = VM, PlanType = PlanType>,
+    MPE: ProcessEdgesWork<VM = VM>,
+    FPE: ProcessEdgesWork<VM = VM>,
+>(
+    plan: &'static PlanType,
+    scheduler: &GCWorkScheduler<VM>,
+    compressor_space: &'static CompressorSpace<VM>,
+    remset: &'static RemSet<VM>,
+) {
+    // TODO use schedule_common once it can work with the Compressor
+    // The main issue there is that we need to ForwardingProcessEdges
+    // in FinalizableForwarding.
+
+    // Stop & scan mutators (mutator scanning can happen before STW)
+    scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<Context>::new());
+
+    // Prepare global/collectors/mutators
+    scheduler.work_buckets[WorkBucketStage::Prepare].add(Prepare::<Context>::new(plan));
+
+    schedule_compaction(scheduler, compressor_space, remset);
+
+    // Release global/collectors/mutators
+    scheduler.work_buckets[WorkBucketStage::Release].add(Release::<Context>::new(plan));
+
+    // Reference processing
+    if !*plan.base().options.no_reference_types {
+        use crate::util::reference_processor::{
+            PhantomRefProcessing, SoftRefProcessing, WeakRefProcessing,
+        };
+        scheduler.work_buckets[WorkBucketStage::SoftRefClosure]
+            .add(SoftRefProcessing::<MPE>::new());
+        scheduler.work_buckets[WorkBucketStage::WeakRefClosure].add(WeakRefProcessing::<VM>::new());
+        scheduler.work_buckets[WorkBucketStage::PhantomRefClosure]
+            .add(PhantomRefProcessing::<VM>::new());
+
+        use crate::util::reference_processor::RefForwarding;
+        scheduler.work_buckets[WorkBucketStage::RefForwarding].add(RefForwarding::<FPE>::new());
+
+        use crate::util::reference_processor::RefEnqueue;
+        scheduler.work_buckets[WorkBucketStage::Release].add(RefEnqueue::<VM>::new());
+    }
+
+    // Finalization
+    if !*plan.base().options.no_finalizer {
+        use crate::util::finalizable_processor::{Finalization, ForwardFinalization};
+        // finalization
+        // treat finalizable objects as roots and perform a closure (marking)
+        // must be done before calculating forwarding pointers
+        scheduler.work_buckets[WorkBucketStage::FinalRefClosure].add(Finalization::<MPE>::new());
+        // update finalizable object references
+        // must be done before compacting
+        scheduler.work_buckets[WorkBucketStage::FinalizableForwarding]
+            .add(ForwardFinalization::<FPE>::new());
+    }
+
+    // VM-specific weak ref processing
+    scheduler.work_buckets[WorkBucketStage::VMRefClosure]
+        .set_sentinel(Box::new(VMProcessWeakRefs::<MarkingProcessEdges<VM>>::new()));
+
+    // VM-specific weak ref forwarding
+    scheduler.work_buckets[WorkBucketStage::VMRefForwarding]
+        .add(VMForwardWeakRefs::<ForwardingProcessEdges<VM>>::new());
+
+    // VM-specific work after forwarding, possible to implement ref enququing.
+    scheduler.work_buckets[WorkBucketStage::Release].add(VMPostForwarding::<VM>::default());
+
+    // Analysis GC work
+    #[cfg(feature = "analysis")]
+    {
+        use crate::util::analysis::GcHookWork;
+        scheduler.work_buckets[WorkBucketStage::Unconstrained].add(GcHookWork);
+    }
+    #[cfg(feature = "sanity")]
+    scheduler.work_buckets[WorkBucketStage::Final]
+        .add(crate::util::sanity::sanity_checker::ScheduleSanityGC::<Self>::new(plan));
 }
