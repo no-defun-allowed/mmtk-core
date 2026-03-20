@@ -46,9 +46,7 @@ impl<VM: VMBinding> AfterCompact<VM> {
 }
 
 /// Marking trace
-pub struct CompressorCondition<VM: VMBinding> {
-    _p: PhantomData<VM>,
-}
+pub struct CompressorCondition<VM: VMBinding>(PhantomData<VM>);
 
 impl<VM: VMBinding> RemsetCondition<Compressor<VM>, VM> for CompressorCondition<VM> {
     fn relevant(plan: &Compressor<VM>, source: VM::VMSlot, target: ObjectReference) -> bool {
@@ -60,7 +58,7 @@ impl<VM: VMBinding> RemsetCondition<Compressor<VM>, VM> for CompressorCondition<
 pub type MarkingProcessEdges<VM> =
     PlanProcessEdgesRemset<VM, Compressor<VM>, CompressorCondition<VM>, TRACE_KIND_MARK>;
 
-pub struct CompressorWorkContext<VM: VMBinding>(std::marker::PhantomData<VM>);
+pub struct CompressorWorkContext<VM: VMBinding>(PhantomData<VM>);
 impl<VM: VMBinding> crate::scheduler::GCWorkContext for CompressorWorkContext<VM> {
     type VM = VM;
     type PlanType = Compressor<VM>;

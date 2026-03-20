@@ -138,7 +138,7 @@ pub(crate) fn schedule_compaction<
     VM: VMBinding
 >(
     scheduler: &GCWorkScheduler<VM>,
-    compressor_space: &'static Compressor<VM>,
+    compressor_space: &'static CompressorSpace<VM>,
     remset: &'static RemSet<VM>,
 ) {
     scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new(|| {

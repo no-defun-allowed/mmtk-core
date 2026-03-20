@@ -3,6 +3,7 @@ pub(super) mod concurrent_marking_work;
 pub(super) mod global;
 
 pub mod immix;
+pub mod compressor;
 
 use bytemuck::NoUninit;
 

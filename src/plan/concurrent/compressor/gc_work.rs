@@ -1,25 +1,45 @@
-use crate::plan::concurrent::immix::global::ConcurrentImmix;
-use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
+use crate::plan::concurrent::compressor::global::ConcurrentCompressor;
+use crate::plan::compressor::process_edges::{PlanProcessEdgesRemset, RemsetCondition};
+use crate::policy::compressor::{CompressorSpace, TRACE_KIND_FORWARD, TRACE_KIND_MARK};
+use crate::policy::space::Space;
 use crate::scheduler::gc_work::{PlanProcessEdges, UnsupportedProcessEdges};
 use crate::scheduler::ProcessEdgesWork;
+use crate::util::ObjectReference;
 use crate::vm::VMBinding;
+use crate::vm::slot::Slot;
+use std::marker::PhantomData;
 
-pub(super) struct ConcurrentImmixSTWGCWorkContext<VM: VMBinding, const KIND: TraceKind>(
-    std::marker::PhantomData<VM>,
+/// Remset tracing fluff
+pub(super) type MarkingProcessEdges<VM> =
+    PlanProcessEdgesRemset<VM, ConcurrentCompressor<VM>, CompressorCondition<VM>, TRACE_KIND_MARK>;
+
+pub type ForwardingProcessEdges<VM> = PlanProcessEdges<VM, ConcurrentCompressor<VM>, TRACE_KIND_FORWARD>;
+
+pub(super) struct CompressorCondition<VM: VMBinding>(PhantomData<VM>);
+
+impl<VM: VMBinding> RemsetCondition<ConcurrentCompressor<VM>, VM> for CompressorCondition<VM> {
+    fn relevant(plan: &ConcurrentCompressor<VM>, source: VM::VMSlot, target: ObjectReference) -> bool {
+        !plan.compressor_space.address_in_space(source.as_address())
+            && plan.compressor_space.in_space(target)
+    }
+}
+
+pub(super) struct ConcurrentCompressorSTWGCWorkContext<VM: VMBinding>(
+    PhantomData<VM>,
 );
-impl<VM: VMBinding, const KIND: TraceKind> crate::scheduler::GCWorkContext
-    for ConcurrentImmixSTWGCWorkContext<VM, KIND>
+impl<VM: VMBinding> crate::scheduler::GCWorkContext
+    for ConcurrentCompressorSTWGCWorkContext<VM>
 {
     type VM = VM;
-    type PlanType = ConcurrentImmix<VM>;
-    type DefaultProcessEdges = PlanProcessEdges<VM, ConcurrentImmix<VM>, KIND>;
-    type PinningProcessEdges = PlanProcessEdges<VM, ConcurrentImmix<VM>, TRACE_KIND_TRANSITIVE_PIN>;
+    type PlanType = ConcurrentCompressor<VM>;
+    type DefaultProcessEdges = MarkingProcessEdges<VM>;
+    type PinningProcessEdges = UnsupportedProcessEdges<VM>;
 }
-pub(super) struct ConcurrentImmixGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
+pub(super) struct ConcurrentCompressorGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
 
-impl<E: ProcessEdgesWork> crate::scheduler::GCWorkContext for ConcurrentImmixGCWorkContext<E> {
+impl<E: ProcessEdgesWork> crate::scheduler::GCWorkContext for ConcurrentCompressorGCWorkContext<E> {
     type VM = E::VM;
-    type PlanType = ConcurrentImmix<E::VM>;
+    type PlanType = ConcurrentCompressor<E::VM>;
     type DefaultProcessEdges = E;
     type PinningProcessEdges = UnsupportedProcessEdges<Self::VM>;
 }

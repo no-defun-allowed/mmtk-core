@@ -1,22 +1,27 @@
-use crate::plan::concurrent::concurrent_marking_work::ProcessRootSlots;
+use crate::plan::concurrent::compressor::concurrent_marking_work::ProcessRootSlots;
 use crate::plan::concurrent::global::ConcurrentPlan;
 use crate::plan::concurrent::Pause;
+use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
 use crate::plan::global::{BasePlan, CommonPlan, CreateGeneralPlanArgs, CreateSpecificPlanArgs};
 use crate::plan::compressor::mutator::ALLOCATOR_MAPPING;
+use crate::plan::compressor::process_edges::PlanRemember;
 use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
+use crate::policy::compressor::TRACE_KIND_MARK;
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::{Release, StopMutators, UnsupportedProcessEdges, VMProcessWeakRefs};
 use crate::scheduler::*;
+use crate::util::ObjectReference;
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::copy::*;
 use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::metadata::side_metadata::SideMetadataContext;
+use crate::util::remset::RemSet;
 use crate::vm::{ObjectModel, VMBinding};
 use crate::{policy::compressor::CompressorSpace, util::opaque_pointer::VMWorkerThread};
 use std::sync::atomic::AtomicBool;
-use super::gc_work::{ConcurrentImmixGCWorkContext, ConcurrentImmixSTWGCWorkContext};
+use super::gc_work::*;
 
 use atomic::Atomic;
 use atomic::Ordering;
@@ -32,7 +37,7 @@ pub struct ConcurrentCompressor<VM: VMBinding> {
     pub common: CommonPlan<VM>,
     #[space]
     pub compressor_space: CompressorSpace<VM>,
-    remset: Remset<VM>,
+    remset: RemSet<VM>,
     current_pause: Atomic<Option<Pause>>,
     previous_pause: Atomic<Option<Pause>>,
     should_do_full_gc: AtomicBool,
@@ -110,11 +115,13 @@ impl<VM: VMBinding> Plan for ConcurrentCompressor<VM> {
                 // Ref closure buckets is disabled by initial mark, and needs to be re-enabled for full GC before
                 // we reuse the normal Immix scheduling.
                 self.set_ref_closure_buckets_enabled(true);
-                crate::plan::immix::global::Immix::schedule_immix_full_heap_collection::<
-                    ConcurrentImmix<VM>,
-                    ConcurrentImmixSTWGCWorkContext<VM, TRACE_KIND_FAST>,
-                    ConcurrentImmixSTWGCWorkContext<VM, TRACE_KIND_DEFRAG>,
-                >(self, &self.immix_space, scheduler);
+                crate::plan::compressor::global::schedule_collection::<
+                    VM,
+                    ConcurrentCompressor<VM>,
+                    ConcurrentCompressorSTWGCWorkContext<VM>,
+                    MarkingProcessEdges<VM>,
+                    ForwardingProcessEdges<VM>
+                >(self, scheduler, &self.compressor_space, &self.remset);
             }
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
@@ -240,30 +247,29 @@ impl<VM: VMBinding> Plan for ConcurrentCompressor<VM> {
 
 impl<VM: VMBinding> ConcurrentCompressor<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
+        let scheduler = args.scheduler.clone();
+
         let spec = crate::util::metadata::extract_side_metadata(&[
             *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC,
         ]);
 
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
-            constraints: &CONCURRENT_IMMIX_CONSTRAINTS,
+            constraints: &CONCURRENT_COMPRESSOR_CONSTRAINTS,
             global_side_metadata_specs: SideMetadataContext::new_global_specs(&spec),
         };
 
         // These buckets are not used in an Immix plan. We can simply disable them.
         // TODO: We should be more systmatic on this, and disable unnecessary buckets for other plans as well.
-        let scheduler = &plan_args.global_args.scheduler;
-        /*
-        scheduler.work_buckets[WorkBucketStage::VMRefForwarding].set_enabled(false);
-        scheduler.work_buckets[WorkBucketStage::CalculateForwarding].set_enabled(false);
+        //scheduler.work_buckets[WorkBucketStage::VMRefForwarding].set_enabled(false);
+        //scheduler.work_buckets[WorkBucketStage::CalculateForwarding].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::SecondRoots].set_enabled(false);
-        scheduler.work_buckets[WorkBucketStage::RefForwarding].set_enabled(false);
-        scheduler.work_buckets[WorkBucketStage::FinalizableForwarding].set_enabled(false);
-        scheduler.work_buckets[WorkBucketStage::Compact].set_enabled(false);
-        */
+        //scheduler.work_buckets[WorkBucketStage::RefForwarding].set_enabled(false);
+        //scheduler.work_buckets[WorkBucketStage::FinalizableForwarding].set_enabled(false);
+        //scheduler.work_buckets[WorkBucketStage::Compact].set_enabled(false);
 
         let res = ConcurrentCompressor {
-            CompressorSpace::new(plan_args.get_normal_space_args(
+            compressor_space: CompressorSpace::new(plan_args.get_normal_space_args(
                 "compressor_space",
                 true,
                 false,
@@ -271,7 +277,6 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
             )),
             common: CommonPlan::new(plan_args),
             remset: RemSet::new(scheduler.num_workers()),
-            last_gc_was_defrag: AtomicBool::new(false),
             current_pause: Atomic::new(None),
             previous_pause: Atomic::new(None),
             should_do_full_gc: AtomicBool::new(false),
@@ -301,10 +306,10 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
         self.set_ref_closure_buckets_enabled(false);
 
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
-            ConcurrentImmixGCWorkContext<ProcessRootSlots<VM, Self, TRACE_KIND_FAST>>,
+            ConcurrentCompressorGCWorkContext<ProcessRootSlots<VM, Self, CompressorCondition<VM>, TRACE_KIND_MARK>>,
         >::new());
         scheduler.work_buckets[WorkBucketStage::Prepare].add(Prepare::<
-            ConcurrentImmixGCWorkContext<UnsupportedProcessEdges<VM>>,
+            ConcurrentCompressorGCWorkContext<UnsupportedProcessEdges<VM>>,
         >::new(self));
     }
 
@@ -313,17 +318,17 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
 
         // Skip root scanning in the final mark
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
-            ConcurrentImmixGCWorkContext<ProcessRootSlots<VM, Self, TRACE_KIND_FAST>>,
+            ConcurrentCompressorGCWorkContext<ProcessRootSlots<VM, Self, CompressorCondition<VM>, TRACE_KIND_MARK>>,
         >::new_no_scan_roots());
 
         scheduler.work_buckets[WorkBucketStage::Release].add(Release::<
-            ConcurrentImmixGCWorkContext<UnsupportedProcessEdges<VM>>,
+            ConcurrentCompressorGCWorkContext<UnsupportedProcessEdges<VM>>,
         >::new(self));
 
         // Deal with weak ref and finalizers
         // TODO: Check against schedule_common_work and see if we are still missing any work packet
         type RefProcessingEdges<VM> =
-            crate::scheduler::gc_work::PlanProcessEdges<VM, ConcurrentImmix<VM>, TRACE_KIND_FAST>;
+            crate::scheduler::gc_work::PlanProcessEdges<VM, ConcurrentCompressor<VM>, TRACE_KIND_MARK>;
         // Reference processing
         if !*self.base().options.no_reference_types {
             use crate::util::reference_processor::{
@@ -349,7 +354,7 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
         }
 
         // VM-specific weak ref processing
-        // Note that ConcurrentImmix does not have a separate forwarding stage,
+        // Note that ConcurrentCompressor does not have a separate forwarding stage,
         // so we don't schedule the `VMForwardWeakRefs` work packet.
         scheduler.work_buckets[WorkBucketStage::VMRefClosure]
             .set_sentinel(Box::new(VMProcessWeakRefs::<RefProcessingEdges<VM>>::new()));
@@ -384,12 +389,18 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
     }
 }
 
-impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
+impl<VM: VMBinding> ConcurrentPlan for ConcurrentCompressor<VM> {
     fn current_pause(&self) -> Option<Pause> {
         self.current_pause.load(Ordering::SeqCst)
     }
 
     fn concurrent_work_in_progress(&self) -> bool {
         self.concurrent_marking_in_progress()
+    }
+}
+
+impl<VM: VMBinding> PlanRemember<VM> for ConcurrentCompressor<VM> {
+    fn record(&self, source: VM::VMSlot, target: ObjectReference, worker: &GCWorker<VM>) {
+        self.remset.record(source, target, worker);
     }
 }

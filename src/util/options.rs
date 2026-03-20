@@ -58,6 +58,8 @@ pub enum PlanSelector {
     StickyImmix,
     /// Concurrent non-moving immix using SATB
     ConcurrentImmix,
+    /// Concurrent marking Compressor using SATB
+    ConcurrentCompressor,
 }
 
 /// MMTk option for perf events
