@@ -1,6 +1,6 @@
 use std::sync::atomic::Ordering;
 
-use super::{concurrent_marking_work::ProcessModBufSATB, Pause};
+use super::Pause;
 use crate::plan::global::PlanTraceObject;
 use crate::policy::gc_work::TraceKind;
 use crate::util::VMMutatorThread;
@@ -77,7 +77,7 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
                     WorkBucketStage::Closure
                 };
                 self.mmtk.scheduler.work_buckets[bucket]
-                    .add(ProcessModBufSATB::<VM, P, KIND>::new(satb));
+                    .add_boxed(self.plan.satb_packet(satb));
             } else {
                 let _ = self.satb.take();
             };
@@ -95,7 +95,7 @@ impl<VM: VMBinding, P: ConcurrentPlan<VM = VM> + PlanTraceObject<VM>, const KIND
                 WorkBucketStage::Closure
             };
             self.mmtk.scheduler.work_buckets[bucket]
-                .add(ProcessModBufSATB::<VM, P, KIND>::new(nodes));
+                .add_boxed(self.plan.satb_packet(nodes));
         }
     }
 

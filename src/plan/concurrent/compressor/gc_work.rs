@@ -1,6 +1,6 @@
 use crate::plan::concurrent::compressor::global::ConcurrentCompressor;
 use crate::plan::compressor::process_edges::{PlanProcessEdgesRemset, RemsetCondition};
-use crate::policy::compressor::{CompressorSpace, TRACE_KIND_FORWARD, TRACE_KIND_MARK};
+use crate::policy::compressor::{TRACE_KIND_FORWARD, TRACE_KIND_MARK};
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::{PlanProcessEdges, UnsupportedProcessEdges};
 use crate::scheduler::ProcessEdgesWork;

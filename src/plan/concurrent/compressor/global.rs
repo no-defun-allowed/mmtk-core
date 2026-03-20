@@ -12,7 +12,6 @@ use crate::scheduler::gc_work::{Release, StopMutators, UnsupportedProcessEdges, 
 use crate::scheduler::*;
 use crate::util::ObjectReference;
 use crate::util::alloc::allocators::AllocatorSelector;
-use crate::util::copy::*;
 use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::log_bit::UnlogBitsOperation;
@@ -396,6 +395,11 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentCompressor<VM> {
 
     fn concurrent_work_in_progress(&self) -> bool {
         self.concurrent_marking_in_progress()
+    }
+
+    fn satb_packet(&self, satb: Vec<ObjectReference>) -> Box<dyn GCWork<VM>> {
+        use super::concurrent_marking_work::ProcessModBufSATB;
+        Box::new(ProcessModBufSATB::<VM, Self, CompressorCondition<VM>, TRACE_KIND_MARK>::new(satb))
     }
 }
 
