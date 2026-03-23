@@ -1,19 +1,20 @@
-use crate::MMTK;
 use crate::plan::concurrent::compressor::global::ConcurrentCompressor;
 use crate::policy::compressor::{CompressorSpace, TRACE_KIND_FORWARD, TRACE_KIND_MARK};
 use crate::policy::largeobjectspace::LargeObjectSpace;
 use crate::scheduler::gc_work::*;
-use crate::scheduler::{GCWork, GCWorker, WorkBucketStage};
 use crate::scheduler::ProcessEdgesWork;
-use crate::util::ObjectReference;
+use crate::scheduler::{GCWork, GCWorker, WorkBucketStage};
 use crate::util::object_enum::ClosureObjectEnumerator;
-use crate::vm:: {ActivePlan, Scanning, VMBinding};
+use crate::util::ObjectReference;
+use crate::vm::{ActivePlan, Scanning, VMBinding};
+use crate::MMTK;
 use std::marker::PhantomData;
 
 pub(super) type MarkingProcessEdges<VM> =
     PlanProcessEdges<VM, ConcurrentCompressor<VM>, TRACE_KIND_MARK>;
 
-pub(super) type ForwardingProcessEdges<VM> = PlanProcessEdges<VM, ConcurrentCompressor<VM>, TRACE_KIND_FORWARD>;
+pub(super) type ForwardingProcessEdges<VM> =
+    PlanProcessEdges<VM, ConcurrentCompressor<VM>, TRACE_KIND_FORWARD>;
 
 /// Create another round of root scanning work packets
 /// to update root references.
@@ -53,37 +54,33 @@ pub(super) struct UpdateLOS<VM: VMBinding> {
 }
 
 impl<VM: VMBinding> UpdateLOS<VM> {
-    pub fn new(
-        space: &'static CompressorSpace<VM>,
-        los: &'static LargeObjectSpace<VM>,
-    ) -> Self {
+    pub fn new(space: &'static CompressorSpace<VM>, los: &'static LargeObjectSpace<VM>) -> Self {
         Self { space, los }
     }
 }
 
 impl<VM: VMBinding> GCWork<VM> for UpdateLOS<VM> {
     fn do_work(&mut self, worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.los.enumerate_to_space_objects(&mut ClosureObjectEnumerator::<_, VM>::new(
-            &mut |o: ObjectReference| {
-                self.space.update_references::<false>(worker, o);
-            }
-        ));
+        self.los
+            .enumerate_to_space_objects(&mut ClosureObjectEnumerator::<_, VM>::new(
+                &mut |o: ObjectReference| {
+                    self.space.update_references::<false>(worker, o);
+                },
+            ));
     }
 }
 
-/// The STW+remset trace.
-pub(super) struct ConcurrentCompressorSTWGCWorkContext<VM: VMBinding>(
-    PhantomData<VM>,
-);
-impl<VM: VMBinding> crate::scheduler::GCWorkContext
-    for ConcurrentCompressorSTWGCWorkContext<VM>
-{
+/// The STW trace.
+pub(super) struct ConcurrentCompressorSTWGCWorkContext<VM: VMBinding>(PhantomData<VM>);
+impl<VM: VMBinding> crate::scheduler::GCWorkContext for ConcurrentCompressorSTWGCWorkContext<VM> {
     type VM = VM;
     type PlanType = ConcurrentCompressor<VM>;
     type DefaultProcessEdges = MarkingProcessEdges<VM>;
     type PinningProcessEdges = UnsupportedProcessEdges<VM>;
 }
-pub(super) struct ConcurrentCompressorGCWorkContext<E: ProcessEdgesWork>(std::marker::PhantomData<E>);
+pub(super) struct ConcurrentCompressorGCWorkContext<E: ProcessEdgesWork>(
+    std::marker::PhantomData<E>,
+);
 
 /// The root fixing "trace".
 pub struct CompressorForwardingWorkContext<VM: VMBinding>(std::marker::PhantomData<VM>);

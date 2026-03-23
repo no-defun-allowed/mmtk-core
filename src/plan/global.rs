@@ -67,7 +67,9 @@ pub fn create_mutator<VM: VMBinding>(
             crate::plan::compressor::mutator::create_compressor_mutator(tls, mmtk)
         }
         PlanSelector::ConcurrentCompressor => {
-            crate::plan::concurrent::compressor::mutator::create_concurrent_compressor_mutator(tls, mmtk)
+            crate::plan::concurrent::compressor::mutator::create_concurrent_compressor_mutator(
+                tls, mmtk,
+            )
         }
         PlanSelector::OnePass => crate::plan::one_pass::mutator::create_onepass_mutator(tls, mmtk),
         PlanSelector::OldPass => crate::plan::old_pass::mutator::create_oldpass_mutator(tls, mmtk),

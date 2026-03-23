@@ -17,8 +17,11 @@ use crate::vm::VMBinding;
 use crate::MMTK;
 use enum_map::{enum_map, EnumMap};
 
-type BarrierSemanticsType<VM> =
-    SATBBarrierSemantics<VM, ConcurrentCompressor<VM>, { crate::policy::compressor::TRACE_KIND_MARK }>;
+type BarrierSemanticsType<VM> = SATBBarrierSemantics<
+    VM,
+    ConcurrentCompressor<VM>,
+    { crate::policy::compressor::TRACE_KIND_MARK },
+>;
 
 type BarrierType<VM> = SATBBarrier<BarrierSemanticsType<VM>>;
 
@@ -115,7 +118,10 @@ pub fn create_concurrent_compressor_mutator<VM: VMBinding>(
                 !cfg!(feature = "compressor_single_space"),
                 compressor,
             );
-            vec.push((AllocatorSelector::BumpPointer(0), &compressor.compressor_space));
+            vec.push((
+                AllocatorSelector::BumpPointer(0),
+                &compressor.compressor_space,
+            ));
             vec
         }),
 

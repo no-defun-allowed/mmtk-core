@@ -134,9 +134,7 @@ impl<VM: VMBinding> PlanRemember<VM> for Compressor<VM> {
     }
 }
 
-pub(crate) fn schedule_compaction<
-    VM: VMBinding
->(
+pub(crate) fn schedule_compaction<VM: VMBinding>(
     scheduler: &GCWorkScheduler<VM>,
     compressor_space: &'static CompressorSpace<VM>,
     remset: Option<&'static RemSet<VM>>,

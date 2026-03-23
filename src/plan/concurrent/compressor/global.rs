@@ -1,13 +1,16 @@
+use super::gc_work::*;
+use crate::plan::compressor::mutator::ALLOCATOR_MAPPING;
 use crate::plan::concurrent::concurrent_marking_work::ProcessRootSlots;
 use crate::plan::concurrent::global::ConcurrentPlan;
 use crate::plan::concurrent::Pause;
-use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
 use crate::plan::global::{BasePlan, CommonPlan, CreateGeneralPlanArgs, CreateSpecificPlanArgs};
-use crate::plan::compressor::mutator::ALLOCATOR_MAPPING;
+use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
 use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
 use crate::policy::compressor::TRACE_KIND_MARK;
 use crate::policy::space::Space;
-use crate::scheduler::gc_work::{Release, StopMutators, UnsupportedProcessEdges, VMProcessWeakRefs};
+use crate::scheduler::gc_work::{
+    Release, StopMutators, UnsupportedProcessEdges, VMForwardWeakRefs, VMProcessWeakRefs,
+};
 use crate::scheduler::*;
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::heap::gc_trigger::SpaceStats;
@@ -17,7 +20,6 @@ use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::vm::{ObjectModel, VMBinding};
 use crate::{policy::compressor::CompressorSpace, util::opaque_pointer::VMWorkerThread};
 use std::sync::atomic::AtomicBool;
-use super::gc_work::*;
 
 use atomic::Atomic;
 use atomic::Ordering;
@@ -115,8 +117,8 @@ impl<VM: VMBinding> Plan for ConcurrentCompressor<VM> {
                     ConcurrentCompressor<VM>,
                     ConcurrentCompressorSTWGCWorkContext<VM>,
                     MarkingProcessEdges<VM>,
-                    ForwardingProcessEdges<VM>
-                        >(self, scheduler, &self.compressor_space, None);
+                    ForwardingProcessEdges<VM>,
+                >(self, scheduler, &self.compressor_space, None);
                 self.schedule_updating_roots(scheduler);
             }
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
@@ -137,7 +139,7 @@ impl<VM: VMBinding> Plan for ConcurrentCompressor<VM> {
             }
             Pause::InitialMark => {
                 self.compressor_space.prepare();
-                unimplemented!("bulk set log bits");
+                todo!("bulk set log bits");
                 self.common.prepare(tls, true);
                 // Bulk set log bits so SATB barrier will be triggered on the existing objects.
                 self.common
@@ -153,7 +155,7 @@ impl<VM: VMBinding> Plan for ConcurrentCompressor<VM> {
             Pause::InitialMark => (),
             Pause::Full | Pause::FinalMark => {
                 self.compressor_space.release();
-                unimplemented!("bulk clear log bits");
+                todo!("bulk clear log bits");
 
                 self.common.release(tls, true);
 
@@ -314,12 +316,12 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
         // Skip root scanning in the final mark
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
             ConcurrentCompressorGCWorkContext<ProcessRootSlots<VM, Self, TRACE_KIND_MARK>>,
-            >::new_no_scan_roots());
+        >::new_no_scan_roots());
 
         crate::plan::compressor::global::schedule_compaction(
             scheduler,
             &self.compressor_space,
-            None
+            None,
         );
         self.schedule_updating_roots(scheduler);
 
@@ -329,8 +331,11 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
 
         // Deal with weak ref and finalizers
         // TODO: Check against schedule_common_work and see if we are still missing any work packet
-        type RefProcessingEdges<VM> =
-            crate::scheduler::gc_work::PlanProcessEdges<VM, ConcurrentCompressor<VM>, TRACE_KIND_MARK>;
+        type RefProcessingEdges<VM> = crate::scheduler::gc_work::PlanProcessEdges<
+            VM,
+            ConcurrentCompressor<VM>,
+            TRACE_KIND_MARK,
+        >;
         // Reference processing
         if !*self.base().options.no_reference_types {
             use crate::util::reference_processor::{
@@ -343,29 +348,36 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
             scheduler.work_buckets[WorkBucketStage::PhantomRefClosure]
                 .add(PhantomRefProcessing::<VM>::new());
 
+            use crate::util::reference_processor::RefForwarding;
+            scheduler.work_buckets[WorkBucketStage::RefForwarding]
+                .add(RefForwarding::<ForwardingProcessEdges<VM>>::new());
+
             use crate::util::reference_processor::RefEnqueue;
             scheduler.work_buckets[WorkBucketStage::Release].add(RefEnqueue::<VM>::new());
         }
 
         // Finalization
         if !*self.base().options.no_finalizer {
-            use crate::util::finalizable_processor::Finalization;
+            use crate::util::finalizable_processor::{Finalization, ForwardFinalization};
             // finalization
             scheduler.work_buckets[WorkBucketStage::FinalRefClosure]
                 .add(Finalization::<RefProcessingEdges<VM>>::new());
+            scheduler.work_buckets[WorkBucketStage::FinalizableForwarding]
+                .add(ForwardFinalization::<ForwardingProcessEdges<VM>>::new());
         }
 
-        // VM-specific weak ref processing
-        // Note that ConcurrentCompressor does not have a separate forwarding stage,
-        // so we don't schedule the `VMForwardWeakRefs` work packet.
         scheduler.work_buckets[WorkBucketStage::VMRefClosure]
             .set_sentinel(Box::new(VMProcessWeakRefs::<RefProcessingEdges<VM>>::new()));
+        scheduler.work_buckets[WorkBucketStage::VMRefForwarding]
+            .add(VMForwardWeakRefs::<ForwardingProcessEdges<VM>>::new());
     }
 
     fn schedule_updating_roots(&'static self, scheduler: &GCWorkScheduler<VM>) {
         scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateRoots::<VM>::new());
-        scheduler.work_buckets[WorkBucketStage::Compact].add(
-            UpdateLOS::<VM>::new(&self.compressor_space, &self.common.los));
+        scheduler.work_buckets[WorkBucketStage::Compact].add(UpdateLOS::<VM>::new(
+            &self.compressor_space,
+            &self.common.los,
+        ));
     }
 
     pub fn concurrent_marking_in_progress(&self) -> bool {
