@@ -27,7 +27,6 @@ use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::metadata::side_metadata::SideMetadataContext;
-use crate::util::ObjectReference;
 use crate::vm::ObjectModel;
 use crate::vm::VMBinding;
 use crate::{policy::immix::ImmixSpace, util::opaque_pointer::VMWorkerThread};
@@ -446,10 +445,5 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentImmix<VM> {
 
     fn concurrent_work_in_progress(&self) -> bool {
         self.concurrent_marking_in_progress()
-    }
-
-    fn satb_packet(&self, satb: Vec<ObjectReference>) -> Box<dyn GCWork<VM>> {
-        use crate::plan::concurrent::concurrent_marking_work::ProcessModBufSATB;
-        Box::new(ProcessModBufSATB::<VM, Self, TRACE_KIND_FAST>::new(satb))
     }
 }
