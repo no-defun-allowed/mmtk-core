@@ -139,15 +139,17 @@ pub(crate) fn schedule_compaction<
 >(
     scheduler: &GCWorkScheduler<VM>,
     compressor_space: &'static CompressorSpace<VM>,
-    remset: &'static RemSet<VM>,
+    remset: Option<&'static RemSet<VM>>,
 ) {
     scheduler.work_buckets[WorkBucketStage::CalculateForwarding].add(GenerateWork::new(|| {
         compressor_space.add_offset_vector_tasks()
     }));
 
-    scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
-        compressor_space.add_remset_tasks(remset, WorkBucketStage::SecondRoots)
-    }));
+    if let Some(remset) = remset {
+        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(GenerateWork::new(|| {
+            compressor_space.add_remset_tasks(remset, WorkBucketStage::SecondRoots)
+        }));
+    };
 
     scheduler.work_buckets[WorkBucketStage::Compact]
         .add(GenerateWork::new(|| compressor_space.add_compact_tasks()));
@@ -178,7 +180,7 @@ pub(crate) fn schedule_collection<
     // Prepare global/collectors/mutators
     scheduler.work_buckets[WorkBucketStage::Prepare].add(Prepare::<Context>::new(plan));
 
-    schedule_compaction(scheduler, compressor_space, remset);
+    schedule_compaction(scheduler, compressor_space, Some(remset));
 
     // Release global/collectors/mutators
     scheduler.work_buckets[WorkBucketStage::Release].add(Release::<Context>::new(plan));

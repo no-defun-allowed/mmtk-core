@@ -1,4 +1,4 @@
-use crate::plan::concurrent::compressor::concurrent_marking_work::ProcessRootSlots;
+use crate::plan::concurrent::concurrent_marking_work::ProcessRootSlots;
 use crate::plan::concurrent::global::ConcurrentPlan;
 use crate::plan::concurrent::Pause;
 use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
@@ -12,7 +12,6 @@ use crate::scheduler::gc_work::{Release, StopMutators, UnsupportedProcessEdges, 
 use crate::scheduler::*;
 use crate::util::ObjectReference;
 use crate::util::alloc::allocators::AllocatorSelector;
-use crate::util::copy::*;
 use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::log_bit::UnlogBitsOperation;
@@ -306,7 +305,7 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
         self.set_ref_closure_buckets_enabled(false);
 
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
-            ConcurrentCompressorGCWorkContext<ProcessRootSlots<VM, Self, CompressorCondition<VM>, TRACE_KIND_MARK>>,
+            ConcurrentCompressorGCWorkContext<ProcessRootSlots<VM, Self, TRACE_KIND_MARK>>,
         >::new());
         scheduler.work_buckets[WorkBucketStage::Prepare].add(Prepare::<
             ConcurrentCompressorGCWorkContext<UnsupportedProcessEdges<VM>>,
@@ -318,8 +317,17 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
 
         // Skip root scanning in the final mark
         scheduler.work_buckets[WorkBucketStage::Unconstrained].add(StopMutators::<
-            ConcurrentCompressorGCWorkContext<ProcessRootSlots<VM, Self, CompressorCondition<VM>, TRACE_KIND_MARK>>,
-        >::new_no_scan_roots());
+            ConcurrentCompressorGCWorkContext<ProcessRootSlots<VM, Self, TRACE_KIND_MARK>>,
+            >::new_no_scan_roots());
+
+        crate::plan::compressor::global::schedule_compaction(
+            scheduler,
+            &self.compressor_space,
+            None
+        );
+        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateRoots::<VM>::new());
+        scheduler.work_buckets[WorkBucketStage::Compact].add(
+            UpdateLOS::<VM>::new(&self.compressor_space, &self.common.los));
 
         scheduler.work_buckets[WorkBucketStage::Release].add(Release::<
             ConcurrentCompressorGCWorkContext<UnsupportedProcessEdges<VM>>,

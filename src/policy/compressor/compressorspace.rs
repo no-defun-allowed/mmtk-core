@@ -357,7 +357,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         ObjectReference::from_raw_address(to).unwrap()
     }
 
-    fn update_references<const CAN_CLMUL: bool>(
+    pub fn update_references<const CAN_CLMUL: bool>(
         &self,
         worker: &mut GCWorker<VM>,
         object: ObjectReference,
