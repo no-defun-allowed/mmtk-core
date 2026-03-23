@@ -12,6 +12,7 @@ use crate::util::metadata::extract_side_metadata;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
+use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::object_enum::ObjectEnumerator;
 use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
@@ -241,16 +242,22 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         }
     }
 
-    pub fn prepare(&self) {
+    pub fn prepare(&self, log_bits_op: UnlogBitsOperation) {
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 forwarding::MARK_SPEC
-                    .bzero_metadata(r.region.start(), r.region.end() - r.region.start());
+                    .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
+                log_bits_op.execute::<VM>(r.region.start(), forwarding::CompressorRegion::BYTES);
             });
     }
 
-    pub fn release(&self) {
+    pub fn release(&self, log_bits_op: UnlogBitsOperation) {
         self.forwarding.release();
+        self.pr
+            .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
+                log_bits_op.execute::<VM>(r.region.start(), forwarding::CompressorRegion::BYTES);
+            });
+
     }
 
     pub fn trace_mark_object<Q: ObjectQueue>(

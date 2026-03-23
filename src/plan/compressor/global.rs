@@ -16,6 +16,7 @@ use crate::util::heap::gc_trigger::SpaceStats;
 #[allow(unused_imports)]
 use crate::util::heap::VMRequest;
 use crate::util::metadata::side_metadata::SideMetadataContext;
+use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::opaque_pointer::*;
 use crate::util::remset::RemSet;
 use crate::util::ObjectReference;
@@ -66,12 +67,12 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
 
     fn prepare(&mut self, tls: VMWorkerThread) {
         self.common.prepare(tls, true);
-        self.compressor_space.prepare();
+        self.compressor_space.prepare(UnlogBitsOperation::NoOp);
     }
 
     fn release(&mut self, tls: VMWorkerThread) {
         self.common.release(tls, true);
-        self.compressor_space.release();
+        self.compressor_space.release(UnlogBitsOperation::NoOp);
     }
 
     fn end_of_gc(&mut self, tls: VMWorkerThread) {

@@ -135,11 +135,10 @@ impl<VM: VMBinding> Plan for ConcurrentCompressor<VM> {
         match pause {
             Pause::Full => {
                 self.common.prepare(tls, true);
-                self.compressor_space.prepare();
+                self.compressor_space.prepare(UnlogBitsOperation::NoOp);
             }
             Pause::InitialMark => {
-                self.compressor_space.prepare();
-                todo!("bulk set log bits");
+                self.compressor_space.prepare(UnlogBitsOperation::BulkSet);
                 self.common.prepare(tls, true);
                 // Bulk set log bits so SATB barrier will be triggered on the existing objects.
                 self.common
@@ -154,8 +153,7 @@ impl<VM: VMBinding> Plan for ConcurrentCompressor<VM> {
         match pause {
             Pause::InitialMark => (),
             Pause::Full | Pause::FinalMark => {
-                self.compressor_space.release();
-                todo!("bulk clear log bits");
+                self.compressor_space.release(UnlogBitsOperation::BulkClear);
 
                 self.common.release(tls, true);
 
@@ -245,8 +243,6 @@ impl<VM: VMBinding> Plan for ConcurrentCompressor<VM> {
 
 impl<VM: VMBinding> ConcurrentCompressor<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
-        let scheduler = args.scheduler.clone();
-
         let spec = crate::util::metadata::extract_side_metadata(&[
             *VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC,
         ]);
@@ -256,15 +252,6 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
             constraints: &CONCURRENT_COMPRESSOR_CONSTRAINTS,
             global_side_metadata_specs: SideMetadataContext::new_global_specs(&spec),
         };
-
-        // These buckets are not used in an Immix plan. We can simply disable them.
-        // TODO: We should be more systmatic on this, and disable unnecessary buckets for other plans as well.
-        //scheduler.work_buckets[WorkBucketStage::VMRefForwarding].set_enabled(false);
-        //scheduler.work_buckets[WorkBucketStage::CalculateForwarding].set_enabled(false);
-        scheduler.work_buckets[WorkBucketStage::SecondRoots].set_enabled(false);
-        //scheduler.work_buckets[WorkBucketStage::RefForwarding].set_enabled(false);
-        //scheduler.work_buckets[WorkBucketStage::FinalizableForwarding].set_enabled(false);
-        //scheduler.work_buckets[WorkBucketStage::Compact].set_enabled(false);
 
         let res = ConcurrentCompressor {
             compressor_space: CompressorSpace::new(plan_args.get_normal_space_args(

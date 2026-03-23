@@ -64,6 +64,7 @@ impl<VM: VMBinding> GCWork<VM> for UpdateLOS<VM> {
         self.los
             .enumerate_to_space_objects(&mut ClosureObjectEnumerator::<_, VM>::new(
                 &mut |o: ObjectReference| {
+                    // XXX: ehm, I should detect clmul'ing on this packet, actually
                     self.space.update_references::<false>(worker, o);
                 },
             ));
