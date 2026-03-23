@@ -1,32 +1,19 @@
 use crate::MMTK;
 use crate::plan::concurrent::compressor::global::ConcurrentCompressor;
-use crate::plan::compressor::process_edges::{PlanProcessEdgesRemset, RemsetCondition};
 use crate::policy::compressor::{CompressorSpace, TRACE_KIND_FORWARD, TRACE_KIND_MARK};
 use crate::policy::largeobjectspace::LargeObjectSpace;
-use crate::policy::space::Space;
 use crate::scheduler::gc_work::*;
 use crate::scheduler::{GCWork, GCWorker, WorkBucketStage};
 use crate::scheduler::ProcessEdgesWork;
 use crate::util::ObjectReference;
 use crate::util::object_enum::ClosureObjectEnumerator;
 use crate::vm:: {ActivePlan, Scanning, VMBinding};
-use crate::vm::slot::Slot;
 use std::marker::PhantomData;
 
-/// Remset tracing fluff
 pub(super) type MarkingProcessEdges<VM> =
-    PlanProcessEdgesRemset<VM, ConcurrentCompressor<VM>, CompressorCondition<VM>, TRACE_KIND_MARK>;
+    PlanProcessEdges<VM, ConcurrentCompressor<VM>, TRACE_KIND_MARK>;
 
-pub type ForwardingProcessEdges<VM> = PlanProcessEdges<VM, ConcurrentCompressor<VM>, TRACE_KIND_FORWARD>;
-
-pub(super) struct CompressorCondition<VM: VMBinding>(PhantomData<VM>);
-
-impl<VM: VMBinding> RemsetCondition<ConcurrentCompressor<VM>, VM> for CompressorCondition<VM> {
-    fn relevant(plan: &ConcurrentCompressor<VM>, source: VM::VMSlot, target: ObjectReference) -> bool {
-        !plan.compressor_space.address_in_space(source.as_address())
-            && plan.compressor_space.in_space(target)
-    }
-}
+pub(super) type ForwardingProcessEdges<VM> = PlanProcessEdges<VM, ConcurrentCompressor<VM>, TRACE_KIND_FORWARD>;
 
 /// Create another round of root scanning work packets
 /// to update root references.

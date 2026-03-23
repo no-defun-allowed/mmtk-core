@@ -89,7 +89,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
             CompressorWorkContext<VM>,
             MarkingProcessEdges<VM>,
             ForwardingProcessEdges<VM>,
-        >(self, scheduler, &self.compressor_space, &self.remset);
+        >(self, scheduler, &self.compressor_space, Some(&self.remset));
     }
 
     fn current_gc_may_move_object(&self) -> bool {
@@ -168,7 +168,7 @@ pub(crate) fn schedule_collection<
     plan: &'static PlanType,
     scheduler: &GCWorkScheduler<VM>,
     compressor_space: &'static CompressorSpace<VM>,
-    remset: &'static RemSet<VM>,
+    remset: Option<&'static RemSet<VM>>,
 ) {
     // TODO use schedule_common once it can work with the Compressor
     // The main issue there is that we need to ForwardingProcessEdges
@@ -180,7 +180,7 @@ pub(crate) fn schedule_collection<
     // Prepare global/collectors/mutators
     scheduler.work_buckets[WorkBucketStage::Prepare].add(Prepare::<Context>::new(plan));
 
-    schedule_compaction(scheduler, compressor_space, Some(remset));
+    schedule_compaction(scheduler, compressor_space, remset);
 
     // Release global/collectors/mutators
     scheduler.work_buckets[WorkBucketStage::Release].add(Release::<Context>::new(plan));

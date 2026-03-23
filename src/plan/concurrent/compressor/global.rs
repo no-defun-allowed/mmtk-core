@@ -4,19 +4,16 @@ use crate::plan::concurrent::Pause;
 use crate::plan::plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
 use crate::plan::global::{BasePlan, CommonPlan, CreateGeneralPlanArgs, CreateSpecificPlanArgs};
 use crate::plan::compressor::mutator::ALLOCATOR_MAPPING;
-use crate::plan::compressor::process_edges::PlanRemember;
 use crate::plan::{AllocationSemantics, Plan, PlanConstraints};
 use crate::policy::compressor::TRACE_KIND_MARK;
 use crate::policy::space::Space;
 use crate::scheduler::gc_work::{Release, StopMutators, UnsupportedProcessEdges, VMProcessWeakRefs};
 use crate::scheduler::*;
-use crate::util::ObjectReference;
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::heap::gc_trigger::SpaceStats;
 use crate::util::heap::VMRequest;
 use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::metadata::side_metadata::SideMetadataContext;
-use crate::util::remset::RemSet;
 use crate::vm::{ObjectModel, VMBinding};
 use crate::{policy::compressor::CompressorSpace, util::opaque_pointer::VMWorkerThread};
 use std::sync::atomic::AtomicBool;
@@ -36,7 +33,6 @@ pub struct ConcurrentCompressor<VM: VMBinding> {
     pub common: CommonPlan<VM>,
     #[space]
     pub compressor_space: CompressorSpace<VM>,
-    remset: RemSet<VM>,
     current_pause: Atomic<Option<Pause>>,
     previous_pause: Atomic<Option<Pause>>,
     should_do_full_gc: AtomicBool,
@@ -120,7 +116,8 @@ impl<VM: VMBinding> Plan for ConcurrentCompressor<VM> {
                     ConcurrentCompressorSTWGCWorkContext<VM>,
                     MarkingProcessEdges<VM>,
                     ForwardingProcessEdges<VM>
-                >(self, scheduler, &self.compressor_space, &self.remset);
+                        >(self, scheduler, &self.compressor_space, None);
+                self.schedule_updating_roots(scheduler);
             }
             Pause::InitialMark => self.schedule_concurrent_marking_initial_pause(scheduler),
             Pause::FinalMark => self.schedule_concurrent_marking_final_pause(scheduler),
@@ -275,7 +272,6 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
                 VMRequest::discontiguous(),
             )),
             common: CommonPlan::new(plan_args),
-            remset: RemSet::new(scheduler.num_workers()),
             current_pause: Atomic::new(None),
             previous_pause: Atomic::new(None),
             should_do_full_gc: AtomicBool::new(false),
@@ -325,9 +321,7 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
             &self.compressor_space,
             None
         );
-        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateRoots::<VM>::new());
-        scheduler.work_buckets[WorkBucketStage::Compact].add(
-            UpdateLOS::<VM>::new(&self.compressor_space, &self.common.los));
+        self.schedule_updating_roots(scheduler);
 
         scheduler.work_buckets[WorkBucketStage::Release].add(Release::<
             ConcurrentCompressorGCWorkContext<UnsupportedProcessEdges<VM>>,
@@ -368,6 +362,12 @@ impl<VM: VMBinding> ConcurrentCompressor<VM> {
             .set_sentinel(Box::new(VMProcessWeakRefs::<RefProcessingEdges<VM>>::new()));
     }
 
+    fn schedule_updating_roots(&'static self, scheduler: &GCWorkScheduler<VM>) {
+        scheduler.work_buckets[WorkBucketStage::SecondRoots].add(UpdateRoots::<VM>::new());
+        scheduler.work_buckets[WorkBucketStage::Compact].add(
+            UpdateLOS::<VM>::new(&self.compressor_space, &self.common.los));
+    }
+
     pub fn concurrent_marking_in_progress(&self) -> bool {
         self.concurrent_marking_active.load(Ordering::Acquire)
     }
@@ -404,11 +404,5 @@ impl<VM: VMBinding> ConcurrentPlan for ConcurrentCompressor<VM> {
 
     fn concurrent_work_in_progress(&self) -> bool {
         self.concurrent_marking_in_progress()
-    }
-}
-
-impl<VM: VMBinding> PlanRemember<VM> for ConcurrentCompressor<VM> {
-    fn record(&self, source: VM::VMSlot, target: ObjectReference, worker: &GCWorker<VM>) {
-        self.remset.record(source, target, worker);
     }
 }
