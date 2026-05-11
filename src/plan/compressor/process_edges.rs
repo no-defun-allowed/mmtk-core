@@ -55,8 +55,8 @@ impl<
         }
     }
 
-    fn create_scan_work(&self, nodes: Vec<ObjectReference>) -> Self::ScanObjectsWorkType {
-        PlanScanObjects::<Self, P>::new(self.plan, nodes, false, self.bucket)
+    fn create_scan_work(&self, nodes: Vec<ObjectReference>) -> Option<Self::ScanObjectsWorkType> {
+        Some(PlanScanObjects::<Self, P>::new(self.plan, nodes, false, self.bucket))
     }
 
     fn trace_object(&mut self, object: ObjectReference) -> ObjectReference {

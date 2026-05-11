@@ -66,11 +66,11 @@ pub fn create_mutator<VM: VMBinding>(
         PlanSelector::Compressor => {
             crate::plan::compressor::mutator::create_compressor_mutator(tls, mmtk)
         }
-        PlanSelector::ConcurrentCompressor => {
-            crate::plan::concurrent::compressor::mutator::create_concurrent_compressor_mutator(
-                tls, mmtk,
-            )
-        }
+        // PlanSelector::ConcurrentCompressor => {
+        //     crate::plan::concurrent::compressor::mutator::create_concurrent_compressor_mutator(
+        //         tls, mmtk,
+        //     )
+        // }
         PlanSelector::OnePass => crate::plan::one_pass::mutator::create_onepass_mutator(tls, mmtk),
         PlanSelector::OldPass => crate::plan::old_pass::mutator::create_oldpass_mutator(tls, mmtk),
     })
@@ -110,10 +110,10 @@ pub fn create_plan<VM: VMBinding>(
             Box::new(crate::plan::concurrent::immix::ConcurrentImmix::new(args))
                 as Box<dyn Plan<VM = VM>>
         }
-        PlanSelector::ConcurrentCompressor => {
-            Box::new(crate::plan::concurrent::compressor::ConcurrentCompressor::new(args))
-                as Box<dyn Plan<VM = VM>>
-        }
+        // PlanSelector::ConcurrentCompressor => {
+        //     Box::new(crate::plan::concurrent::compressor::ConcurrentCompressor::new(args))
+        //         as Box<dyn Plan<VM = VM>>
+        // }
         PlanSelector::Compressor => {
             Box::new(crate::plan::compressor::Compressor::new(args)) as Box<dyn Plan<VM = VM>>
         }
