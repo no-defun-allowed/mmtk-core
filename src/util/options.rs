@@ -48,10 +48,18 @@ pub enum PlanSelector {
     MarkCompact,
     /// A mark-compact collector that uses Compressor-style bitmaps.
     Compressor,
+    /// A mark-compact collector that does compaction in one heap traversal,
+    /// blending Compressor-style bitmaps and threading compaction.
+    OnePass,
+    /// A mark-compact collector that does compaction in one heap traversal,
+    /// blending Compressor-style bitmaps and threading compaction (but less parallel).
+    OldPass,
     /// An Immix collector that uses a sticky mark bit to allow generational behaviors without a copying nursery.
     StickyImmix,
     /// Concurrent non-moving immix using SATB
     ConcurrentImmix,
+    /// Concurrent marking Compressor using SATB
+    ConcurrentCompressor,
 }
 
 /// MMTk option for perf events
@@ -979,7 +987,12 @@ options! {
     /// headroom between 1% to 3% of the heap size.
     immix_defrag_headroom_percent: usize            [|v: &usize| *v <= 50] = 2,
     /// Disable concurrent marking in ConcurrentImmix. Setting this to true will make ConcurrentImmix behave exactly like full heap Immix. This option is only intended for debugging.
-    concurrent_immix_disable_concurrent_marking: bool              [always_valid] = false
+    concurrent_immix_disable_concurrent_marking: bool              [always_valid] = false,
+    /// The maximum density of a region which the Compressor will compact.
+    compressor_compact_max_percent: u8              [|v: &u8| *v <= 100] = 90,
+    /// Enable the use of an algorithm based on carryless multiplication to
+    /// compute the offset vector in the Compressor.
+    compressor_use_clmul: bool                      [always_valid] = true
 }
 
 #[cfg(test)]

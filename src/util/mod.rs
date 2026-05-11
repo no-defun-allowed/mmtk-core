@@ -60,6 +60,8 @@ pub(crate) mod object_enum;
 pub(crate) mod object_forwarding;
 /// Reference processing implementation.
 pub(crate) mod reference_processor;
+/// Remembered set implementation.
+pub(crate) mod remset;
 /// Utilities funcitons for Rust
 pub(crate) mod rust_util;
 /// Sanity checker for GC.
