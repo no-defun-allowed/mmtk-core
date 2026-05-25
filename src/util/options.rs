@@ -992,7 +992,7 @@ options! {
     compressor_compact_max_percent: u8              [|v: &u8| *v <= 100] = 90,
     /// Enable the use of an algorithm based on carryless multiplication to
     /// compute the offset vector in the Compressor.
-    compressor_use_clmul: bool                      [always_valid] = true
+    compressor_use_clmul: bool                      [always_valid] = false
 }
 
 #[cfg(test)]
