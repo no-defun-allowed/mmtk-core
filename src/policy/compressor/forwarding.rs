@@ -9,8 +9,20 @@ use crate::util::{Address, ObjectReference};
 use crate::vm::object_model::ObjectModel;
 use crate::vm::VMBinding;
 use atomic::Ordering;
+#[cfg(feature = "object_pinning")]
+use rand::SeedableRng;
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicBool;
+#[cfg(feature = "object_pinning")]
+use std::sync::Mutex;
+
+pub(super) static COMPUTING_FORWARDING_INFO: AtomicBool = AtomicBool::new(false);
+
+lazy_static! {
+    pub(super) static ref FORWARDING_MAP: Mutex<HashMap<Address, Address>> =
+        Mutex::new(HashMap::new());
+}
 
 /// A [`CompressorRegion`] is the granularity at which [`super::CompressorSpace`]
 /// compacts the heap. Objects are allocated inside one region, and are only ever
@@ -46,6 +58,28 @@ impl Region for CompressorRegion {
 pub(crate) type Offset = u32;
 pub(crate) const LOG_BITS_IN_OFFSET: usize = Offset::BITS.ilog2() as usize;
 
+#[cfg(feature = "object_pinning")]
+pub(super) fn does_new_address_intersect_pinned_objects<VM: VMBinding>(
+    start: Address,
+    size: usize,
+) -> (bool, Option<ObjectReference>) {
+    let start_address = start;
+    let end_address = start_address + size;
+    let mut current_address = start_address;
+    while current_address < end_address {
+        // SAFETY: We are only creating ObjectReferences from addresses within the MMTk heap
+        let object =
+            unsafe { ObjectReference::from_raw_address_unchecked(Address::from(current_address)) };
+        // TODO(kunals): What if we have multiple objects pinned after one-another? In that case, we should
+        // probably return the end address of the last pinned object
+        if is_object_pinned::<VM>(object) {
+            return (true, Some(object));
+        }
+        current_address += BYTES_IN_WORD;
+    }
+    (false, None)
+}
+
 /// A finite-state machine which visits the positions of marked bits in
 /// the mark bitmap, and accumulates the size of live data that it has
 /// seen between marked bits.
@@ -65,6 +99,8 @@ struct Transducer {
     /// Whether or not the transducer is currently inside an object
     /// (i.e. if it has seen a first bit but no matching last bit yet).
     in_object: bool,
+    #[cfg(feature = "object_pinning")]
+    in_pinned_object: bool,
 }
 
 #[cfg(not(feature = "compressor_art_marking"))]
@@ -74,9 +110,15 @@ impl Transducer {
             offset: 0,
             last_bit_visited: Address::ZERO,
             in_object: false,
+            #[cfg(feature = "object_pinning")]
+            in_pinned_object: false,
         }
     }
-    pub fn visit_mark_bit(&mut self, address: Address) {
+    pub fn visit_mark_bit<VM: VMBinding>(&mut self, address: Address) {
+        // if !COMPUTING_FORWARDING_INFO.load(Ordering::SeqCst) {
+        //     info!("Visiting mark bit at address {}, offset {:#x}, in_object: {}, in_pinned_object: {}, last_bit_visited: {}",
+        //         address, self.offset, self.in_object, self.in_pinned_object, self.last_bit_visited);
+        // }
         if self.in_object {
             // The size of an object is the distance between the end and
             // start of the object, and the last word of the object is one
@@ -86,18 +128,131 @@ impl Transducer {
             let first_word = self.last_bit_visited;
             let last_word = address;
             let size = last_word - first_word + BYTES_IN_WORD;
-            self.offset += size as Offset;
+            let region = CompressorRegion::from_unaligned_address(first_word);
+            if !self.in_pinned_object {
+                let (intersects_pinned, pinned_object) =
+                    does_new_address_intersect_pinned_objects::<VM>(
+                        region.start() + self.offset as usize,
+                        size,
+                    );
+                debug_assert!(
+                    !intersects_pinned || pinned_object.is_some(),
+                    "If the new address intersects pinned objects, we should have found a pinned object."
+                );
+                if intersects_pinned {
+                    let mut pinned_object_mut = pinned_object;
+                    let mut intersects_pinned_mut = true;
+                    let mut potential_forwarding_address =
+                        pinned_object_mut.unwrap().to_object_start::<VM>()
+                            + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
+                    while intersects_pinned_mut {
+                        info!(
+                            "Object at 0x{first_word:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
+                            pinned_object_mut.unwrap().to_raw_address(), potential_forwarding_address);
+                        let (intersects_pinned, pinned_object) =
+                            does_new_address_intersect_pinned_objects::<VM>(
+                                potential_forwarding_address,
+                                size,
+                            );
+                        intersects_pinned_mut = intersects_pinned;
+                        pinned_object_mut = pinned_object;
+                        if intersects_pinned_mut {
+                            potential_forwarding_address = pinned_object_mut
+                                .unwrap()
+                                .to_object_start::<VM>()
+                                + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
+                        }
+                    }
+                    let offset = potential_forwarding_address - region.start();
+                    debug_assert!(
+                        !is_object_pinned::<VM>(unsafe {
+                            ObjectReference::from_raw_address_unchecked(region.start() + offset)
+                        }),
+                        "The new offset {} should not intersect with another pinned object {}",
+                        offset,
+                        region.start() + offset,
+                    );
+                    self.offset = offset as Offset;
+                }
+                self.offset += size as Offset;
+                if COMPUTING_FORWARDING_INFO.load(Ordering::SeqCst) {
+                    let mut map = FORWARDING_MAP.lock().unwrap();
+                    if map.contains_key(&first_word) {
+                        debug_assert_eq!(
+                            map[&first_word],
+                            region.start() + self.offset as usize - size,
+                            "If the object has already been forwarded, it should have the same forwarding address as before. Old: 0x{:x}, new: 0x{:x}",
+                            map[&first_word],
+                            region.start() + self.offset as usize - size,
+                        );
+                    } else {
+                        map.insert(first_word, region.start() + self.offset as usize - size);
+                    }
+                    info!(
+                        "Move object at 0x{first_word:#x} -> 0x{:#x} (size {size}): {:#x}",
+                        region.start() + self.offset as usize - size,
+                        self.offset
+                    );
+                }
+            } else {
+                if COMPUTING_FORWARDING_INFO.load(Ordering::SeqCst) {
+                    info!("Skip pinned object at 0x{first_word:#x} -> 0x{first_word:#x} (size {size}): {:#x}", self.offset);
+                    let mut map = FORWARDING_MAP.lock().unwrap();
+                    if map.contains_key(&first_word) {
+                        debug_assert_eq!(
+                            map[&first_word],
+                            first_word,
+                            "Pinned object at 0x{first_word:#x} should have been forwarded to itself. Old: 0x{:x}, new: 0x{:x}",
+                            map[&first_word],
+                            first_word,
+                        );
+                    } else {
+                        map.insert(first_word, first_word);
+                    }
+                }
+                let pinned_obj_offset = (first_word - region.start()) as Offset;
+                if self.offset == pinned_obj_offset {
+                    // We have no gap remaining between the end of the last object and the start of the pinned object
+                    self.offset += size as Offset;
+                }
+            }
         }
         self.in_object = !self.in_object;
+        #[cfg(feature = "object_pinning")]
+        if self.in_object {
+            // SAFETY: If we're currently within an object, we have just found the starting mark-bit
+            // of the next live object. Hence, the address is a valid ObjectReference.
+            self.in_pinned_object = is_object_pinned::<VM>(unsafe {
+                ObjectReference::from_raw_address_unchecked(address)
+            });
+        } else {
+            self.in_pinned_object = false;
+        }
         self.last_bit_visited = address;
+        // if !COMPUTING_FORWARDING_INFO.load(Ordering::SeqCst) {
+        //     info!("After visiting mark bit at address {}, offset {:#x}, in_object: {}, in_pinned_object: {}, last_bit_visited: {}",
+        //         address, self.offset, self.in_object, self.in_pinned_object, self.last_bit_visited);
+        // }
     }
 
-    pub fn encode(&self, current_position: Address) -> Offset {
+    pub fn encode(&self, _current_position: Address) -> Offset {
         if self.in_object {
             // We count the space between the last mark bit and
             // the current address as live when we stop in the
             // middle of an object.
-            self.offset + (current_position - self.last_bit_visited) as Offset + 1
+            use crate::util::constants::MIN_OBJECT_SIZE;
+            debug_assert!(crate::util::conversions::raw_is_aligned(
+                self.offset as usize,
+                MIN_OBJECT_SIZE
+            ));
+            debug_assert!(self.offset & 0b10 == 0, "The offset should have at least 2 free bits for encoding the in_object and in_pinned_object flags.");
+            #[allow(unused_mut)]
+            let mut offset = self.offset + 1;
+            #[cfg(feature = "object_pinning")]
+            if self.in_pinned_object {
+                offset += 0b10;
+            }
+            offset
         } else {
             self.offset
         }
@@ -105,9 +260,11 @@ impl Transducer {
 
     pub fn decode(offset: Offset, current_position: Address) -> Self {
         Transducer {
-            offset: offset & !1,
+            offset: offset & !0b11,
             last_bit_visited: current_position,
             in_object: (offset & 1) == 1,
+            #[cfg(feature = "object_pinning")]
+            in_pinned_object: (offset & 0b10) == 0b10,
         }
     }
 }
@@ -270,6 +427,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
         use crate::util::constants::LOG_BITS_IN_WORD;
         const_assert!(Block::LOG_BYTES - MARK_SPEC.log_bytes_in_region >= LOG_BITS_IN_WORD);
+        COMPUTING_FORWARDING_INFO.store(true, Ordering::SeqCst);
         cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
             let used = self.calculate_offset_vector_art(region, cursor);
         } else {
@@ -282,6 +440,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 { unreachable!("Shouldn't have self.supports_clmul = true on non-x86_64") }
+            } else if self.pin_objects {
+                self.calculate_offset_vector_with_pinning(region, cursor)
             } else {
                 self.calculate_offset_vector_base(region, cursor)
             };
@@ -378,16 +538,59 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     block.start(),
                     block.end(),
                     &mut |addr: Address| {
-                        state.visit_mark_bit(addr);
+                        state.visit_mark_bit::<VM>(addr);
                     },
                 );
             }
+            state.offset
+        }
+
+        fn calculate_offset_vector_with_pinning(&self, region: CompressorRegion, cursor: Address) -> Offset {
+            use crate::util::linear_scan::RegionIterator;
+            let mut state = Transducer::new();
+            let first_block = Block::from_aligned_address(region.start());
+            let last_block = Block::from_aligned_address(cursor);
+            for block in RegionIterator::<Block>::new(first_block, last_block) {
+                OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
+                    block.start(),
+                    state.encode(block.start()),
+                    Ordering::Relaxed,
+                );
+                info!(
+                    "Offset vector for block {}: {:#x}, in_object: {}, in_pinned_object: {}, last_bit_visited: {}",
+                    block.start(), state.offset, state.in_object, state.in_pinned_object, state.last_bit_visited);
+                MARK_SPEC.scan_non_zero_values::<u8>(
+                    block.start(),
+                    block.end(),
+                    &mut |addr: Address| {
+                        state.visit_mark_bit::<VM>(addr);
+                    },
+                    // &mut |addr: Address| {
+                    //     if !state.in_object {
+                    //         // SAFETY: If we're currently not within an object, we have just found the starting mark-bit
+                    //         // of the next live object. Hence, the address is a valid ObjectReference.
+                    //         let object = unsafe { ObjectReference::from_raw_address_unchecked(addr) };
+                    //         if is_object_pinned::<VM>(object) {
+                    //             // We treat pinned objects as taking up no space in the offset vector calculation,
+                    //             // so that they don't affect the forwarding addresses of other objects. We still
+                    //             // need to visit the mark bits of pinned objects, in order to update the state of
+                    //             // the transducer correctly for subsequent live objects in the same region.
+                    //             state.visit_mark_bit::<VM>(addr);
+                    //         }
+                    //     } else {
+                    //         state.visit_mark_bit::<VM>(addr);
+                    //     }
+                    // },
+                );
+            }
+            info!("Finished calculating offset vector for region {}: {:#x}\n", region.start(), state.offset);
             state.offset
         }
     }}
 
     pub fn release(&self) {
         self.calculated.store(false, Ordering::Relaxed);
+        FORWARDING_MAP.lock().unwrap().clear();
     }
 
     pub fn is_forwarding_region(&self, region: CompressorRegion) -> bool {
@@ -401,7 +604,12 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             "forward() should only be called when we have calculated an offset vector"
         );
         let region = CompressorRegion::from_unaligned_address(address);
+        // SAFETY: We are creating an ObjectReference from a valid object since we call this
+        // function only for objects
+        let object = unsafe { ObjectReference::from_raw_address_unchecked(address) };
         if !self.is_forwarding_region(region) {
+            address
+        } else if is_object_pinned::<VM>(object) {
             address
         } else {
             // This could be less of a mess, and with more compile-time checks,
@@ -450,12 +658,113 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 OFFSET_VECTOR_SPEC.load_atomic::<Offset>(block.start(), Ordering::Relaxed),
                 block.start(),
             );
+            if state.in_object {
+                let region = CompressorRegion::from_unaligned_address(block.start());
+                // SAFETY: We can safely find the previous non-zero bit since we are in an object, and thus there
+                // must be a previous mark bit which we have visited. No one else can be modifying the mark bits
+                // right now anyway since we're in the Forward phase
+                let object_start = unsafe {
+                    MARK_SPEC.find_prev_non_zero_value::<u8>(block.start() - BYTES_IN_WORD, block.start() - region.start())
+                        .expect("Failed to find previous non-zero bit")
+                };
+                state.last_bit_visited = object_start;
+            }
             // The transducer in this implementation computes the distance of
             // an object from the start of a region; whereas Total-Live-Data in the
             // paper computes the distance of the object from the start of the block.
             MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
-                state.visit_mark_bit(addr)
+                state.visit_mark_bit::<VM>(addr)
             });
+            // SAFETY: We are creating an ObjectReference from a valid object since we call this
+            // function only for objects
+            let from_obj = unsafe { ObjectReference::from_raw_address_unchecked(address) };
+            let region = CompressorRegion::from_unaligned_address(address);
+            let potential_forwarding_address = region.start() + state.offset as usize;
+            debug_assert!(
+                MARK_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) != 0,
+                "The address to forward should be marked in the bitmap."
+            );
+            let end = MARK_SPEC.find_first_non_zero_bit(address + BYTES_IN_WORD, region.end()).expect("Failed to find first non-zero bit");
+            debug_assert_ne!(address, end, "Object start and end should be different: {:#x}", address);
+            let size = end - address + BYTES_IN_WORD;
+            let (intersects_pinned, pinned_object) =
+                does_new_address_intersect_pinned_objects::<VM>(
+                    potential_forwarding_address,
+                    size,
+                );
+            debug_assert!(
+                !intersects_pinned || pinned_object.is_some(),
+                "Forwarding: if the new address intersects pinned objects, we should have found a pinned object."
+            );
+            if intersects_pinned {
+                let mut pinned_object_mut = pinned_object;
+                let mut intersects_pinned_mut = true;
+                debug_assert!(
+                    is_object_pinned::<VM>(pinned_object_mut.unwrap())
+                );
+                let mut potential_forwarding_address =
+                    pinned_object_mut.unwrap().to_object_start::<VM>()
+                        + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
+                while intersects_pinned_mut {
+                    info!(
+                        "Forwarding: object at 0x{address:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
+                        pinned_object_mut.unwrap().to_raw_address(), potential_forwarding_address);
+                    let (intersects_pinned, pinned_object) =
+                        does_new_address_intersect_pinned_objects::<VM>(
+                            potential_forwarding_address,
+                            size,
+                        );
+                    intersects_pinned_mut = intersects_pinned;
+                    pinned_object_mut = pinned_object;
+                    if intersects_pinned_mut {
+                        potential_forwarding_address = pinned_object_mut
+                            .unwrap()
+                            .to_object_start::<VM>()
+                            + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
+                    }
+                }
+                let offset = potential_forwarding_address - region.start();
+                debug_assert!(
+                    !is_object_pinned::<VM>(unsafe {
+                        ObjectReference::from_raw_address_unchecked(region.start() + offset)
+                    }),
+                    "Forwarding: the new offset {} should not intersect with another pinned object {}",
+                    offset,
+                    region.start() + offset,
+                );
+                state.offset = offset as Offset;
+            }
+            info!("Forwarding object at 0x{address:#x} -> 0x{:#x} (size {size}): {:#x}\n", region.start() + state.offset as usize, state.offset);
+            {
+                let map = FORWARDING_MAP.lock().unwrap();
+                let mut block_state = Transducer::decode(
+                    OFFSET_VECTOR_SPEC.load_atomic::<Offset>(block.start(), Ordering::Relaxed),
+                    block.start(),
+                );
+                if block_state.in_object {
+                    let region = CompressorRegion::from_unaligned_address(block.start());
+                    // SAFETY: We can safely find the previous non-zero bit since we are in an object, and thus there
+                    // must be a previous mark bit which we have visited. No one else can be modifying the mark bits
+                    // right now anyway since we're in the Forward phase
+                    let object_start = unsafe {
+                        MARK_SPEC.find_prev_non_zero_value::<u8>(block.start() - BYTES_IN_WORD, block.start() - region.start())
+                            .expect("Failed to find previous non-zero bit")
+                    };
+                    block_state.last_bit_visited = object_start;
+                }
+                debug_assert_eq!(
+                    region.start() + state.offset as usize,
+                    map[&address],
+                    "The forwarding address should match the one in the forwarding map. Expected: 0x{:x}, actual: 0x{:x}\n    block start: 0x{:x}, offset: {:#x} in_object: {}, in_pinned_object: {}, last_bit_visited: 0x{:x}",
+                    map[&address],
+                    region.start() + state.offset as usize,
+                    block.start(),
+                    block_state.offset,
+                    block_state.in_object,
+                    block_state.in_pinned_object,
+                    block_state.last_bit_visited,
+                );
+            }
             state.offset
         }
 
@@ -612,7 +921,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 block.start(),
                 block.end(),
                 &mut |addr: Address| {
-                    state.visit_mark_bit(addr);
+                    state.visit_mark_bit::<VM>(addr);
                     if state.in_object {
                         let o = ObjectReference::from_raw_address(addr).unwrap();
                         VM::VMObjectModel::finalise_threading_list(o);
@@ -625,7 +934,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 block.start(),
                 block.end(),
                 &mut |addr: Address| {
-                    second_state.visit_mark_bit(addr);
+                    second_state.visit_mark_bit::<VM>(addr);
                     if second_state.in_object {
                         let o = ObjectReference::from_raw_address(addr).unwrap();
                         move_object(o);

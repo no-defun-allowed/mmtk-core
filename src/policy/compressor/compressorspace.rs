@@ -1,5 +1,5 @@
 use crate::plan::VectorObjectQueue;
-use crate::policy::compressor::forwarding;
+use crate::policy::compressor::forwarding::{self, COMPUTING_FORWARDING_INFO, FORWARDING_MAP, does_new_address_intersect_pinned_objects};
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
@@ -396,6 +396,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .collect();
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
             .bulk_add(offset_vector_packets);
+        self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
+            .set_sentinel(Box::new(AfterCalculateOffsetVector::new(self)));
     }
 
     pub fn calculate_offset_vector_for_region(
@@ -494,6 +496,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.pr.with_regions(&mut |regions| {
             let r = &regions[index];
             let start = r.region.start();
+            info!("\nCompacting region {}", start);
             let end = r.cursor();
             #[cfg(feature = "vo_bit")]
             {
@@ -522,11 +525,25 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
                         debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
                         let new_object = self.forward::<CAN_CLMUL>(obj, false);
-                        debug_assert!(
-                            new_object.to_raw_address() >= to,
-                            "whilst forwarding {obj}, the new address {0} should be after the end of the last object {to}",
-                            new_object.to_raw_address()
-                        );
+                        // debug_assert!(
+                        //     new_object.to_raw_address() >= to,
+                        //     "whilst forwarding {obj}, the new address {0} should be after the end of the last object {to}",
+                        //     new_object.to_raw_address()
+                        // );
+                        #[cfg(debug_assertions)]
+                        {
+                            if !self.is_pinned(obj) {
+                                let (intersects_pinned, pinned_object) = does_new_address_intersect_pinned_objects::<VM>(new_object.to_raw_address(), copied_size);
+                                debug_assert!(
+                                    !intersects_pinned,
+                                    "Moving object {obj} -> {:#x} (size {copied_size}) intersects with pinned object {:?}",
+                                    new_object.to_raw_address(),
+                                    pinned_object,
+                                );
+                            } else {
+                                debug_assert_eq!(obj, new_object, "Pinned object {obj} was forwarded to {new_object}!");
+                            }
+                        }
                         // copy object
                         trace!("copy from {} to {}", obj, new_object);
                         let end_of_new_object =
@@ -534,8 +551,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         // update VO bit
                         #[cfg(feature = "vo_bit")]
                         vo_bit::set_vo_bit(new_object);
-                        to = new_object.to_object_start::<VM>() + copied_size;
-                        debug_assert_eq!(end_of_new_object, to);
+                        to = to.max(new_object.to_object_start::<VM>() + copied_size);
+                        // debug_assert_eq!(end_of_new_object, to);
                         self.update_references::<CAN_CLMUL>(worker, new_object);
                     });
                 debug!("Compacted region [{}, {}) -> {to} with {objects} objects", r.region.start(), r.cursor());
@@ -549,6 +566,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     pub fn update_slots<const CAN_CLMUL: bool>(&self, slots: &[VM::VMSlot]) {
+        info!("\nUpdating {} slots in remset", slots.len());
         for s in slots {
             if let Some(o) = s.load() {
                 trace!("Forwarding {o} -> {}", self.forward::<false>(o, false));
@@ -560,6 +578,47 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     pub fn after_compact(&self) {
         self.pr.reset_allocator();
         self.pr.with_regions(&mut |r| draw_region_usage(r));
+    }
+}
+
+pub struct AfterCalculateOffsetVector<VM: VMBinding> {
+    compressor_space: &'static CompressorSpace<VM>,
+}
+
+impl<VM: VMBinding> AfterCalculateOffsetVector<VM> {
+    pub fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
+        Self { compressor_space }
+    }
+}
+
+impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        {
+            let map = FORWARDING_MAP.lock().unwrap();
+            map.iter().for_each(|(from_obj, to_obj)| {
+                let from_obj = ObjectReference::from_raw_address(*from_obj).unwrap();
+                let to_obj = ObjectReference::from_raw_address(*to_obj).unwrap();
+                if self.compressor_space.is_object_pinned(from_obj) {
+                    debug_assert_eq!(
+                        from_obj, to_obj,
+                        "Pinned object {:?} was forwarded to {:?}!",
+                        from_obj, to_obj
+                    );
+                } else {
+                    let (intersects_pinned, pinned_object) =
+                        does_new_address_intersect_pinned_objects::<VM>(to_obj.to_raw_address(), VM::VMObjectModel::get_size_when_copied(from_obj));
+                    debug_assert!(
+                        !intersects_pinned,
+                        "Moving object {:?} -> {:?} intersects with pinned object {:?}!",
+                        from_obj,
+                        to_obj,
+                        pinned_object,
+                    );
+                }
+            });
+        }
+
+        COMPUTING_FORWARDING_INFO.store(false, Ordering::SeqCst);
     }
 }
 

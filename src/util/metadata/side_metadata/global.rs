@@ -1273,6 +1273,66 @@ impl SideMetadataSpec {
             &mut visitor,
         )
     }
+
+    pub fn find_first_non_zero_bit(&self, data_addr_start: Address, data_addr_end: Address) -> Option<Address> {
+        debug_assert!(self.uses_contiguous_side_metadata());
+
+        let start_meta_addr = address_to_contiguous_meta_address(self, data_addr_start);
+        let start_meta_shift = meta_byte_lshift(self, data_addr_start);
+        let end_meta_addr = address_to_contiguous_meta_address(self, data_addr_end);
+        let end_meta_shift = meta_byte_lshift(self, data_addr_end);
+
+        let mut res = None;
+
+        let mut visitor = |range: BitByteRange| {
+            match range {
+                BitByteRange::Bytes { start, end } => {
+                    match helpers::find_first_non_zero_bit_in_metadata_bytes(start, end) {
+                        helpers::FindMetaBitResult::Found { addr, bit } => {
+                            let (addr, bit) = align_metadata_address(self, addr, bit);
+                            res = Some(contiguous_meta_address_to_address(self, addr, bit));
+                            // Return true to abort the search. We found the bit.
+                            true
+                        }
+                        // If we see unmapped metadata, we don't need to search any more.
+                        helpers::FindMetaBitResult::UnmappedMetadata => true,
+                        // Return false to continue searching.
+                        helpers::FindMetaBitResult::NotFound => false,
+                    }
+                }
+                BitByteRange::BitsInByte {
+                    addr,
+                    bit_start,
+                    bit_end,
+                } => {
+                    match helpers::find_first_non_zero_bit_in_metadata_bits(addr, bit_start, bit_end)
+                    {
+                        helpers::FindMetaBitResult::Found { addr, bit } => {
+                            let (addr, bit) = align_metadata_address(self, addr, bit);
+                            res = Some(contiguous_meta_address_to_address(self, addr, bit));
+                            // Return true to abort the search. We found the bit.
+                            true
+                        }
+                        // If we see unmapped metadata, we don't need to search any more.
+                        helpers::FindMetaBitResult::UnmappedMetadata => true,
+                        // Return false to continue searching.
+                        helpers::FindMetaBitResult::NotFound => false,
+                    }
+                }
+            }
+        };
+
+        ranges::break_bit_range(
+            start_meta_addr,
+            start_meta_shift,
+            end_meta_addr,
+            end_meta_shift,
+            true,
+            &mut visitor,
+        );
+
+        res.filter(|addr| *addr >= data_addr_start && *addr < data_addr_end)
+    }
 }
 
 impl fmt::Debug for SideMetadataSpec {

@@ -345,6 +345,93 @@ where
     }
 }
 
+pub fn find_first_non_zero_bit_in_metadata_bytes(
+    meta_start: Address,
+    meta_end: Address,
+) -> FindMetaBitResult {
+    use crate::util::constants::BYTES_IN_ADDRESS;
+
+    // We need to check if metadata address is mapped or not.  But we make use of the granularity of
+    // the `Mmapper` to reduce the number of checks.  This records the start of a grain that is
+    // tested to be mapped.
+    let mut mapped_grain = Address::MAX;
+    let mmap_granularity = MMAPPER.granularity();
+    let mut cursor = meta_start;
+    // If we are looking at an address that is not in a mapped chunk, we need to check if the chunk if mapped.
+    if cursor > mapped_grain {
+        if cursor.is_mapped() {
+            // This is mapped. No need to check for this chunk.
+            mapped_grain = cursor.align_down(mmap_granularity);
+        } else {
+            return FindMetaBitResult::UnmappedMetadata;
+        }
+    }
+
+    while cursor < meta_end && !cursor.is_aligned_to(BYTES_IN_ADDRESS) {
+        let byte = unsafe { cursor.load::<u8>() };
+        if let Some(bit) = find_first_non_zero_bit::<u8>(byte, 0, 8) {
+            return FindMetaBitResult::Found { addr: cursor, bit };
+        }
+        cursor += 1usize;
+    }
+
+    while cursor + BYTES_IN_ADDRESS < meta_end {
+        let word = unsafe { cursor.load::<usize>() };
+        if word != 0 {
+            let bit = find_first_non_zero_bit::<usize>(word, 0, usize::BITS as u8).unwrap();
+            let byte_offset = bit >> LOG_BITS_IN_BYTE;
+            let bit_offset = bit - ((byte_offset) << LOG_BITS_IN_BYTE);
+            return FindMetaBitResult::Found {
+                addr: cursor + byte_offset as usize,
+                bit: bit_offset,
+            };
+        }
+        cursor += BYTES_IN_ADDRESS;
+    }
+
+    while cursor < meta_end {
+        let byte = unsafe { cursor.load::<u8>() };
+        if let Some(bit) = find_first_non_zero_bit::<u8>(byte, 0, 8) {
+            return FindMetaBitResult::Found { addr: cursor, bit };
+        }
+        cursor += 1usize;
+    }
+
+    FindMetaBitResult::NotFound
+}
+
+pub fn find_first_non_zero_bit_in_metadata_bits(
+    addr: Address,
+    start_bit: u8,
+    end_bit: u8,
+) -> FindMetaBitResult {
+    if !addr.is_mapped() {
+        return FindMetaBitResult::UnmappedMetadata;
+    }
+    let byte = unsafe { addr.load::<u8>() };
+    if let Some(bit) = find_first_non_zero_bit::<u8>(byte, start_bit, end_bit) {
+        return FindMetaBitResult::Found { addr, bit };
+    }
+    FindMetaBitResult::NotFound
+}
+
+fn find_first_non_zero_bit<T>(value: T, start: u8, end: u8) -> Option<u8>
+where
+    T: PrimInt + CheckedShl,
+{
+    let mask = match T::one().checked_shl((end - start) as u32) {
+        Some(shl) => (shl - T::one()) << (start as u32),
+        None => T::max_value() << (start as u32),
+    };
+    let masked = value & mask;
+    if masked.is_zero() {
+        None
+    } else {
+        let trailing_zeroes = masked.trailing_zeros();
+        Some(trailing_zeroes as u8)
+    }
+}
+
 pub fn scan_non_zero_bits_in_metadata_bytes(
     meta_start: Address,
     meta_end: Address,
