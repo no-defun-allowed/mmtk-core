@@ -992,7 +992,17 @@ options! {
     compressor_compact_max_percent: u8              [|v: &u8| *v <= 100] = 90,
     /// Enable the use of an algorithm based on carryless multiplication to
     /// compute the offset vector in the Compressor.
-    compressor_use_clmul: bool                      [always_valid] = false
+    compressor_use_clmul: bool                      [always_valid] = false,
+    /// Fraction of OS pages to randomly pin per GC cycle in the Compressor (0.0–1.0).
+    /// Pinned pages are not compacted; objects within them have their references updated
+    /// in-place but are never moved.  The default of 0.0 disables random pinning.
+    compressor_pin_pages_fraction: f64              [|v: &f64| *v >= 0.0 && *v <= 1.0] = 0.0,
+    /// Fraction of objects to randomly pin per GC cycle in the Compressor (0.0–1.0).
+    /// Pinned objects are not moved. The default of 0.0 disables random pinning. Note that
+    /// this option conflicts with [`Options::compressor_pin_pages_fraction`], and if both are
+    /// set to non-zero values, MMTk will only use [`Options::compressor_pin_pages_fraction`]
+    /// and ignore [`Options::compressor_pin_objects_fraction`].
+    compressor_pin_objects_fraction: f64            [|v: &f64| *v >= 0.0 && *v <= 1.0] = 0.0
 }
 
 #[cfg(test)]

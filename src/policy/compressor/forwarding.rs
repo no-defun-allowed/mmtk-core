@@ -144,10 +144,30 @@ pub struct ForwardingMetadata<VM: VMBinding> {
     calculated: AtomicBool,
     vm: PhantomData<VM>,
     supports_clmul: bool,
+    #[cfg(feature = "object_pinning")]
+    pin_fraction: f64,
+    #[cfg(feature = "object_pinning")]
+    pin_objects: bool,
+    #[cfg(feature = "object_pinning")]
+    random: Mutex<rand_chacha::ChaCha8Rng>,
+}
+
+#[cfg(feature = "object_pinning")]
+fn is_object_pinned<VM: VMBinding>(object: ObjectReference) -> bool {
+    VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.is_object_pinned::<VM>(object)
+}
+
+#[cfg(feature = "object_pinning")]
+fn pin_object<VM: VMBinding>(object: ObjectReference) {
+    VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.pin_object::<VM>(object);
 }
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
-    pub fn new(compact_limit: CompactLimit, _use_clmul: bool) -> ForwardingMetadata<VM> {
+    pub fn new(
+        compact_limit: CompactLimit,
+        _use_clmul: bool,
+        _pin_fraction: f64,
+    ) -> ForwardingMetadata<VM> {
         cfg_if::cfg_if! { if #[cfg(target_arch = "x86_64")] {
             let supports_clmul = _use_clmul
                 && is_x86_feature_detected!("pclmulqdq")
@@ -160,6 +180,12 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             calculated: AtomicBool::new(false),
             vm: PhantomData,
             supports_clmul,
+            #[cfg(feature = "object_pinning")]
+            pin_fraction: _pin_fraction,
+            #[cfg(feature = "object_pinning")]
+            pin_objects: _pin_fraction > 0.0,
+            #[cfg(feature = "object_pinning")]
+            random: Mutex::new(rand_chacha::ChaCha8Rng::seed_from_u64(0x0bad5eed)),
         }
     }
 
@@ -213,6 +239,31 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             // same bytes, words, cache lines, etc.; so setting more bits is not actually
             // that inefficient in practice.
             MARK_SPEC.fetch_or_atomic::<u8>(last_word_of_object, 1, Ordering::Relaxed);
+        }
+
+        #[cfg(feature = "object_pinning")]
+        if self.pin_objects {
+            let last_word_of_object = object.to_object_start::<VM>()
+                + VM::VMObjectModel::get_current_size(object)
+                - BYTES_IN_WORD;
+            let start_block = Block::from_unaligned_address(object.to_object_start::<VM>());
+            let end_block = Block::from_unaligned_address(last_word_of_object);
+            // TODO(kunals): Currently we only pin objects that are completely within a single block
+            if start_block == end_block {
+                use rand::Rng;
+
+                // TODO(kunals): Locking is expensive!
+                let mut rng = self.random.lock().unwrap();
+                let should_pin = rng.random_bool(self.pin_fraction);
+                if should_pin {
+                    pin_object::<VM>(object);
+                    info!(
+                        "Pinning object at 0x{:#x} of size {} bytes",
+                        object.to_raw_address(),
+                        VM::VMObjectModel::get_current_size(object)
+                    );
+                }
+            }
         }
     }
 

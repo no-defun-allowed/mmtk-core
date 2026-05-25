@@ -249,6 +249,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             forwarding: forwarding::ForwardingMetadata::new(
                 forwarding::CompactLimit::AlwaysCompact,
                 use_clmul,
+                0.0,
             ),
             common,
             scheduler,
