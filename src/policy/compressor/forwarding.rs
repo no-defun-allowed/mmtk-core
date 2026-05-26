@@ -9,13 +9,11 @@ use crate::util::{Address, ObjectReference};
 use crate::vm::object_model::ObjectModel;
 use crate::vm::VMBinding;
 use atomic::Ordering;
-#[cfg(feature = "object_pinning")]
-use rand::SeedableRng;
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicBool;
-#[cfg(feature = "object_pinning")]
+#[cfg(debug_assertions)]
 use std::sync::Mutex;
 
 #[cfg(debug_assertions)]
@@ -310,8 +308,6 @@ pub struct ForwardingMetadata<VM: VMBinding> {
     pin_fraction: f64,
     #[cfg(feature = "object_pinning")]
     pin_objects: bool,
-    #[cfg(feature = "object_pinning")]
-    random: Mutex<rand_chacha::ChaCha8Rng>,
 }
 
 #[cfg(feature = "object_pinning")]
@@ -346,8 +342,6 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             pin_fraction: _pin_fraction,
             #[cfg(feature = "object_pinning")]
             pin_objects: _pin_fraction > 0.0,
-            #[cfg(feature = "object_pinning")]
-            random: Mutex::new(rand_chacha::ChaCha8Rng::seed_from_u64(0x0bad5eed)),
         }
     }
 
@@ -412,11 +406,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             let end_block = Block::from_unaligned_address(last_word_of_object);
             // TODO(kunals): Currently we only pin objects that are completely within a single block
             if start_block == end_block {
-                use rand::Rng;
-
-                // TODO(kunals): Locking is expensive!
-                let mut rng = self.random.lock().unwrap();
-                let should_pin = rng.random_bool(self.pin_fraction);
+                let should_pin = rand::random_bool(self.pin_fraction);
                 if should_pin {
                     pin_object::<VM>(object);
                     info!(
