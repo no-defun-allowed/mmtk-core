@@ -675,7 +675,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             });
             // SAFETY: We are creating an ObjectReference from a valid object since we call this
             // function only for objects
-            let from_obj = unsafe { ObjectReference::from_raw_address_unchecked(address) };
+            // let from_obj = unsafe { ObjectReference::from_raw_address_unchecked(address) };
             let region = CompressorRegion::from_unaligned_address(address);
             let potential_forwarding_address = region.start() + state.offset as usize;
             debug_assert!(

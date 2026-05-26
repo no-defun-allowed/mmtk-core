@@ -20,8 +20,8 @@ use crate::vm::slot::Slot;
 use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
 use atomic::Ordering;
-#[cfg(feature = "object_pinning")]
-use std::sync::atomic::AtomicU32;
+// #[cfg(feature = "object_pinning")]
+// use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
@@ -49,7 +49,7 @@ pub struct CompressorSpace<VM: VMBinding> {
     pr: RegionPageResource<VM, forwarding::CompressorRegion>,
     forwarding: forwarding::ForwardingMetadata<VM>,
     scheduler: Arc<GCWorkScheduler<VM>>,
-    gc_count: AtomicU32,
+    // gc_count: AtomicU32,
 }
 
 /// The number of bytes of the heap that each CalculateOffsetVector
@@ -248,7 +248,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             ),
             common,
             scheduler,
-            gc_count: AtomicU32::new(0),
+            // gc_count: AtomicU32::new(0),
         }
     }
 
