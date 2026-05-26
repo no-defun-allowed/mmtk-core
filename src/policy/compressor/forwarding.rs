@@ -664,7 +664,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 // must be a previous mark bit which we have visited. No one else can be modifying the mark bits
                 // right now anyway since we're in the Forward phase
                 let object_start = unsafe {
-                    MARK_SPEC.find_prev_non_zero_value::<u8>(block.start() - BYTES_IN_WORD, block.start() - region.start())
+                    let search_start = block.start() - BYTES_IN_WORD;
+                    MARK_SPEC.find_prev_non_zero_value::<u8>(search_start, search_start - region.start() + 1usize)
                         .expect("Failed to find previous non-zero bit")
                 };
                 state.last_bit_visited = object_start;
@@ -684,7 +685,9 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 MARK_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) != 0,
                 "The address to forward should be marked in the bitmap."
             );
-            let end = MARK_SPEC.find_first_non_zero_bit(address + BYTES_IN_WORD, region.end()).expect("Failed to find first non-zero bit");
+            // SAFETY: Since we're in the Forward phase, no one will be modifying the mark bits now
+            let search_start = address + BYTES_IN_WORD;
+            let end = unsafe { MARK_SPEC.find_next_non_zero_value::<u8>(search_start, region.end() - search_start + 1usize).expect("Failed to find first non-zero bit") };
             debug_assert_ne!(address, end, "Object start and end should be different: {:#x}", address);
             let size = end - address + BYTES_IN_WORD;
             let (intersects_pinned, pinned_object) =
@@ -735,6 +738,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 state.offset = offset as Offset;
             }
             info!("Forwarding object at 0x{address:#x} -> 0x{:#x} (size {size}): {:#x}\n", region.start() + state.offset as usize, state.offset);
+            #[cfg(debug_assertions)]
             {
                 let map = FORWARDING_MAP.lock().unwrap();
                 let mut block_state = Transducer::decode(
@@ -747,7 +751,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     // must be a previous mark bit which we have visited. No one else can be modifying the mark bits
                     // right now anyway since we're in the Forward phase
                     let object_start = unsafe {
-                        MARK_SPEC.find_prev_non_zero_value::<u8>(block.start() - BYTES_IN_WORD, block.start() - region.start())
+                        let search_start = block.start() - BYTES_IN_WORD;
+                        MARK_SPEC.find_prev_non_zero_value::<u8>(search_start, search_start - region.start() + 1usize)
                             .expect("Failed to find previous non-zero bit")
                     };
                     block_state.last_bit_visited = object_start;
