@@ -546,7 +546,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         }
                         // copy object
                         trace!("copy from {} to {}", obj, new_object);
-                        let end_of_new_object =
+                        let _end_of_new_object =
                             VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
                         // update VO bit
                         #[cfg(feature = "vo_bit")]
