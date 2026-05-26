@@ -1,5 +1,7 @@
 use crate::plan::VectorObjectQueue;
-use crate::policy::compressor::forwarding::{self, COMPUTING_FORWARDING_INFO, FORWARDING_MAP, does_new_address_intersect_pinned_objects};
+use crate::policy::compressor::forwarding;
+#[cfg(debug_assertions)]
+use crate::policy::compressor::forwarding::{COMPUTING_FORWARDING_INFO, FORWARDING_MAP, does_new_address_intersect_pinned_objects};
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
@@ -396,6 +398,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .collect();
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
             .bulk_add(offset_vector_packets);
+        #[cfg(debug_assertions)]
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
             .set_sentinel(Box::new(AfterCalculateOffsetVector::new(self)));
     }
@@ -581,16 +584,19 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 }
 
+#[cfg(debug_assertions)]
 pub struct AfterCalculateOffsetVector<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
 }
 
+#[cfg(debug_assertions)]
 impl<VM: VMBinding> AfterCalculateOffsetVector<VM> {
     pub fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
         Self { compressor_space }
     }
 }
 
+#[cfg(debug_assertions)]
 impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         {
@@ -618,6 +624,7 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
             });
         }
 
+        #[cfg(debug_assertions)]
         COMPUTING_FORWARDING_INFO.store(false, Ordering::SeqCst);
     }
 }

@@ -11,14 +11,17 @@ use crate::vm::VMBinding;
 use atomic::Ordering;
 #[cfg(feature = "object_pinning")]
 use rand::SeedableRng;
+#[cfg(debug_assertions)]
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicBool;
 #[cfg(feature = "object_pinning")]
 use std::sync::Mutex;
 
+#[cfg(debug_assertions)]
 pub(super) static COMPUTING_FORWARDING_INFO: AtomicBool = AtomicBool::new(false);
 
+#[cfg(debug_assertions)]
 lazy_static! {
     pub(super) static ref FORWARDING_MAP: Mutex<HashMap<Address, Address>> =
         Mutex::new(HashMap::new());
@@ -175,6 +178,7 @@ impl Transducer {
                     self.offset = offset as Offset;
                 }
                 self.offset += size as Offset;
+                #[cfg(debug_assertions)]
                 if COMPUTING_FORWARDING_INFO.load(Ordering::SeqCst) {
                     let mut map = FORWARDING_MAP.lock().unwrap();
                     if map.contains_key(&first_word) {
@@ -195,6 +199,7 @@ impl Transducer {
                     );
                 }
             } else {
+                #[cfg(debug_assertions)]
                 if COMPUTING_FORWARDING_INFO.load(Ordering::SeqCst) {
                     info!("Skip pinned object at 0x{first_word:#x} -> 0x{first_word:#x} (size {size}): {:#x}", self.offset);
                     let mut map = FORWARDING_MAP.lock().unwrap();
@@ -427,6 +432,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
         use crate::util::constants::LOG_BITS_IN_WORD;
         const_assert!(Block::LOG_BYTES - MARK_SPEC.log_bytes_in_region >= LOG_BITS_IN_WORD);
+        #[cfg(debug_assertions)]
         COMPUTING_FORWARDING_INFO.store(true, Ordering::SeqCst);
         cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
             let used = self.calculate_offset_vector_art(region, cursor);
@@ -590,6 +596,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 
     pub fn release(&self) {
         self.calculated.store(false, Ordering::Relaxed);
+        #[cfg(debug_assertions)]
         FORWARDING_MAP.lock().unwrap().clear();
     }
 
