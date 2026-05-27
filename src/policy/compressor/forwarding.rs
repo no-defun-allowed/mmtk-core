@@ -399,13 +399,15 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 
         #[cfg(feature = "object_pinning")]
         if self.pin_objects {
-            let last_word_of_object = object.to_object_start::<VM>()
-                + VM::VMObjectModel::get_current_size(object)
-                - BYTES_IN_WORD;
+            let size = VM::VMObjectModel::get_current_size(object);
+            let last_word_of_object = object.to_object_start::<VM>() + size - BYTES_IN_WORD;
             let start_block = Block::from_unaligned_address(object.to_object_start::<VM>());
             let end_block = Block::from_unaligned_address(last_word_of_object);
             // TODO(kunals): Currently we only pin objects that are completely within a single block
-            if start_block == end_block {
+            // or they span exactly one block.
+            if start_block == end_block
+                || (end_block.start() - start_block.start() == Block::BYTES && size < 512_usize)
+            {
                 let should_pin = rand::random_bool(self.pin_fraction);
                 if should_pin {
                     pin_object::<VM>(object);
