@@ -336,6 +336,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     if rand::random_bool(fraction) {
                         pages_pinned += 1;
                         forwarding::PINNED_PAGE_SPEC.store_atomic(page, 1_u8, Ordering::Relaxed);
+                        info!("Pinning page {:#x}", page);
                     }
                     page += BYTES_IN_PAGE;
                     total_pages += 1;
