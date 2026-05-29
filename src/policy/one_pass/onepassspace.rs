@@ -1,5 +1,6 @@
 use crate::plan::VectorObjectQueue;
 use crate::policy::compressor::forwarding;
+use crate::policy::compressor::forwarding::PinningMode;
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::one_pass::locking;
 use crate::policy::sft::GCWorkerMutRef;
@@ -249,7 +250,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             forwarding: forwarding::ForwardingMetadata::new(
                 forwarding::CompactLimit::AlwaysCompact,
                 use_clmul,
-                0.0,
+                PinningMode::NoPinning,
             ),
             common,
             scheduler,

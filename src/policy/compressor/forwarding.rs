@@ -1,6 +1,10 @@
+#[cfg(feature = "object_pinning")]
+use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::Region;
 use crate::util::metadata::side_metadata::ranges::Bits;
+#[cfg(feature = "object_pinning")]
+use crate::util::metadata::side_metadata::spec_defs::COMPRESSOR_PAGE_PINNED;
 use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
 };
@@ -23,6 +27,13 @@ pub(super) static COMPUTING_FORWARDING_INFO: AtomicBool = AtomicBool::new(false)
 lazy_static! {
     pub(super) static ref FORWARDING_MAP: Mutex<HashMap<Address, Address>> =
         Mutex::new(HashMap::new());
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum PinningMode {
+    NoPinning,
+    RandomPagePinning(f64),
+    RandomObjectPinning(f64),
 }
 
 /// A [`CompressorRegion`] is the granularity at which [`super::CompressorSpace`]
@@ -298,6 +309,8 @@ pub(crate) const MARK_SPEC: SideMetadataSpec = COMPRESSOR_MARK;
 const BYTES_PER_MARK_BIT: Offset = (1usize << MARK_SPEC.log_bytes_in_region) as Offset;
 pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR;
 pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
+#[cfg(feature = "object_pinning")]
+pub(crate) const PINNED_PAGE_SPEC: SideMetadataSpec = COMPRESSOR_PAGE_PINNED;
 
 pub struct ForwardingMetadata<VM: VMBinding> {
     compact_limit: CompactLimit,
@@ -305,9 +318,17 @@ pub struct ForwardingMetadata<VM: VMBinding> {
     vm: PhantomData<VM>,
     supports_clmul: bool,
     #[cfg(feature = "object_pinning")]
-    pin_fraction: f64,
-    #[cfg(feature = "object_pinning")]
-    pin_objects: bool,
+    pub pinning_mode: PinningMode,
+}
+
+#[cfg(feature = "object_pinning")]
+fn is_page_pinned(address: Address) -> bool {
+    debug_assert!(
+        address.is_aligned_to(BYTES_IN_PAGE),
+        "Address {} should be aligned to page size when checking for page pinning.",
+        address,
+    );
+    PINNED_PAGE_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) != 0
 }
 
 #[cfg(feature = "object_pinning")]
@@ -324,7 +345,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     pub fn new(
         compact_limit: CompactLimit,
         _use_clmul: bool,
-        _pin_fraction: f64,
+        _pinning_mode: PinningMode,
     ) -> ForwardingMetadata<VM> {
         cfg_if::cfg_if! { if #[cfg(target_arch = "x86_64")] {
             let supports_clmul = _use_clmul
@@ -339,9 +360,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             vm: PhantomData,
             supports_clmul,
             #[cfg(feature = "object_pinning")]
-            pin_fraction: _pin_fraction,
-            #[cfg(feature = "object_pinning")]
-            pin_objects: _pin_fraction > 0.0,
+            pinning_mode: _pinning_mode,
         }
     }
 
@@ -398,16 +417,31 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         }
 
         #[cfg(feature = "object_pinning")]
-        if self.pin_objects {
-            // Pin an arbitrary object with probability of pin_fraction
-            let should_pin = rand::random_bool(self.pin_fraction);
-            if should_pin {
-                pin_object::<VM>(object);
-                info!(
-                    "Pinning object at 0x{:#x} of size {} bytes",
-                    object.to_raw_address(),
-                    VM::VMObjectModel::get_current_size(object)
-                );
+        match self.pinning_mode {
+            PinningMode::NoPinning => {}
+            PinningMode::RandomObjectPinning(fraction) => {
+                // Pin the object with probability of pin_fraction
+                let should_pin = rand::random_bool(fraction);
+                if should_pin {
+                    pin_object::<VM>(object);
+                    info!(
+                        "Pinning object at 0x{:#x} of size {} bytes",
+                        object.to_raw_address(),
+                        VM::VMObjectModel::get_current_size(object)
+                    );
+                }
+            }
+            PinningMode::RandomPagePinning(_) => {
+                let page_start = object.to_object_start::<VM>().align_down(BYTES_IN_PAGE);
+                let should_pin = is_page_pinned(page_start);
+                if should_pin {
+                    pin_object::<VM>(object);
+                    info!(
+                        "Pinning object at 0x{:#x} of size {} bytes",
+                        object.to_raw_address(),
+                        VM::VMObjectModel::get_current_size(object)
+                    );
+                }
             }
         }
     }
@@ -429,7 +463,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 { unreachable!("Shouldn't have self.supports_clmul = true on non-x86_64") }
-            } else if self.pin_objects {
+            } else if self.pinning_mode != PinningMode::NoPinning {
                 self.calculate_offset_vector_with_pinning(region, cursor)
             } else {
                 self.calculate_offset_vector_base(region, cursor)

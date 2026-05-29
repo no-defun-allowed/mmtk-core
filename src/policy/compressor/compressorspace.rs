@@ -1,7 +1,10 @@
 use crate::plan::VectorObjectQueue;
 use crate::policy::compressor::forwarding;
+use crate::policy::compressor::forwarding::PinningMode;
 #[cfg(debug_assertions)]
-use crate::policy::compressor::forwarding::{COMPUTING_FORWARDING_INFO, FORWARDING_MAP, does_new_address_intersect_pinned_objects};
+use crate::policy::compressor::forwarding::{
+    does_new_address_intersect_pinned_objects, COMPUTING_FORWARDING_INFO, FORWARDING_MAP,
+};
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
@@ -20,8 +23,6 @@ use crate::vm::slot::Slot;
 use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
 use atomic::Ordering;
-// #[cfg(feature = "object_pinning")]
-// use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 pub(crate) const TRACE_KIND_MARK: TraceKind = 0;
@@ -49,7 +50,6 @@ pub struct CompressorSpace<VM: VMBinding> {
     pr: RegionPageResource<VM, forwarding::CompressorRegion>,
     forwarding: forwarding::ForwardingMetadata<VM>,
     scheduler: Arc<GCWorkScheduler<VM>>,
-    // gc_count: AtomicU32,
 }
 
 /// The number of bytes of the heap that each CalculateOffsetVector
@@ -227,14 +227,29 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             MetadataSpec::OnSide(forwarding::SELECTED_SPEC),
             #[cfg(feature = "object_pinning")]
             *VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC,
-            // #[cfg(feature = "object_pinning")]
-            // MetadataSpec::OnSide(forwarding::PINNED_PAGE_SPEC),
+            #[cfg(feature = "object_pinning")]
+            MetadataSpec::OnSide(forwarding::PINNED_PAGE_SPEC),
         ]);
         let is_discontiguous = args.vmrequest.is_discontiguous();
         let scheduler = args.scheduler.clone();
         let common = CommonSpace::new(args.into_policy_args(true, false, local_specs));
         let percent = *common.options.compressor_compact_max_percent;
         let use_clmul = *common.options.compressor_use_clmul;
+
+        #[cfg(feature = "object_pinning")]
+        assert!(
+            !(*common.options.compressor_pin_pages_fraction > 0.0 && *common.options.compressor_pin_objects_fraction > 0.0),
+            "Page pinning and object pinning are mutually exclusive. Please set one of them to 0.0.",
+        );
+
+        let pinning_mode = if *common.options.compressor_pin_pages_fraction > 0.0 {
+            PinningMode::RandomPagePinning(*common.options.compressor_pin_pages_fraction)
+        } else if *common.options.compressor_pin_objects_fraction > 0.0 {
+            PinningMode::RandomObjectPinning(*common.options.compressor_pin_objects_fraction)
+        } else {
+            PinningMode::NoPinning
+        };
+
         CompressorSpace {
             pr: if is_discontiguous {
                 RegionPageResource::new_discontiguous(vm_map)
@@ -244,21 +259,38 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             forwarding: forwarding::ForwardingMetadata::new(
                 forwarding::CompactLimit::Percentage(percent),
                 use_clmul,
-                *common.options.compressor_pin_objects_fraction,
+                pinning_mode,
             ),
             common,
             scheduler,
-            // gc_count: AtomicU32::new(0),
         }
     }
 
     pub fn prepare(&self) {
+        #[cfg(feature = "object_pinning")]
+        let is_pinning = match self.forwarding.pinning_mode {
+            PinningMode::NoPinning => false,
+            PinningMode::RandomPagePinning(fraction) => {
+                debug_assert!(
+                    fraction > 0.0 && fraction <= 1.0,
+                    "Pinning fraction should be in (0.0, 1.0]."
+                );
+                true
+            }
+            PinningMode::RandomObjectPinning(fraction) => {
+                debug_assert!(
+                    fraction > 0.0 && fraction <= 1.0,
+                    "Pinning fraction should be in (0.0, 1.0]."
+                );
+                true
+            }
+        };
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let region_size = r.region.end() - r.region.start();
                 forwarding::MARK_SPEC.bzero_metadata(r.region.start(), region_size);
                 #[cfg(feature = "object_pinning")]
-                if *self.common.options.compressor_pin_objects_fraction > 0.0 {
+                if is_pinning {
                     match VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.as_spec() {
                         MetadataSpec::OnSide(spec) => {
                             spec.bzero_metadata(r.region.start(), region_size)
@@ -267,23 +299,22 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                             panic!("Local pinning bit needs to be in side metadata")
                         }
                     };
-                    // forwarding::PINNED_PAGE_SPEC.bzero_metadata(r.region.start(), region_size);
+                    forwarding::PINNED_PAGE_SPEC.bzero_metadata(r.region.start(), region_size);
                 }
             });
 
         #[cfg(feature = "object_pinning")]
-        assert_eq!(*self.common.options.compressor_pin_pages_fraction, 0.0, "Page pinning is currently disabled in CompressorSpace. Please set compressor_pin_pages_fraction to 0.0.");
-
-        // #[cfg(feature = "object_pinning")]
-        // {
-        //     // Pin a fraction of allocated pages at the start of GC. We will later individually pin random live objects in these pages.
-        //     // TODO(kunals): See pin_random_object for details
-        //     let fraction = *self.common.options.compressor_pin_pages_fraction;
-        //     if fraction > 0.0 {
-        //         let seed = self.gc_count.fetch_add(1, Ordering::Relaxed);
-        //         self.pin_random_pages(fraction, seed);
-        //     }
-        // }
+        {
+            // Pin a fraction of allocated pages at the start of GC. We will later individually pin random live objects in these pages.
+            match self.forwarding.pinning_mode {
+                PinningMode::RandomPagePinning(fraction) => {
+                    if fraction > 0.0 {
+                        self.pin_random_pages(fraction);
+                    }
+                },
+                _ => {},
+            }
+        }
     }
 
     pub fn release(&self) {
@@ -291,35 +322,32 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     /// Randomly select `fraction` of currently-allocated OS pages to pin.
-    /// `seed` makes the selection deterministic for testing.
-    // #[cfg(feature = "object_pinning")]
-    // fn pin_random_pages(&self, fraction: f64, seed: u64) {
-    //     let fraction = fraction.clamp(0.0, 1.0);
-    //     let mut all_pages: Vec<Address> = vec![];
-    //     self.pr
-    //         .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
-    //             let mut page = r.region.start();
-    //             while page < r.cursor() {
-    //                 all_pages.push(page);
-    //                 page += BYTES_IN_PAGE;
-    //             }
-    //         });
-    //     let count = (all_pages.len() as f64 * fraction) as usize;
-    //     // Partial Fisher-Yates shuffle using a seeded xorshift64 PRNG.
-    //     let mut rng = seed + 1; // avoid zero seed
-    //     for i in 0..count {
-    //         rng ^= rng << 13;
-    //         rng ^= rng >> 7;
-    //         rng ^= rng << 17;
-    //         let j = i + (rng as usize % (all_pages.len() - i));
-    //         all_pages.swap(i, j);
-    //     }
+    #[cfg(feature = "object_pinning")]
+    fn pin_random_pages(&self, fraction: f64) {
+        use crate::util::constants::BYTES_IN_PAGE;
 
-    //     // Pin the selected pages. We will later pin random live objects
-    //     for page in &all_pages[..count] {
-    //         forwarding::PINNED_PAGE_SPEC.set_atomic(*page, 1, Ordering::Relaxed);
-    //     }
-    // }
+        let mut total_pages = 0;
+        let mut pages_pinned = 0;
+        let fraction = fraction.clamp(0.0, 1.0);
+        self.pr
+            .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
+                let mut page = r.region.start();
+                while page < r.cursor() {
+                    if rand::random_bool(fraction) {
+                        pages_pinned += 1;
+                        forwarding::PINNED_PAGE_SPEC.store_atomic(page, 1_u8, Ordering::Relaxed);
+                    }
+                    page += BYTES_IN_PAGE;
+                    total_pages += 1;
+                }
+            });
+        info!(
+            "Pinned {}/{} pages ({:.2}%)",
+            pages_pinned,
+            total_pages,
+            (pages_pinned as f64 / total_pages as f64) * 100.0
+        );
+    }
 
     pub fn trace_mark_object<Q: ObjectQueue>(
         &self,
@@ -612,13 +640,14 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
                     );
                 } else {
                     let (intersects_pinned, pinned_object) =
-                        does_new_address_intersect_pinned_objects::<VM>(to_obj.to_raw_address(), VM::VMObjectModel::get_size_when_copied(from_obj));
+                        does_new_address_intersect_pinned_objects::<VM>(
+                            to_obj.to_raw_address(),
+                            VM::VMObjectModel::get_size_when_copied(from_obj),
+                        );
                     debug_assert!(
                         !intersects_pinned,
                         "Moving object {:?} -> {:?} intersects with pinned object {:?}!",
-                        from_obj,
-                        to_obj,
-                        pinned_object,
+                        from_obj, to_obj, pinned_object,
                     );
                 }
             });
