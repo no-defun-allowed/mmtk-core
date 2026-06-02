@@ -35,6 +35,7 @@ pub use mutator_context::MutatorContext;
 mod plan_constraints;
 pub use plan_constraints::PlanConstraints;
 pub(crate) use plan_constraints::DEFAULT_PLAN_CONSTRAINTS;
+pub(crate) use plan_constraints::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
 
 mod tracing;
 pub use tracing::{ObjectQueue, ObjectsClosure, VectorObjectQueue, VectorQueue};
