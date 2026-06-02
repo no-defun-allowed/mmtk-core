@@ -159,6 +159,27 @@ impl Transducer {
             let last_word = address;
             let size = last_word - first_word + BYTES_IN_WORD;
             let region = CompressorRegion::from_unaligned_address(first_word);
+            #[cfg(debug_assertions)]
+            {
+                let first_page = first_word.align_down(BYTES_IN_PAGE);
+                let mut current_page = first_page;
+                let mut spans_pinned = false;
+                while current_page <= last_word {
+                    if is_page_pinned(current_page) {
+                        spans_pinned = true;
+                        break;
+                    }
+                    current_page += BYTES_IN_PAGE;
+                }
+                if spans_pinned {
+                    assert!(
+                        is_object_pinned::<VM>(unsafe {
+                            ObjectReference::from_raw_address_unchecked(first_word)
+                        }),
+                        "Object at {first_word} (size {size}) spans a pinned page {current_page}, but is not pinned!"
+                    );
+                }
+            }
             if !self.in_pinned_object {
                 let mut calculated_offset = false;
                 while !calculated_offset {
@@ -302,7 +323,7 @@ impl Transducer {
                         map.insert(first_word, region.start() + self.offset as usize - size);
                     }
                     info!(
-                        "Move object at 0x{first_word:#x} -> 0x{:#x} (size {size}): {:#x}",
+                        "Move object at {first_word} -> {} (size {size}): {:#x}",
                         region.start() + self.offset as usize - size,
                         self.offset
                     );
@@ -316,6 +337,11 @@ impl Transducer {
                         "Object at {first_word} moved to {} (size {size}) which intersects a pinned page!",
                         region.start() + self.offset as usize - size,
                     );
+                    debug_assert!(
+                        first_word >= region.start() + self.offset as usize - size,
+                        "Object {first_word} moved to {} (size {size}) which is after its original location, potentially overwriting live data!",
+                        region.start() + self.offset as usize - size,
+                    )
                 }
             } else {
                 #[cfg(debug_assertions)]
@@ -529,9 +555,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 // Pin the object with probability of pin_fraction
                 let should_pin = rand::random_bool(fraction);
                 if should_pin {
-                    pin_object::<VM>(object);
+                    while !is_object_pinned::<VM>(object) {
+                        pin_object::<VM>(object);
+                    }
                     info!(
-                        "Pinning object at 0x{:#x} of size {} bytes",
+                        "Pinning object at {} of size {} bytes",
                         object.to_raw_address(),
                         VM::VMObjectModel::get_current_size(object)
                     );
@@ -553,13 +581,22 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     current_page += BYTES_IN_PAGE;
                 }
                 if should_pin {
-                    pin_object::<VM>(object);
+                    while !is_object_pinned::<VM>(object) {
+                        pin_object::<VM>(object);
+                    }
                     info!(
-                        "Pinning object at 0x{:#x} of size {} bytes",
+                        "Pinning object at {} of size {} bytes",
                         object.to_raw_address(),
                         VM::VMObjectModel::get_current_size(object)
                     );
                 }
+                debug_assert!(
+                    !should_pin
+                        || is_object_pinned::<VM>(object),
+                    "Object at {} (size {}) should be pinned if we attempted to pin it!",
+                    object.to_raw_address(),
+                    VM::VMObjectModel::get_current_size(object),
+                );
             }
         }
     }
