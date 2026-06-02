@@ -614,11 +614,18 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             PinningMode::RandomPagePinning(_) => {
                 // Any object that spans a pinned page should be pinned
                 let start_page = object.to_object_start::<VM>().align_down(BYTES_IN_PAGE);
-                let end_page = (object.to_object_start::<VM>()
+                let last_word_of_object = object.to_object_start::<VM>()
                     + VM::VMObjectModel::get_current_size(object)
-                    - BYTES_IN_WORD)
-                    .align_down(BYTES_IN_PAGE);
-                let should_pin = is_page_pinned(start_page) || is_page_pinned(end_page);
+                    - BYTES_IN_WORD;
+                let mut should_pin = false;
+                let mut current_page = start_page;
+                while current_page <= last_word_of_object {
+                    if is_page_pinned(current_page) {
+                        should_pin = true;
+                        break;
+                    }
+                    current_page += BYTES_IN_PAGE;
+                }
                 if should_pin {
                     pin_object::<VM>(object);
                     info!(
