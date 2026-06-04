@@ -881,6 +881,85 @@ mod gc_trigger_tests {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PagePinningMode {
+    /// Clear and re-pin pages every GC.
+    FirstGC,
+    /// Pin pages once per execution, i.e. pin pages at the first GC and keep them pinned for the rest of the execution.
+    EveryGC,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum PinningMode {
+    /// Do not pin anything.
+    NoPinning,
+    /// Pin fraction of random objects while tracing
+    RandomObjectPinning(f64),
+    /// Pin fraction of random pages while tracing
+    RandomPagePinning(PagePinningMode, f64),
+}
+
+impl PinningMode {
+    fn validate(&self) -> bool {
+        match self {
+            PinningMode::NoPinning => true,
+            PinningMode::RandomObjectPinning(fraction) => (0.0..=1.0).contains(fraction),
+            PinningMode::RandomPagePinning(_, fraction) => (0.0..=1.0).contains(fraction),
+        }
+    }
+}
+
+impl FromStr for PinningMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "NoPinning" {
+            return Ok(PinningMode::NoPinning);
+        }
+
+        // We should have '(' and ')' in the string now if it is not the "NoPinning" case
+        let parts: Vec<&str> = s.split(&['(', ')']).collect();
+        if parts.len() != 3 || !parts[2].is_empty() {
+            return Err("Invalid format".to_string());
+        }
+
+        let variant = parts[0];
+        match variant {
+            "RandomObjectPinning" => {
+                let fraction = parts[1]
+                    .parse::<f64>()
+                    .map_err(|_| "Failed to parse fraction".to_string())?;
+                if fraction <= 0.0 || fraction > 1.0 {
+                    return Err("Fraction should be between 0 and 1".to_string());
+                }
+                Ok(PinningMode::RandomObjectPinning(fraction))
+            }
+            "RandomPagePinning" => {
+                let inner_parts: Vec<&str> = parts[1].split(',').collect();
+                if inner_parts.len() != 2 {
+                    return Err("Invalid format for RandomPagePinning".to_string());
+                }
+
+                let page_pinning_mode = match inner_parts[0] {
+                    "FirstGC" => PagePinningMode::FirstGC,
+                    "EveryGC" => PagePinningMode::EveryGC,
+                    _ => return Err("Unknown page pinning mode".to_string()),
+                };
+
+                let fraction = inner_parts[1]
+                    .trim()
+                    .parse::<f64>()
+                    .map_err(|_| "Failed to parse fraction".to_string())?;
+                if fraction <= 0.0 || fraction > 1.0 {
+                    return Err("Fraction should be between 0 and 1".to_string());
+                }
+                Ok(PinningMode::RandomPagePinning(page_pinning_mode, fraction))
+            }
+            _ => Err("Unknown variant".to_string()),
+        }
+    }
+}
+
 options! {
     /// The GC plan to use.
     plan:                   PlanSelector            [always_valid] = PlanSelector::GenImmix,
@@ -993,16 +1072,10 @@ options! {
     /// Enable the use of an algorithm based on carryless multiplication to
     /// compute the offset vector in the Compressor.
     compressor_use_clmul: bool                      [always_valid] = false,
-    /// Fraction of OS pages to randomly pin per GC cycle in the Compressor (0.0–1.0).
-    /// Pinned pages are not compacted; objects within them have their references updated
-    /// in-place but are never moved.  The default of 0.0 disables random pinning.
-    compressor_pin_pages_fraction: f64              [|v: &f64| *v >= 0.0 && *v <= 1.0] = 0.0,
-    /// Fraction of objects to randomly pin per GC cycle in the Compressor (0.0–1.0).
-    /// Pinned objects are not moved. The default of 0.0 disables random pinning. Note that
-    /// this option conflicts with [`Options::compressor_pin_pages_fraction`], and if both are
-    /// set to non-zero values, MMTk will only use [`Options::compressor_pin_pages_fraction`]
-    /// and ignore [`Options::compressor_pin_objects_fraction`].
-    compressor_pin_objects_fraction: f64            [|v: &f64| *v >= 0.0 && *v <= 1.0] = 0.0
+    /// Fraction of either OS pages or objects to randomly pin per GC cycle in the Compressor (0.0–1.0).
+    /// Pinned objects/pages are not compacted; pinned objects have their references updated
+    /// in-place but are never moved. The default of NoPinning disables pinning.
+    compressor_pinning_mode: PinningMode            [always_valid] = PinningMode::NoPinning
 }
 
 #[cfg(test)]

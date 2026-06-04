@@ -9,6 +9,7 @@ use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
 };
 use crate::util::metadata::side_metadata::SideMetadataSpec;
+use crate::util::options::PinningMode;
 use crate::util::{Address, ObjectReference};
 use crate::vm::object_model::ObjectModel;
 use crate::vm::VMBinding;
@@ -32,13 +33,6 @@ pub(super) static COMPUTING_FORWARDING_INFO: AtomicBool = AtomicBool::new(false)
 lazy_static! {
     pub(super) static ref FORWARDING_MAP: Mutex<HashMap<Address, Address>> =
         Mutex::new(HashMap::new());
-}
-
-#[derive(Debug, PartialEq)]
-pub(crate) enum PinningMode {
-    NoPinning,
-    RandomPagePinning(f64),
-    RandomObjectPinning(f64),
 }
 
 /// A [`CompressorRegion`] is the granularity at which [`super::CompressorSpace`]
@@ -569,7 +563,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     );
                 }
             }
-            PinningMode::RandomPagePinning(_) => {
+            PinningMode::RandomPagePinning(..) => {
                 // Any object that spans a pinned page should be pinned
                 let start_page = object.to_object_start::<VM>().align_down(BYTES_IN_PAGE);
                 let last_word_of_object = object.to_object_start::<VM>()

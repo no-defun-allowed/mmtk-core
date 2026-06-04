@@ -333,7 +333,9 @@ impl<VM: VMBinding> MMTK<VM> {
     /// This is usually called by the benchmark harness as its last step before the actual benchmark.
     pub fn harness_begin(&self, tls: VMMutatorThread) {
         probe!(mmtk, harness_begin);
+        self.state.is_harness_begin_gc.store(true, Ordering::SeqCst);
         self.handle_user_collection_request(tls, true, true);
+        self.state.is_harness_begin_gc.store(false, Ordering::SeqCst);
         self.state.inside_harness.store(true, Ordering::SeqCst);
         self.stats.start_all();
         self.scheduler.enable_stat();

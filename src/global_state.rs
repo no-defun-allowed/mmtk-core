@@ -44,6 +44,8 @@ pub struct GlobalState {
     pub(crate) allocation_bytes: AtomicUsize,
     /// Are we inside the benchmark harness?
     pub(crate) inside_harness: AtomicBool,
+    /// Is this GC the harness begin GC?
+    pub(crate) is_harness_begin_gc: AtomicBool,
     /// A counteer that keeps tracks of the number of bytes allocated by malloc
     #[cfg(feature = "malloc_counted_size")]
     pub(crate) malloc_bytes: AtomicUsize,
@@ -214,6 +216,7 @@ impl Default for GlobalState {
             scanned_stacks: AtomicUsize::new(0),
             allocation_bytes: AtomicUsize::new(0),
             inside_harness: AtomicBool::new(false),
+            is_harness_begin_gc: AtomicBool::new(false),
             #[cfg(feature = "malloc_counted_size")]
             malloc_bytes: AtomicUsize::new(0),
             live_bytes_in_last_gc: AtomicRefCell::new(HashMap::new()),

@@ -1,6 +1,5 @@
 use crate::plan::VectorObjectQueue;
 use crate::policy::compressor::forwarding;
-use crate::policy::compressor::forwarding::PinningMode;
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::one_pass::locking;
 use crate::policy::sft::GCWorkerMutRef;
@@ -17,6 +16,7 @@ use crate::util::metadata::extract_side_metadata;
 use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::ObjectEnumerator;
+use crate::util::options::PinningMode;
 use crate::util::statistics::counter::EventCounter;
 use crate::util::statistics::stats::Stats;
 use crate::util::{Address, ObjectReference};
