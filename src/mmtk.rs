@@ -335,7 +335,9 @@ impl<VM: VMBinding> MMTK<VM> {
         probe!(mmtk, harness_begin);
         self.state.is_harness_begin_gc.store(true, Ordering::SeqCst);
         self.handle_user_collection_request(tls, true, true);
-        self.state.is_harness_begin_gc.store(false, Ordering::SeqCst);
+        self.state
+            .is_harness_begin_gc
+            .store(false, Ordering::SeqCst);
         self.state.inside_harness.store(true, Ordering::SeqCst);
         self.stats.start_all();
         self.scheduler.enable_stat();
