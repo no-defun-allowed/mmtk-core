@@ -3,7 +3,8 @@ use crate::policy::compressor::forwarding;
 use crate::policy::compressor::forwarding::PinningMode;
 #[cfg(debug_assertions)]
 use crate::policy::compressor::forwarding::{
-    COMPUTING_FORWARDING_INFO, FORWARDING_MAP, does_new_address_intersect_pinned_objects, is_page_pinned
+    does_new_address_intersect_pinned_objects, is_page_pinned, COMPUTING_FORWARDING_INFO,
+    FORWARDING_MAP,
 };
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::sft::{GCWorkerMutRef, SFT};

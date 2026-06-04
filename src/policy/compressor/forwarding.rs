@@ -199,7 +199,7 @@ impl Transducer {
                             pinned_object_mut.unwrap().to_object_start::<VM>()
                                 + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
                         while intersects_pinned_mut {
-                            info!(
+                            debug!(
                                 "Object at 0x{first_word:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
                                 pinned_object_mut.unwrap().to_raw_address(), potential_forwarding_address);
                             let (intersects_pinned, pinned_object) =
@@ -210,10 +210,11 @@ impl Transducer {
                             intersects_pinned_mut = intersects_pinned;
                             pinned_object_mut = pinned_object;
                             if intersects_pinned_mut {
-                                potential_forwarding_address = pinned_object_mut
-                                    .unwrap()
-                                    .to_object_start::<VM>()
-                                    + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
+                                potential_forwarding_address =
+                                    pinned_object_mut.unwrap().to_object_start::<VM>()
+                                        + VM::VMObjectModel::get_current_size(
+                                            pinned_object_mut.unwrap(),
+                                        );
                             }
                         }
                         let offset = potential_forwarding_address - region.start();
@@ -228,10 +229,11 @@ impl Transducer {
                         self.offset = offset as Offset;
                     }
 
-                    let (intersects_pinned_page, pinned_page) = does_new_address_intersect_pinned_pages(
-                        region.start() + self.offset as usize,
-                        size,
-                    );
+                    let (intersects_pinned_page, pinned_page) =
+                        does_new_address_intersect_pinned_pages(
+                            region.start() + self.offset as usize,
+                            size,
+                        );
                     if intersects_pinned_page {
                         use crate::plan::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
                         use crate::util::metadata::MetadataSpec;
@@ -239,10 +241,11 @@ impl Transducer {
                         calculated_offset = false;
                         let mut pinned_page_mut = pinned_page;
                         let mut intersects_pinned_page_mut = true;
-                        let mut potential_forwarding_address = pinned_page_mut.unwrap() + BYTES_IN_PAGE;
+                        let mut potential_forwarding_address =
+                            pinned_page_mut.unwrap() + BYTES_IN_PAGE;
 
                         while intersects_pinned_page_mut {
-                            info!(
+                            debug!(
                                 "Object at {first_word} of size {size} intersects with pinned page at {} after moving. We will skip to the end of the pinned page at {}",
                                 pinned_page_mut.unwrap(), potential_forwarding_address);
                             let (intersects_pinned_page, pinned_page) =
@@ -253,7 +256,8 @@ impl Transducer {
                             intersects_pinned_page_mut = intersects_pinned_page;
                             pinned_page_mut = pinned_page;
                             if intersects_pinned_page_mut {
-                                potential_forwarding_address = pinned_page_mut.unwrap() + BYTES_IN_PAGE;
+                                potential_forwarding_address =
+                                    pinned_page_mut.unwrap() + BYTES_IN_PAGE;
                             }
                         }
 
@@ -558,7 +562,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     while !is_object_pinned::<VM>(object) {
                         pin_object::<VM>(object);
                     }
-                    info!(
+                    debug!(
                         "Pinning object at {} of size {} bytes",
                         object.to_raw_address(),
                         VM::VMObjectModel::get_current_size(object)
@@ -584,15 +588,14 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     while !is_object_pinned::<VM>(object) {
                         pin_object::<VM>(object);
                     }
-                    info!(
+                    debug!(
                         "Pinning object at {} of size {} bytes",
                         object.to_raw_address(),
                         VM::VMObjectModel::get_current_size(object)
                     );
                 }
                 debug_assert!(
-                    !should_pin
-                        || is_object_pinned::<VM>(object),
+                    !should_pin || is_object_pinned::<VM>(object),
                     "Object at {} (size {}) should be pinned if we attempted to pin it!",
                     object.to_raw_address(),
                     VM::VMObjectModel::get_current_size(object),
@@ -734,7 +737,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     state.encode(block.start()),
                     Ordering::Relaxed,
                 );
-                info!(
+                trace!(
                     "Offset vector for block {}: {:#x}, in_object: {}, in_pinned_object: {}, last_bit_visited: {}",
                     block.start(), state.offset, state.in_object, state.in_pinned_object, state.last_bit_visited);
                 MARK_SPEC.scan_non_zero_values::<u8>(
@@ -761,7 +764,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     // },
                 );
             }
-            info!("Finished calculating offset vector for region {}: {:#x}\n", region.start(), state.offset);
+            trace!("Finished calculating offset vector for region {}: {:#x}\n", region.start(), state.offset);
             state.offset
         }
     }}
@@ -889,7 +892,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                         pinned_object_mut.unwrap().to_object_start::<VM>()
                             + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
                     while intersects_pinned_mut {
-                        info!(
+                        debug!(
                             "Forwarding: object at 0x{address:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
                             pinned_object_mut.unwrap().to_raw_address(), potential_forwarding_address);
                         let (intersects_pinned, pinned_object) =
@@ -932,7 +935,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     let mut potential_forwarding_address = pinned_page_mut.unwrap() + BYTES_IN_PAGE;
 
                     while intersects_pinned_page_mut {
-                        info!(
+                        debug!(
                             "Forwarding: object at {address} of size {size} intersects with pinned page at {} after moving. We will skip to the end of the pinned page at {}",
                             pinned_page_mut.unwrap(), potential_forwarding_address);
                         let (intersects_pinned_page, pinned_page) =
@@ -995,7 +998,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 }
             }
 
-            info!("Forwarding object at 0x{address:#x} -> 0x{:#x} (size {size}): {:#x}\n", region.start() + state.offset as usize, state.offset);
+            debug!("Forwarding object at 0x{address:#x} -> 0x{:#x} (size {size}): {:#x}\n", region.start() + state.offset as usize, state.offset);
             #[cfg(debug_assertions)]
             {
                 let map = FORWARDING_MAP.lock().unwrap();
