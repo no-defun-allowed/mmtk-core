@@ -283,8 +283,9 @@ impl Transducer {
                                     let last_pinned_object_end = last_pinned_object
                                         .to_object_start::<VM>()
                                         + VM::VMObjectModel::get_current_size(last_pinned_object);
-                                    // TODO(kunals): Very interesting edge case. Object > 4096. The second page is pinned. The first page is unpinned.
-                                    // We skip to the second page, but find that the second page is pinned so we can't use it!
+                                    // XXX(kunals): Very interesting edge case. Object > 4096. The second page is pinned. The first page is unpinned.
+                                    // We skip to the second page, but find that the second page is pinned so we can't use it! Hence why we have a loop
+                                    // to ensure that we don't accidentally end up intersecting a pinned page/object again.
                                     if last_pinned_object_end > potential_forwarding_address {
                                         // The last pinned object extends beyond the end of the pinned page, so we need to skip to the end of the pinned object instead of the end of the pinned page
                                         info!(
