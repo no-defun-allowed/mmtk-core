@@ -2,15 +2,15 @@ use crate::plan::VectorObjectQueue;
 use crate::policy::compressor::forwarding;
 #[cfg(debug_assertions)]
 use crate::policy::compressor::forwarding::{
-    does_new_address_intersect_pinned_objects, is_page_pinned, COMPUTING_FORWARDING_INFO,
-    FORWARDING_MAP,
+    does_new_address_intersect_pinned_objects, does_new_address_intersect_pinned_pages,
+    COMPUTING_FORWARDING_INFO, FORWARDING_MAP,
 };
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
 use crate::scheduler::{GCWork, GCWorkScheduler, GCWorker, WorkBucketStage};
 #[cfg(debug_assertions)]
-use crate::util::constants::{BYTES_IN_PAGE, BYTES_IN_WORD};
+use crate::util::constants::BYTES_IN_WORD;
 use crate::util::copy::CopySemantics;
 use crate::util::heap::regionpageresource::AllocatedRegion;
 use crate::util::heap::{PageResource, RegionPageResource};
@@ -555,16 +555,13 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
                         debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
                         let new_object = self.forward::<CAN_CLMUL>(obj, false);
-                        // debug_assert!(
-                        //     new_object.to_raw_address() >= to,
-                        //     "whilst forwarding {obj}, the new address {0} should be after the end of the last object {to}",
-                        //     new_object.to_raw_address()
-                        // );
+                        assert!(
+                            obj.to_object_start::<VM>() >= new_object.to_object_start::<VM>(),
+                            "Object {obj} was forwarded to {new_object} which is after it, potentially overwriting data!",
+                        );
                         #[cfg(debug_assertions)]
                         {
                             if !self.is_pinned(obj) {
-                                use crate::policy::compressor::forwarding::does_new_address_intersect_pinned_pages;
-
                                 let (intersects_pinned, pinned_object) = does_new_address_intersect_pinned_objects::<VM>(new_object.to_raw_address(), copied_size);
                                 debug_assert!(
                                     !intersects_pinned,
@@ -591,11 +588,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         #[cfg(feature = "vo_bit")]
                         vo_bit::set_vo_bit(new_object);
                         to = to.max(new_object.to_object_start::<VM>() + copied_size);
-                        assert!(
-                            obj.to_object_start::<VM>() >= new_object.to_object_start::<VM>(),
-                            "Object {obj} was forwarded to {new_object} which is after it, potentially overwriting data!",
-                        );
-                        // debug_assert_eq!(end_of_new_object, to);
                         self.update_references::<CAN_CLMUL>(worker, new_object);
                     });
                 debug_assert!(to <= r.cursor());
@@ -652,10 +644,11 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
                         from_obj, to_obj
                     );
                 } else {
+                    let size = VM::VMObjectModel::get_size_when_copied(from_obj);
                     let (intersects_pinned, pinned_object) =
                         does_new_address_intersect_pinned_objects::<VM>(
                             to_obj.to_raw_address(),
-                            VM::VMObjectModel::get_size_when_copied(from_obj),
+                            size,
                         );
                     debug_assert!(
                         !intersects_pinned,
@@ -665,26 +658,27 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
                     if let PinningMode::RandomPagePinning(..) = self.compressor_space.forwarding.pinning_mode {
                         let to_obj_start = to_obj.to_object_start::<VM>();
                         let to_obj_end = to_obj_start
-                            + VM::VMObjectModel::get_size_when_copied(from_obj)
+                            + size
                             - BYTES_IN_WORD;
-                        let to_obj_start_page = to_obj_start.align_down(BYTES_IN_PAGE);
-                        let to_obj_end_page = to_obj_end.align_down(BYTES_IN_PAGE);
+                        let (intersects_pinned_page, pinned_page) =
+                             does_new_address_intersect_pinned_pages(from_obj.to_object_start::<VM>(), size);
                         debug_assert!(
-                            !is_page_pinned(to_obj_start_page),
-                            "Object {:?} is forwarded to [{}, {}), which intersects with pinned page {}!",
-                            from_obj, to_obj_start, to_obj_end, to_obj_start_page,
+                            !intersects_pinned_page,
+                            "Object {:?} (size {}) intersects pinned page {} but was not pinned!",
+                            from_obj, size, pinned_page.unwrap(),
                         );
+                        let (intersects_pinned_page, pinned_page) =
+                             does_new_address_intersect_pinned_pages(to_obj_start, size);
                         debug_assert!(
-                            !is_page_pinned(to_obj_end_page),
+                            !intersects_pinned_page,
                             "Object {:?} is forwarded to [{}, {}), which intersects with pinned page {}!",
-                            from_obj, to_obj_start, to_obj_end, to_obj_end_page,
+                            from_obj, to_obj_start, to_obj_end, pinned_page.unwrap(),
                         );
                     }
                 }
             });
         }
 
-        #[cfg(debug_assertions)]
         COMPUTING_FORWARDING_INFO.store(false, Ordering::SeqCst);
     }
 }
