@@ -302,9 +302,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             // Pin a fraction of allocated pages at the start of GC. We will later individually pin live objects in these pages.
             if needs_page_pinning {
                 match self.forwarding.pinning_mode {
-                    PinningMode::RandomPagePinning(_, fraction) => {
+                    PinningMode::RandomPagePinning(page_pinning_mode, fraction) => {
                         if fraction > 0.0 {
-                            self.pin_random_pages(fraction);
+                            let pin_till_end = page_pinning_mode == PagePinningMode::FirstGC;
+                            self.pin_random_pages(fraction, pin_till_end);
                         }
                     }
                     _ => {
@@ -321,7 +322,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 
     /// Randomly select `fraction` of currently-allocated OS pages to pin.
     #[cfg(feature = "object_pinning")]
-    fn pin_random_pages(&self, fraction: f64) {
+    fn pin_random_pages(&self, fraction: f64, pin_till_end: bool) {
         use crate::util::constants::BYTES_IN_PAGE;
 
         let mut total_pages = 0;
@@ -330,7 +331,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let mut page = r.region.start();
-                while page < r.cursor() {
+                let end = if pin_till_end {
+                    r.region.end()
+                } else {
+                    r.cursor()
+                };
+                while page < end {
                     if rand::random_bool(fraction) {
                         pages_pinned += 1;
                         forwarding::PINNED_PAGE_SPEC.store_atomic(page, 1_u8, Ordering::Relaxed);
