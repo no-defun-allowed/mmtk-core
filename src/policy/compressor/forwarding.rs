@@ -127,6 +127,9 @@ struct Transducer {
     /// Whether or not the transducer is currently inside an object
     /// (i.e. if it has seen a first bit but no matching last bit yet).
     in_object: bool,
+    /// Whether or not the transducer is currently inside a pinned object
+    /// or not. We use this to skip over pinned objects when calculating the
+    /// offset-vector or forwarding addresses
     #[cfg(feature = "object_pinning")]
     in_pinned_object: bool,
 }
@@ -382,15 +385,20 @@ impl Transducer {
 
     pub fn encode(&self, _current_position: Address) -> Offset {
         if self.in_object {
-            // We count the space between the last mark bit and
-            // the current address as live when we stop in the
-            // middle of an object.
-            use crate::util::constants::MIN_OBJECT_SIZE;
+            // We don't count the space between the last mark bit and the
+            // current address as live when we stop in the middle of an object.
+            // Instead, we expect the `forward_base` algorithm to use the
+            // mark-bits to go back to find the original address. This is
+            // required because the forwarding/offset-vector calculation
+            // algorithm assumes we have valid object starts.
+            // TODO(kunals): We could, instead, store the offset of the last
+            // mark-bit _from_ the block start and use that to calculate the
+            // starting address. This avoids scanning backwards in the metadata
             debug_assert!(crate::util::conversions::raw_is_aligned(
                 self.offset as usize,
-                MIN_OBJECT_SIZE
+                crate::util::constants::MIN_OBJECT_SIZE
             ));
-            debug_assert!(self.offset & 0b10 == 0, "The offset should have at least 2 free bits for encoding the in_object and in_pinned_object flags.");
+            debug_assert!(self.offset & 0b11 == 0, "The offset should have at least 2 free bits for encoding the in_object and in_pinned_object flags.");
             #[allow(unused_mut)]
             let mut offset = self.offset + 1;
             #[cfg(feature = "object_pinning")]
@@ -741,22 +749,6 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     &mut |addr: Address| {
                         state.visit_mark_bit::<VM>(addr);
                     },
-                    // &mut |addr: Address| {
-                    //     if !state.in_object {
-                    //         // SAFETY: If we're currently not within an object, we have just found the starting mark-bit
-                    //         // of the next live object. Hence, the address is a valid ObjectReference.
-                    //         let object = unsafe { ObjectReference::from_raw_address_unchecked(addr) };
-                    //         if is_object_pinned::<VM>(object) {
-                    //             // We treat pinned objects as taking up no space in the offset vector calculation,
-                    //             // so that they don't affect the forwarding addresses of other objects. We still
-                    //             // need to visit the mark bits of pinned objects, in order to update the state of
-                    //             // the transducer correctly for subsequent live objects in the same region.
-                    //             state.visit_mark_bit::<VM>(addr);
-                    //         }
-                    //     } else {
-                    //         state.visit_mark_bit::<VM>(addr);
-                    //     }
-                    // },
                 );
             }
             trace!("Finished calculating offset vector for region {}: {:#x}\n", region.start(), state.offset);
