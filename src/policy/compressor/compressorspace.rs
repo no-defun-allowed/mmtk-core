@@ -526,7 +526,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.pr.with_regions(&mut |regions| {
             let r = &regions[index];
             let start = r.region.start();
-            info!("\nCompacting region {}", start);
+            debug!("\nCompacting region {}", start);
             let end = r.cursor();
             #[cfg(feature = "vo_bit")]
             {
@@ -602,7 +602,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     pub fn update_slots<const CAN_CLMUL: bool>(&self, slots: &[VM::VMSlot]) {
-        info!("\nUpdating {} slots in remset", slots.len());
+        debug!("\nUpdating {} slots in remset", slots.len());
         for s in slots {
             if let Some(o) = s.load() {
                 trace!("Forwarding {o} -> {}", self.forward::<false>(o, false));

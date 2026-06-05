@@ -324,7 +324,7 @@ impl Transducer {
                     } else {
                         map.insert(first_word, region.start() + self.offset as usize - size);
                     }
-                    info!(
+                    debug!(
                         "Move object at {first_word} -> {} (size {size}): {:#x}",
                         region.start() + self.offset as usize - size,
                         self.offset
@@ -348,7 +348,7 @@ impl Transducer {
             } else {
                 #[cfg(debug_assertions)]
                 if COMPUTING_FORWARDING_INFO.load(Ordering::SeqCst) {
-                    info!("Skip pinned object at 0x{first_word:#x} -> 0x{first_word:#x} (size {size}): {:#x}", self.offset);
+                    debug!("Skip pinned object at 0x{first_word:#x} -> 0x{first_word:#x} (size {size}): {:#x}", self.offset);
                     let mut map = FORWARDING_MAP.lock().unwrap();
                     if map.contains_key(&first_word) {
                         debug_assert_eq!(
