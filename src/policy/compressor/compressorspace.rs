@@ -542,6 +542,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             }
             let mut to = r.region.start();
             let mut objects = 0;
+            let mut total_live_bytes = 0;
+            let mut total_copied_bytes = 0;
             if self.forwarding.is_forwarding_region(r.region) {
                 #[cfg(feature = "vo_bit")]
                 crate::util::metadata::vo_bit::bzero_vo_bit(start, end - start);
@@ -582,8 +584,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         }
                         // copy object
                         trace!("copy from {} to {}", obj, new_object);
-                        let _end_of_new_object =
+                        if obj != new_object {
                             VM::VMObjectModel::copy_to(obj, new_object, Address::ZERO);
+                            total_copied_bytes += copied_size;
+                        }
+                        total_live_bytes += copied_size;
                         // update VO bit
                         #[cfg(feature = "vo_bit")]
                         vo_bit::set_vo_bit(new_object);
@@ -591,7 +596,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         self.update_references::<CAN_CLMUL>(worker, new_object);
                     });
                 debug_assert!(to <= r.cursor());
-                info!("Compacted region [{}, {}) -> {to} with {objects} objects", r.region.start(), r.cursor());
+                info!(
+                    "Compacted region [{}, {}) -> {to} with {objects} objects; saved {} bytes (copied {} bytes; live {} bytes)",
+                    r.region.start(), r.cursor(), r.cursor() - to, total_copied_bytes, total_live_bytes,
+                );
                 self.pr.reset_cursor(r, to);
             } else {
                 self.forwarding.scan_marked_objects(start, end, &mut |obj: ObjectReference| {
