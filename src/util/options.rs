@@ -883,10 +883,12 @@ mod gc_trigger_tests {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum PagePinningMode {
-    /// Clear and re-pin pages every GC.
-    FirstGC,
     /// Pin pages once per execution, i.e. pin pages at the first GC and keep them pinned for the rest of the execution.
+    FirstGC,
+    /// Clear and re-pin pages every GC.
     EveryGC,
+    /// Cache the pinned pages for the rest of the execution, but clear and re-pin pages every GC. This is primarily for debugging.
+    CachedEveryGC,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -943,6 +945,7 @@ impl FromStr for PinningMode {
                 let page_pinning_mode = match inner_parts[0] {
                     "FirstGC" => PagePinningMode::FirstGC,
                     "EveryGC" => PagePinningMode::EveryGC,
+                    "CachedEveryGC" => PagePinningMode::CachedEveryGC,
                     _ => return Err("Unknown page pinning mode".to_string()),
                 };
 
