@@ -9,6 +9,8 @@ use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
 use crate::scheduler::{GCWork, GCWorkScheduler, GCWorker, WorkBucketStage};
+#[cfg(feature = "object_pinning")]
+use crate::util::constants::BYTES_IN_PAGE;
 #[cfg(debug_assertions)]
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::copy::CopySemantics;
@@ -27,9 +29,9 @@ use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
 use atomic::Ordering;
 #[cfg(feature = "object_pinning")]
-use portable_atomic::AtomicBool;
-#[cfg(feature = "object_pinning")]
 use std::collections::HashSet;
+#[cfg(feature = "object_pinning")]
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 #[cfg(feature = "object_pinning")]
 use std::sync::RwLock;
@@ -39,6 +41,8 @@ pub(crate) const TRACE_KIND_FORWARD: TraceKind = 1;
 
 #[cfg(feature = "object_pinning")]
 static CACHED_PINNED_PAGES: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "object_pinning")]
+static NUM_GCS: AtomicU32 = AtomicU32::new(0);
 
 /// [`CompressorSpace`] is a stop-the-world implementation of
 /// the Compressor, as described in Kermany and Petrank,
@@ -272,6 +276,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 
     pub fn prepare(&self) {
         #[cfg(feature = "object_pinning")]
+        NUM_GCS.fetch_add(1, Ordering::Relaxed);
+
+        #[cfg(feature = "object_pinning")]
         let is_pinning = match self.forwarding.pinning_mode {
             PinningMode::NoPinning => false,
             _ => true,
@@ -294,21 +301,21 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             ));
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
-                let region_size = r.region.end() - r.region.start();
-                forwarding::MARK_SPEC.bzero_metadata(r.region.start(), region_size);
+                forwarding::MARK_SPEC
+                    .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
                 #[cfg(feature = "object_pinning")]
                 if is_pinning {
                     match VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.as_spec() {
-                        MetadataSpec::OnSide(spec) => {
-                            spec.bzero_metadata(r.region.start(), region_size)
-                        }
+                        MetadataSpec::OnSide(spec) => spec
+                            .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES),
                         MetadataSpec::InHeader(_) => {
                             panic!("Local pinning bit needs to be in side metadata")
                         }
                     };
                     // Reset the pinned page metadata if we have to pin pages this GC.
                     if needs_page_pinning {
-                        forwarding::PINNED_PAGE_SPEC.bzero_metadata(r.region.start(), region_size);
+                        forwarding::PINNED_PAGE_SPEC
+                            .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
                     }
                 }
             });
@@ -332,13 +339,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 if fraction > 0.0 {
                     // Cache pinned pages in the harness begin GC. We pin pages till the
                     // end of the region
-                    if self
-                        .common()
-                        .global_state
-                        .is_harness_begin_gc
-                        .load(Ordering::Relaxed)
-                    {
-                        self.pin_random_pages(fraction, true, true);
+                    if NUM_GCS.load(Ordering::Relaxed) == 3 {
+                        self.pin_random_pages(fraction, false, true);
                         CACHED_PINNED_PAGES.store(true, Ordering::Relaxed);
                     }
 
@@ -363,11 +365,13 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     /// Randomly select `fraction` of currently-allocated OS pages to pin.
     #[cfg(feature = "object_pinning")]
     fn pin_random_pages(&self, fraction: f64, pin_till_end: bool, need_to_cache: bool) {
-        use crate::util::constants::BYTES_IN_PAGE;
+        use rand::Rng;
+        use rand::SeedableRng;
 
         let mut total_pages = 0;
         let mut pages_pinned = 0;
         let fraction = fraction.clamp(0.0, 1.0);
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42_u64);
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let mut page = r.region.start();
@@ -377,14 +381,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     r.cursor()
                 };
                 while page < end {
-                    if rand::random_bool(fraction) {
+                    if rng.random_bool(fraction) {
                         pages_pinned += 1;
                         if !need_to_cache {
-                            forwarding::PINNED_PAGE_SPEC.store_atomic(
-                                page,
-                                1_u8,
-                                Ordering::Relaxed,
-                            );
+                            forwarding::PINNED_PAGE_SPEC.store_atomic(page, 1_u8, Ordering::SeqCst);
                         } else {
                             self.cached_pinned_pages.write().unwrap().insert(page);
                         }
@@ -405,10 +405,19 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     /// Pin the pages in `cached_pinned_pages`. Only called when using [`PagePinningMode::CachedEveryGC`].
     #[cfg(feature = "object_pinning")]
     fn pin_cached_pages(&self) {
-        for page in self.cached_pinned_pages.read().unwrap().iter() {
-            forwarding::PINNED_PAGE_SPEC.store_atomic(*page, 1_u8, Ordering::Relaxed);
-            info!("Pinning cached page {}", page);
-        }
+        self.pr
+            .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
+                let mut page = r.region.start();
+                let end = r.cursor();
+                let cached_pinned_pages = self.cached_pinned_pages.read().unwrap();
+                while page < end {
+                    if cached_pinned_pages.contains(&page) {
+                        forwarding::PINNED_PAGE_SPEC.store_atomic(page, 1_u8, Ordering::SeqCst);
+                        info!("Pinning cached page {}", page);
+                    }
+                    page += BYTES_IN_PAGE;
+                }
+            });
     }
 
     pub fn trace_mark_object<Q: ObjectQueue>(
