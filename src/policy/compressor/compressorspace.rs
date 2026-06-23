@@ -395,7 +395,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 }
             });
         info!(
-            "Pinned {}/{} pages ({:.2}%) + {} KB",
+            "Pinned {}/{} pages ({:.2}%) = {} KB",
             pages_pinned,
             total_pages,
             (pages_pinned as f64 / total_pages as f64) * 100.0,
