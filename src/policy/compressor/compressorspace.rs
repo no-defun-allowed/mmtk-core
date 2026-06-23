@@ -1,18 +1,26 @@
 use crate::plan::VectorObjectQueue;
+#[cfg(feature = "object_pinning")]
 use crate::policy::compressor::forwarding;
-#[cfg(debug_assertions)]
+#[cfg(feature = "object_pinning")]
+use crate::policy::compressor::forwarding::does_new_address_intersect_pinned_pages;
+#[cfg(all(feature = "object_pinning", debug_assertions))]
+use crate::policy::compressor::forwarding::is_page_pinned;
+#[cfg(all(feature = "object_pinning", debug_assertions))]
 use crate::policy::compressor::forwarding::{
-    does_new_address_intersect_pinned_objects, does_new_address_intersect_pinned_pages,
-    COMPUTING_FORWARDING_INFO, FORWARDING_MAP,
+    does_new_address_intersect_pinned_objects, COMPUTING_FORWARDING_INFO, FORWARDING_MAP,
 };
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
+#[cfg(feature = "object_pinning")]
+use crate::scheduler::gc_work::ScanObjects;
+use crate::scheduler::GCWorkContext;
 use crate::scheduler::{GCWork, GCWorkScheduler, GCWorker, WorkBucketStage};
 #[cfg(feature = "object_pinning")]
 use crate::util::constants::BYTES_IN_PAGE;
 #[cfg(debug_assertions)]
 use crate::util::constants::BYTES_IN_WORD;
+use crate::util::conversions::raw_is_aligned;
 use crate::util::copy::CopySemantics;
 use crate::util::heap::regionpageresource::AllocatedRegion;
 use crate::util::heap::{PageResource, RegionPageResource};
@@ -23,7 +31,9 @@ use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::ObjectEnumerator;
 use crate::util::options::{PagePinningMode, PinningMode};
-use crate::util::{Address, ObjectReference};
+#[cfg(all(feature = "object_pinning", debug_assertions))]
+use crate::util::os::OSMemory;
+use crate::util::{Address, ObjectReference, VMThread, VMWorkerThread};
 use crate::vm::slot::Slot;
 use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
@@ -274,7 +284,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         }
     }
 
-    pub fn prepare(&self) {
+    pub fn prepare<Context: GCWorkContext<VM = VM>>(&self) {
         #[cfg(feature = "object_pinning")]
         NUM_GCS.fetch_add(1, Ordering::Relaxed);
 
@@ -321,15 +331,160 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             });
 
         #[cfg(feature = "object_pinning")]
-        // Pin a fraction of allocated pages at the start of GC. We will
-        // individually pin live objects in these pages later.
-        if needs_page_pinning {
-            self.pin_pages();
+        {
+            // Pin a fraction of allocated pages at the start of GC. We will
+            // individually pin live objects in these pages later.
+            if needs_page_pinning {
+                self.pin_pages();
+                self.add_scan_pinned_pages_tasks::<Context>();
+            }
+
+            #[cfg(debug_assertions)]
+            {
+                let pinning_pages = matches!(
+                    self.forwarding.pinning_mode,
+                    PinningMode::RandomPagePinning(PagePinningMode::CachedEveryGC, _)
+                ) || matches!(
+                    self.forwarding.pinning_mode,
+                    PinningMode::RandomPagePinning(PagePinningMode::FirstGC, _)
+                );
+                if pinning_pages {
+                    let mut total_pages = 0;
+                    let mut pages_pinned = 0;
+                    self.pr.enumerate_regions(&mut |r: &AllocatedRegion<
+                        forwarding::CompressorRegion,
+                    >| {
+                        let mut page = r.region.start();
+                        let end = r.cursor();
+                        while page < end {
+                            use crate::policy::compressor::forwarding::is_page_pinned;
+                            if is_page_pinned(page) {
+                                pages_pinned += 1;
+                            }
+                            page += BYTES_IN_PAGE;
+                            total_pages += 1;
+                        }
+                    });
+                    if pages_pinned > 0 {
+                        println!(
+                            "Actually have pinned {}/{} pages ({:.2}%) = {} KB",
+                            pages_pinned,
+                            total_pages,
+                            (pages_pinned as f64 / total_pages as f64) * 100.0,
+                            pages_pinned * BYTES_IN_PAGE / 1024
+                        );
+                    }
+                }
+            }
         }
+    }
+
+    #[cfg(all(feature = "object_pinning", debug_assertions))]
+    fn protect_pinned_pages(&self, read_write: bool) {
+        let access = if read_write {
+            crate::util::os::MmapProtection::ReadWrite
+        } else {
+            crate::util::os::MmapProtection::NoAccess
+        };
+
+        self.pr
+            .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
+                let mut page = r.region.start();
+                let end = r.region.end();
+                while page < end {
+                    if is_page_pinned(page) {
+                        crate::util::os::OS::set_memory_access(page, BYTES_IN_PAGE, access)
+                            .unwrap();
+                    }
+                    page += BYTES_IN_PAGE;
+                }
+            });
+    }
+
+    fn add_scan_pinned_pages_tasks<Context: GCWorkContext<VM = VM>>(&self) {
+        // SAFETY: CompressorSpace reference is always valid within this collection cycle.
+        let space = unsafe { &*(self as *const Self) };
+        let mut packets = vec![];
+        self.pr
+            .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
+                packets.push(Box::new(ScanPinnedPages::<VM, Context>::new(
+                    space,
+                    r.region,
+                    r.cursor(),
+                )) as Box<dyn GCWork<VM>>);
+            });
+        self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace].bulk_add(packets);
+        #[cfg(debug_assertions)]
+        self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace]
+            .set_sentinel(Box::new(ProtectPinnedPages::new(space)));
+    }
+
+    fn scan_pinned_pages(
+        &self,
+        region: forwarding::CompressorRegion,
+        cursor: Address,
+    ) -> Vec<ObjectReference> {
+        let start = region.start();
+        let mut curr = start;
+        let end = cursor;
+        let mut pinned_objects = vec![];
+        while curr < end {
+            // SAFETY: No one will modify the VO-bits when we are scanning pinned pages
+            if unsafe { vo_bit::is_vo_addr(curr) } {
+                // SAFETY: This address is a valid object
+                let obj = unsafe { ObjectReference::from_raw_address_unchecked(curr) };
+                let obj_size = VM::VMObjectModel::get_current_size(obj);
+                let (intersects_pinned_page, _) =
+                    does_new_address_intersect_pinned_pages(curr, obj_size);
+
+                if intersects_pinned_page {
+                    // This object is on a pinned page, so we pin it.
+                    while !forwarding::is_object_pinned::<VM>(obj) {
+                        forwarding::pin_object::<VM>(obj);
+                    }
+
+                    // Mark the pinned object as live.
+                    if CompressorSpace::<VM>::test_and_mark(obj) {
+                        // Mark the end of the object
+                        self.forwarding.mark_rest_of_object(obj);
+                        let mut closure = |slot: VM::VMSlot| {
+                            let Some(object) = slot.load() else { return };
+                            // Pin directly reachable objects
+                            // TODO(kunals): Do we need to pin objects reachable through weak references?
+                            while !forwarding::is_object_pinned::<VM>(object) {
+                                forwarding::pin_object::<VM>(object);
+                                debug!(
+                                    "Pinning reachable object at {:?} of size {} bytes",
+                                    object.to_raw_address(),
+                                    VM::VMObjectModel::get_current_size(object),
+                                );
+                            }
+                        };
+                        VM::VMScanning::scan_object(
+                            VMWorkerThread(VMThread::UNINITIALIZED),
+                            obj,
+                            &mut closure,
+                        );
+                    }
+
+                    pinned_objects.push(obj);
+                }
+
+                // Skip to end of object
+                curr += obj_size;
+                debug_assert!(raw_is_aligned(curr.as_usize(), VM::MIN_ALIGNMENT));
+            } else {
+                curr += VM::MIN_ALIGNMENT;
+            }
+        }
+        pinned_objects
     }
 
     pub fn release(&self) {
         self.forwarding.release();
+        // Unprotect pinned pages
+        #[cfg(all(feature = "object_pinning", debug_assertions))]
+        self.protect_pinned_pages(true);
     }
 
     #[cfg(feature = "object_pinning")]
@@ -543,6 +698,20 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         worker: &mut GCWorker<VM>,
         object: ObjectReference,
     ) {
+        #[cfg(feature = "object_pinning")]
+        if self.is_pinned(object) {
+            let size = forwarding::get_object_size_from_mark_bits(object.to_object_start::<VM>());
+            let (intersect_pinned_page, _) =
+                does_new_address_intersect_pinned_pages(object.to_raw_address(), size);
+            if intersect_pinned_page {
+                // We don't need to update references in an object that
+                // intersects a pinned page because we have already pinned the
+                // directly reachable objects and hence we have no reason to
+                // update references.
+                return;
+            }
+        }
+
         if VM::VMScanning::support_slot_enqueuing(worker.tls, object) {
             VM::VMScanning::scan_object(worker.tls, object, &mut |s: VM::VMSlot| {
                 if let Some(o) = s.load() {
@@ -627,8 +796,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         // marked, and we compute the live data and thus the forwarding
                         // addresses based on those sizes. The forwarding addresses would be
                         // incorrect if the sizes of objects were to change.
-                        let copied_size = VM::VMObjectModel::get_size_when_copied(obj);
-                        debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
+                        let copied_size = if self.is_pinned(obj) {
+                            forwarding::get_object_size_from_mark_bits(obj.to_object_start::<VM>())
+                        } else {
+                            VM::VMObjectModel::get_size_when_copied(obj)
+                        };
+                        // debug_assert!(copied_size == VM::VMObjectModel::get_current_size(obj));
                         let new_object = self.forward::<CAN_CLMUL>(obj, false);
                         assert!(
                             obj.to_object_start::<VM>() >= new_object.to_object_start::<VM>(),
@@ -761,6 +934,68 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
         }
 
         COMPUTING_FORWARDING_INFO.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(feature = "object_pinning")]
+pub struct ScanPinnedPages<VM: VMBinding, Context: GCWorkContext<VM = VM>> {
+    compressor_space: &'static CompressorSpace<VM>,
+    region: forwarding::CompressorRegion,
+    cursor: Address,
+    phantom: std::marker::PhantomData<Context>,
+}
+
+#[cfg(feature = "object_pinning")]
+impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> ScanPinnedPages<VM, Context> {
+    pub fn new(
+        compressor_space: &'static CompressorSpace<VM>,
+        region: forwarding::CompressorRegion,
+        cursor: Address,
+    ) -> Self {
+        Self {
+            compressor_space,
+            region,
+            cursor,
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(feature = "object_pinning")]
+impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> GCWork<VM> for ScanPinnedPages<VM, Context> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        let pinned_objects = self
+            .compressor_space
+            .scan_pinned_pages(self.region, self.cursor);
+        self.compressor_space.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace].add_boxed(
+            Box::new(ScanObjects::<Context::DefaultProcessEdges>::new(
+                pinned_objects,
+                false,
+                WorkBucketStage::PinningRootsTrace,
+            )),
+        );
+    }
+}
+
+#[cfg(all(feature = "object_pinning", debug_assertions))]
+struct ProtectPinnedPages<VM: VMBinding> {
+    compressor_space: &'static CompressorSpace<VM>,
+}
+
+#[cfg(all(feature = "object_pinning", debug_assertions))]
+impl<VM: VMBinding> ProtectPinnedPages<VM> {
+    fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
+        Self { compressor_space }
+    }
+}
+
+#[cfg(all(feature = "object_pinning", debug_assertions))]
+impl<VM: VMBinding> GCWork<VM> for ProtectPinnedPages<VM> {
+    fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        // Protect pinned pages for the duration of the GC so that we don't touch them accidentally
+        // TODO(kunals): Reference processing may need to read from pinned pages.
+        // We disable reference processing for now
+        self.compressor_space.protect_pinned_pages(false);
     }
 }
 

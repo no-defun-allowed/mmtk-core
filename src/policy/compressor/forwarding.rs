@@ -108,6 +108,30 @@ pub(super) fn does_new_address_intersect_pinned_pages(
     (false, None)
 }
 
+pub(super) fn get_object_size_from_mark_bits(start: Address) -> usize {
+    debug_assert!(
+        MARK_SPEC.load_atomic::<u8>(start, Ordering::Relaxed) != 0,
+        "The start address {} should have its mark bit set when calculating object size from mark bits.",
+        start
+    );
+    let region = CompressorRegion::from_unaligned_address(start);
+    let search_start = start + BYTES_IN_WORD;
+    // SAFETY: This is called for either pinned objects or when we're in the Forward phase.
+    // Either way, no one will be modifying the mark bits for that object.
+    let end = unsafe {
+        MARK_SPEC
+            .find_next_non_zero_value::<u8>(search_start, region.end() - search_start + 1usize)
+            .expect("Failed to find first non-zero bit")
+    };
+    debug_assert_ne!(
+        start, end,
+        "Object start and end should be different: {:#x}",
+        start
+    );
+    let size = end - start + BYTES_IN_WORD;
+    size
+}
+
 /// A finite-state machine which visits the positions of marked bits in
 /// the mark bitmap, and accumulates the size of live data that it has
 /// seen between marked bits.
@@ -194,7 +218,9 @@ impl Transducer {
                         let mut intersects_pinned_mut = true;
                         let mut potential_forwarding_address =
                             pinned_object_mut.unwrap().to_object_start::<VM>()
-                                + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
+                                + get_object_size_from_mark_bits(
+                                    pinned_object_mut.unwrap().to_object_start::<VM>(),
+                                );
                         while intersects_pinned_mut {
                             debug!(
                                 "Object at 0x{first_word:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
@@ -209,8 +235,8 @@ impl Transducer {
                             if intersects_pinned_mut {
                                 potential_forwarding_address =
                                     pinned_object_mut.unwrap().to_object_start::<VM>()
-                                        + VM::VMObjectModel::get_current_size(
-                                            pinned_object_mut.unwrap(),
+                                        + get_object_size_from_mark_bits(
+                                            pinned_object_mut.unwrap().to_object_start::<VM>(),
                                         );
                             }
                         }
@@ -285,7 +311,9 @@ impl Transducer {
                                     };
                                     let last_pinned_object_end = last_pinned_object
                                         .to_object_start::<VM>()
-                                        + VM::VMObjectModel::get_current_size(last_pinned_object);
+                                        + get_object_size_from_mark_bits(
+                                            last_pinned_object.to_object_start::<VM>(),
+                                        );
                                     // XXX(kunals): Very interesting edge case. Object > 4096. The second page is pinned. The first page is unpinned.
                                     // We skip to the second page, but find that the second page is pinned so we can't use it! Hence why we have a loop
                                     // to ensure that we don't accidentally end up intersecting a pinned page/object again.
@@ -471,12 +499,12 @@ pub(super) fn is_page_pinned(address: Address) -> bool {
 }
 
 #[cfg(feature = "object_pinning")]
-fn is_object_pinned<VM: VMBinding>(object: ObjectReference) -> bool {
+pub(super) fn is_object_pinned<VM: VMBinding>(object: ObjectReference) -> bool {
     VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.is_object_pinned::<VM>(object)
 }
 
 #[cfg(feature = "object_pinning")]
-fn pin_object<VM: VMBinding>(object: ObjectReference) {
+pub(super) fn pin_object<VM: VMBinding>(object: ObjectReference) {
     VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.pin_object::<VM>(object);
 }
 
@@ -853,11 +881,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 MARK_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) != 0,
                 "The address to forward should be marked in the bitmap."
             );
-            // SAFETY: Since we're in the Forward phase, no one will be modifying the mark bits now
-            let search_start = address + BYTES_IN_WORD;
-            let end = unsafe { MARK_SPEC.find_next_non_zero_value::<u8>(search_start, region.end() - search_start + 1usize).expect("Failed to find first non-zero bit") };
-            debug_assert_ne!(address, end, "Object start and end should be different: {:#x}", address);
-            let size = end - address + BYTES_IN_WORD;
+            let size = get_object_size_from_mark_bits(address);
             let mut calculated_offset = false;
             while !calculated_offset {
                 let (intersects_pinned, pinned_object) =
@@ -877,7 +901,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     );
                     let mut potential_forwarding_address =
                         pinned_object_mut.unwrap().to_object_start::<VM>()
-                            + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
+                            + get_object_size_from_mark_bits(pinned_object_mut.unwrap().to_object_start::<VM>());
                     while intersects_pinned_mut {
                         debug!(
                             "Forwarding: object at 0x{address:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
@@ -893,7 +917,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                             potential_forwarding_address = pinned_object_mut
                                 .unwrap()
                                 .to_object_start::<VM>()
-                                + VM::VMObjectModel::get_current_size(pinned_object_mut.unwrap());
+                                + get_object_size_from_mark_bits(pinned_object_mut.unwrap().to_object_start::<VM>());
                         }
                     }
                     let offset = potential_forwarding_address - region.start();
@@ -964,7 +988,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                                 };
                                 let last_pinned_object_end = last_pinned_object
                                     .to_object_start::<VM>()
-                                    + VM::VMObjectModel::get_current_size(last_pinned_object);
+                                    + get_object_size_from_mark_bits(last_pinned_object_addr);
                                 if last_pinned_object_end > potential_forwarding_address {
                                     // The last pinned object extends beyond the end of the pinned page, so we need to skip to the end of the pinned object instead of the end of the pinned page
                                     info!(

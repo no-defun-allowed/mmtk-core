@@ -66,7 +66,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
 
     fn prepare(&mut self, tls: VMWorkerThread) {
         self.common.prepare(tls, true);
-        self.compressor_space.prepare();
+        self.compressor_space.prepare::<CompressorWorkContext<VM>>();
     }
 
     fn release(&mut self, tls: VMWorkerThread) {
