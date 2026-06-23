@@ -350,11 +350,11 @@ impl<VM: VMBinding> OldPassSpace<VM> {
     pub fn compact<const CAN_CLMUL: bool>(&self, worker: &mut GCWorker<VM>, counters: &Counters) {
         #[cfg(feature = "vo_bit")]
         {
-            let start = self.forwarding.first_address;
-            let end = self.pr.cursor();
+            let _start = self.forwarding.first_address;
+            let _end = self.pr.cursor();
             #[cfg(debug_assertions)]
             self.forwarding
-                .scan_marked_objects(start, end, &mut |object: ObjectReference| {
+                .scan_marked_objects(_start, _end, &mut |object: ObjectReference| {
                     debug_assert!(
                         crate::util::metadata::vo_bit::is_vo_bit_set(object),
                         "{:x}: VO bit not set",
