@@ -442,29 +442,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     while !forwarding::is_object_pinned::<VM>(obj) {
                         forwarding::pin_object::<VM>(obj);
                     }
-
+                    debug_assert!(forwarding::is_object_pinned::<VM>(obj));
                     // Mark the pinned object as live.
                     if CompressorSpace::<VM>::test_and_mark(obj) {
                         // Mark the end of the object
                         self.forwarding.mark_rest_of_object(obj);
-                        let mut closure = |slot: VM::VMSlot| {
-                            let Some(object) = slot.load() else { return };
-                            // Pin directly reachable objects
-                            // TODO(kunals): Do we need to pin objects reachable through weak references?
-                            while !forwarding::is_object_pinned::<VM>(object) {
-                                forwarding::pin_object::<VM>(object);
-                                debug!(
-                                    "Pinning reachable object at {:?} of size {} bytes",
-                                    object.to_raw_address(),
-                                    VM::VMObjectModel::get_current_size(object),
-                                );
-                            }
-                        };
-                        VM::VMScanning::scan_object(
-                            VMWorkerThread(VMThread::UNINITIALIZED),
-                            obj,
-                            &mut closure,
-                        );
                     }
 
                     pinned_objects.push(obj);
@@ -698,6 +680,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         worker: &mut GCWorker<VM>,
         object: ObjectReference,
     ) {
+        #[cfg(feature = "vo_bit")]
+        debug_assert!(
+            crate::util::metadata::vo_bit::is_vo_bit_set(object),
+            "{:?}: VO bit not set",
+            object
+        );
         #[cfg(feature = "object_pinning")]
         if self.is_pinned(object) {
             let size = forwarding::get_object_size_from_mark_bits(object.to_object_start::<VM>());
@@ -868,6 +856,29 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     pub fn after_compact(&self) {
         self.pr.reset_allocator();
         self.pr.with_regions(&mut |r| draw_region_usage(r));
+
+        #[cfg(debug_assertions)]
+        {
+            let map = FORWARDING_MAP.lock().unwrap();
+            map.iter().for_each(|(from_obj, to_obj)| {
+                let from_obj = ObjectReference::from_raw_address(*from_obj).unwrap();
+                let to_obj = ObjectReference::from_raw_address(*to_obj).unwrap();
+                #[cfg(feature = "vo_bit")]
+                debug_assert!(
+                    vo_bit::is_vo_bit_set(to_obj),
+                    "Forwarded object {:?} -> {:?} does not have VO bit set after compaction!",
+                    from_obj,
+                    to_obj,
+                );
+                if self.is_object_pinned(from_obj) {
+                    debug_assert_eq!(
+                        from_obj, to_obj,
+                        "Pinned object {:?} was forwarded to {:?}!",
+                        from_obj, to_obj
+                    );
+                }
+            });
+        }
     }
 }
 
@@ -891,6 +902,12 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
             map.iter().for_each(|(from_obj, to_obj)| {
                 let from_obj = ObjectReference::from_raw_address(*from_obj).unwrap();
                 let to_obj = ObjectReference::from_raw_address(*to_obj).unwrap();
+                #[cfg(feature = "vo_bit")]
+                debug_assert!(
+                    crate::util::metadata::vo_bit::is_vo_bit_set(from_obj),
+                    "{:?}: VO bit not set",
+                    from_obj,
+                );
                 if self.compressor_space.is_object_pinned(from_obj) {
                     debug_assert_eq!(
                         from_obj, to_obj,
@@ -967,6 +984,37 @@ impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> GCWork<VM> for ScanPinnedPa
         let pinned_objects = self
             .compressor_space
             .scan_pinned_pages(self.region, self.cursor);
+
+        let mut closure = |slot: VM::VMSlot| {
+            let Some(object) = slot.load() else { return };
+            while !forwarding::is_object_pinned::<VM>(object) {
+                forwarding::pin_object::<VM>(object);
+                debug!(
+                    "Pinning reachable object at {:?} of size {} bytes",
+                    object.to_raw_address(),
+                    VM::VMObjectModel::get_current_size(object),
+                );
+            }
+            debug_assert!(
+                forwarding::is_object_pinned::<VM>(object),
+                "Directly reachable object {:?} should be pinned",
+                object
+            );
+        };
+
+        pinned_objects.iter().for_each(|obj| {
+            debug_assert!(
+                forwarding::is_object_pinned::<VM>(*obj),
+                "Object {:?} should be pinned",
+                obj
+            );
+            VM::VMScanning::scan_object(
+                VMWorkerThread(VMThread::UNINITIALIZED),
+                *obj,
+                &mut closure,
+            );
+        });
+
         self.compressor_space.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace].add_boxed(
             Box::new(ScanObjects::<Context::DefaultProcessEdges>::new(
                 pinned_objects,
