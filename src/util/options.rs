@@ -1078,7 +1078,9 @@ options! {
     /// Fraction of either OS pages or objects to randomly pin per GC cycle in the Compressor (0.0–1.0).
     /// Pinned objects/pages are not compacted; pinned objects have their references updated
     /// in-place but are never moved. The default of NoPinning disables pinning.
-    compressor_pinning_mode: PinningMode            [always_valid] = PinningMode::NoPinning
+    compressor_pinning_mode: PinningMode            [always_valid] = PinningMode::NoPinning,
+    /// Bias for how much more likely is a mature page to be pinned than a nursery one.
+    compressor_mature_pinning_bias: f64             [|v: &f64| *v >= 1.0] = 1.0
 }
 
 #[cfg(test)]

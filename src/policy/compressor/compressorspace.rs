@@ -54,6 +54,61 @@ static CACHED_PINNED_PAGES: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "object_pinning")]
 static NUM_GCS: AtomicU32 = AtomicU32::new(0);
 
+/// Pins a fixed fraction of all pages (pin_rate), but spends that budget
+/// disproportionately on mature pages.
+///
+/// Parameters:
+///   pin_rate:    desired fraction of ALL pages to pin  (e.g. 0.25)
+///   bias:        P(pin|mature) / P(pin|nursery)        (e.g. 3.0 → mature 3× more likely)
+///   mature_frac: fraction of the page set that is mature (needed to normalize)
+///
+/// Derivation:
+///   p_n × (mature_frac × bias + nursery_frac) = pin_rate
+///   p_m = bias × p_n
+struct PinRng {
+    state: u64,
+    mature_threshold: u32,
+    nursery_threshold: u32,
+}
+
+impl PinRng {
+    fn new(seed: u64, pin_rate: f64, bias: f64, mature_frac: f64) -> Self {
+        assert!(bias >= 1.0, "bias must be >= 1.0");
+        assert!((0.0..=1.0).contains(&pin_rate));
+        assert!((0.0..=1.0).contains(&mature_frac));
+        let nursery_frac = 1.0 - mature_frac;
+        let p_nursery = pin_rate / (mature_frac * bias + nursery_frac);
+        let p_mature = bias * p_nursery;
+        assert!(
+            p_mature <= 1.0,
+            "bias {bias} too high for mature_frac {mature_frac}: p_mature={p_mature:.3} > 1"
+        );
+        Self {
+            state: seed.wrapping_add(0x9e3779b97f4a7c15),
+            mature_threshold: (p_mature * u32::MAX as f64) as u32,
+            nursery_threshold: (p_nursery * u32::MAX as f64) as u32,
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        // splitmix64
+        self.state = self.state.wrapping_add(0x9e3779b97f4a7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+        (z ^ (z >> 31)) as u32
+    }
+
+    pub fn should_pin(&mut self, is_mature: bool) -> bool {
+        let t = if is_mature {
+            self.mature_threshold
+        } else {
+            self.nursery_threshold
+        };
+        self.next_u32() < t
+    }
+}
+
 /// [`CompressorSpace`] is a stop-the-world implementation of
 /// the Compressor, as described in Kermany and Petrank,
 /// [The Compressor: concurrent, incremental, and parallel compaction](https://dl.acm.org/doi/10.1145/1133255.1134023).
@@ -309,6 +364,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 self.forwarding.pinning_mode,
                 PinningMode::RandomPagePinning(PagePinningMode::FirstGC, _)
             ));
+        #[cfg(feature = "object_pinning")]
+        let mut total_nursery = 0_usize;
+        #[cfg(feature = "object_pinning")]
+        let mut total_allocated = 0_usize;
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 forwarding::MARK_SPEC
@@ -327,6 +386,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         forwarding::PINNED_PAGE_SPEC
                             .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
                     }
+                    total_nursery += r.cursor() - r.prev_cursor();
+                    total_allocated += r.cursor() - r.region.start();
                 }
             });
 
@@ -335,7 +396,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             // Pin a fraction of allocated pages at the start of GC. We will
             // individually pin live objects in these pages later.
             if needs_page_pinning {
-                self.pin_pages();
+                let mature_fraction =
+                    (total_allocated - total_nursery) as f64 / total_allocated as f64;
+                self.pin_pages(mature_fraction);
                 self.add_scan_pinned_pages_tasks::<Context>();
             }
 
@@ -470,14 +533,14 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     #[cfg(feature = "object_pinning")]
-    fn pin_pages(&self) {
+    fn pin_pages(&self, mature_fraction: f64) {
         match self.forwarding.pinning_mode {
             PinningMode::RandomPagePinning(PagePinningMode::CachedEveryGC, fraction) => {
                 if fraction > 0.0 {
                     // Cache pinned pages in the harness begin GC. We pin pages till the
                     // end of the region
                     if NUM_GCS.load(Ordering::Relaxed) == 3 {
-                        self.pin_random_pages(fraction, false, true);
+                        self.pin_random_pages(fraction, mature_fraction, false, true);
                         CACHED_PINNED_PAGES.store(true, Ordering::Relaxed);
                     }
 
@@ -490,7 +553,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 assert_ne!(page_pinning_mode, PagePinningMode::CachedEveryGC);
                 if fraction > 0.0 {
                     let pin_till_end = page_pinning_mode == PagePinningMode::FirstGC;
-                    self.pin_random_pages(fraction, pin_till_end, false);
+                    self.pin_random_pages(fraction, mature_fraction, pin_till_end, false);
                 }
             }
             _ => {
@@ -501,14 +564,22 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 
     /// Randomly select `fraction` of currently-allocated OS pages to pin.
     #[cfg(feature = "object_pinning")]
-    fn pin_random_pages(&self, fraction: f64, pin_till_end: bool, need_to_cache: bool) {
-        use rand::Rng;
-        use rand::SeedableRng;
-
+    fn pin_random_pages(
+        &self,
+        fraction: f64,
+        mature_fraction: f64,
+        pin_till_end: bool,
+        need_to_cache: bool,
+    ) {
         let mut total_pages = 0;
         let mut pages_pinned = 0;
         let fraction = fraction.clamp(0.0, 1.0);
-        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42_u64);
+        let mut rng = PinRng::new(
+            42,
+            fraction,
+            *self.common().options.compressor_mature_pinning_bias,
+            mature_fraction,
+        );
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let mut page = r.region.start();
@@ -518,14 +589,19 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     r.cursor()
                 };
                 while page < end {
-                    if rng.random_bool(fraction) {
+                    let mature = page <= r.prev_cursor();
+                    if rng.should_pin(mature) {
                         pages_pinned += 1;
                         if !need_to_cache {
                             forwarding::PINNED_PAGE_SPEC.store_atomic(page, 1_u8, Ordering::SeqCst);
                         } else {
                             self.cached_pinned_pages.write().unwrap().insert(page);
                         }
-                        info!("Pinning page {}", page);
+                        info!(
+                            "Pinning page {}: {}",
+                            page,
+                            if mature { "mature" } else { "nursery" }
+                        );
                     }
                     page += BYTES_IN_PAGE;
                     total_pages += 1;
