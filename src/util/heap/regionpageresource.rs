@@ -16,6 +16,7 @@ use std::sync::RwLock;
 pub struct AllocatedRegion<R: Region> {
     pub region: R,
     cursor: Atomic<Address>,
+    prev_cursor: Atomic<Address>,
 }
 
 impl<R: Region> AllocatedRegion<R> {
@@ -25,6 +26,14 @@ impl<R: Region> AllocatedRegion<R> {
 
     fn set_cursor(&self, a: Address) {
         self.cursor.store(a, Ordering::Relaxed);
+    }
+
+    pub fn prev_cursor(&self) -> Address {
+        self.prev_cursor.load(Ordering::Relaxed)
+    }
+
+    fn set_prev_cursor(&self, a: Address) {
+        self.prev_cursor.store(a, Ordering::Relaxed);
     }
 }
 
@@ -132,6 +141,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         b.all_regions.push(AllocatedRegion {
             region: R::from_aligned_address(start),
             cursor: Atomic::<Address>::new(start),
+            prev_cursor: Atomic::<Address>::new(start),
         });
         let cursor = b.next_region;
         succeed(
@@ -162,6 +172,9 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         let pages = (old - new) / BYTES_IN_PAGE;
         self.common().accounting.release(pages);
         alloc.set_cursor(new);
+        // After compaction, the previous cursor should be set to the new cursor,
+        // so that we can distinguish between mature and nursery objects.
+        alloc.set_prev_cursor(new);
     }
 
     /// Reset the allocator state after a collection, so that the allocator will
