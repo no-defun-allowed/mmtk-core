@@ -113,6 +113,7 @@ pub trait ObjectModel<VM: VMBinding> {
     #[cfg(feature = "object_pinning")]
     /// A local 1-bit metadata specification for the pinning bit, used by plans that need to pin objects. It is
     /// generally in side metadata.
+    // TODO(kunals): Need to make this a global metadata instead of a local one
     const LOCAL_PINNING_BIT_SPEC: VMLocalPinningBitSpec;
 
     /// A local 2-bit metadata used by the large object space to mark objects and set objects as "newly allocated".

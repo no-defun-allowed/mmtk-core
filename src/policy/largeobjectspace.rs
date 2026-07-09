@@ -284,7 +284,11 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
         let common = CommonSpace::new(args.into_policy_args(
             false,
             false,
-            metadata::extract_side_metadata(&[*VM::VMObjectModel::LOCAL_LOS_MARK_NURSERY_SPEC]),
+            metadata::extract_side_metadata(&[
+                *VM::VMObjectModel::LOCAL_LOS_MARK_NURSERY_SPEC,
+                #[cfg(feature = "object_pinning")]
+                *VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC,
+            ]),
         ));
         let mut pr = if is_discontiguous {
             FreeListPageResource::new_discontiguous(vm_map)
