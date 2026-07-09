@@ -1,4 +1,6 @@
 #[cfg(feature = "object_pinning")]
+use crate::policy::compressor::stubtable;
+#[cfg(feature = "object_pinning")]
 use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::Region;
@@ -20,6 +22,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::AtomicBool;
 #[cfg(debug_assertions)]
 use std::sync::Mutex;
+#[cfg(feature = "object_pinning")]
+use std::sync::RwLock;
 
 /// Can we move an object into a pinned page? If not, then we will need to skip over pinned pages
 /// when we are Computing forwarding addresses.
@@ -132,6 +136,22 @@ pub(super) fn get_object_size_from_mark_bits(start: Address) -> usize {
     size
 }
 
+pub(super) fn get_object_size<VM: VMBinding>(
+    object: ObjectReference,
+    stub_table: &RwLock<stubtable::StubTable<VM>>,
+) -> usize {
+    if let Some(size) = stub_table.read().unwrap().get_size(object) {
+        debug_assert!(
+            is_object_pinned::<VM>(object),
+            "Object {:?} in stub table is not pinned!",
+            object,
+        );
+        size.get()
+    } else {
+        VM::VMObjectModel::get_current_size(object)
+    }
+}
+
 /// A finite-state machine which visits the positions of marked bits in
 /// the mark bitmap, and accumulates the size of live data that it has
 /// seen between marked bits.
@@ -169,7 +189,11 @@ impl Transducer {
             in_pinned_object: false,
         }
     }
-    pub fn visit_mark_bit<VM: VMBinding>(&mut self, address: Address) {
+    pub fn visit_mark_bit<VM: VMBinding>(
+        &mut self,
+        address: Address,
+        stub_table: &RwLock<stubtable::StubTable<VM>>,
+    ) {
         if self.in_object {
             // The size of an object is the distance between the end and
             // start of the object, and the last word of the object is one
@@ -218,9 +242,7 @@ impl Transducer {
                         let mut intersects_pinned_mut = true;
                         let mut potential_forwarding_address =
                             pinned_object_mut.unwrap().to_object_start::<VM>()
-                                + get_object_size_from_mark_bits(
-                                    pinned_object_mut.unwrap().to_object_start::<VM>(),
-                                );
+                                + get_object_size(pinned_object_mut.unwrap(), stub_table);
                         while intersects_pinned_mut {
                             debug!(
                                 "Object at 0x{first_word:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
@@ -235,9 +257,7 @@ impl Transducer {
                             if intersects_pinned_mut {
                                 potential_forwarding_address =
                                     pinned_object_mut.unwrap().to_object_start::<VM>()
-                                        + get_object_size_from_mark_bits(
-                                            pinned_object_mut.unwrap().to_object_start::<VM>(),
-                                        );
+                                        + get_object_size(pinned_object_mut.unwrap(), stub_table);
                             }
                         }
                         let offset = potential_forwarding_address - region.start();
@@ -311,9 +331,7 @@ impl Transducer {
                                     };
                                     let last_pinned_object_end = last_pinned_object
                                         .to_object_start::<VM>()
-                                        + get_object_size_from_mark_bits(
-                                            last_pinned_object.to_object_start::<VM>(),
-                                        );
+                                        + get_object_size(last_pinned_object, stub_table);
                                     // XXX(kunals): Very interesting edge case. Object > 4096. The second page is pinned. The first page is unpinned.
                                     // We skip to the second page, but find that the second page is pinned so we can't use it! Hence why we have a loop
                                     // to ensure that we don't accidentally end up intersecting a pinned page/object again.
@@ -485,6 +503,8 @@ pub struct ForwardingMetadata<VM: VMBinding> {
     vm: PhantomData<VM>,
     supports_clmul: bool,
     #[cfg(feature = "object_pinning")]
+    pub stub_table: RwLock<stubtable::StubTable<VM>>,
+    #[cfg(feature = "object_pinning")]
     pub pinning_mode: PinningMode,
 }
 
@@ -526,6 +546,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             calculated: AtomicBool::new(false),
             vm: PhantomData,
             supports_clmul,
+            #[cfg(feature = "object_pinning")]
+            stub_table: RwLock::new(stubtable::StubTable::new()),
             #[cfg(feature = "object_pinning")]
             pinning_mode: _pinning_mode,
         }
@@ -584,6 +606,45 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         }
 
         #[cfg(feature = "object_pinning")]
+        self.pin_object_if_needed(object);
+    }
+
+    pub fn mark_rest_of_object_known_size(&self, object: ObjectReference, size: usize) {
+        // We implement two styles of mark bitmap:
+        if cfg!(feature = "compressor_art_marking") {
+            // - When `cfg(feature = "compressor_art_marking")`, we use a style as in
+            //   the Android Runtime and Clozure Common Lisp, where we mark every
+            //   bit corresponding to a word in each live object.
+            //
+            // XXX: this will SeqCst and we don't need that.
+            MARK_SPEC.bset_metadata(object.to_object_start::<VM>(), size);
+        } else {
+            // - When `cfg(not(feature = "compressor_art_marking"))`, we follow the style
+            //   in the original Compressor paper, where we mark bits corresponding to
+            //   the first and last words of each live object. The live data then
+            //   corresponds to the bits between and including each pair of set bits.
+            let last_word_of_object = object.to_object_start::<VM>() + size - BYTES_IN_WORD;
+            #[cfg(debug_assertions)]
+            {
+                // We require to be able to iterate upon first and last bits in the
+                // same bitmap. Therefore the first and last bits cannot be the
+                // same, else we would only encounter one of the two bits.
+                // This requirement implies that objects must be at least two words
+                // large.
+                debug_assert!(
+                    MARK_SPEC.are_different_metadata_bits(
+                        object.to_object_start::<VM>(),
+                        last_word_of_object
+                    ),
+                    "The first and last mark bits should be different bits."
+                );
+            }
+            MARK_SPEC.fetch_or_atomic::<u8>(last_word_of_object, 1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(feature = "object_pinning")]
+    fn pin_object_if_needed(&self, object: ObjectReference) {
         match self.pinning_mode {
             PinningMode::NoPinning => {}
             PinningMode::RandomObjectPinning(fraction) => {
@@ -750,7 +811,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     block.start(),
                     block.end(),
                     &mut |addr: Address| {
-                        state.visit_mark_bit::<VM>(addr);
+                        state.visit_mark_bit::<VM>(addr, &self.stub_table);
                     },
                 );
             }
@@ -775,7 +836,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     block.start(),
                     block.end(),
                     &mut |addr: Address| {
-                        state.visit_mark_bit::<VM>(addr);
+                        state.visit_mark_bit::<VM>(addr, &self.stub_table);
                     },
                 );
             }
@@ -871,7 +932,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             // an object from the start of a region; whereas Total-Live-Data in the
             // paper computes the distance of the object from the start of the block.
             MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
-                state.visit_mark_bit::<VM>(addr)
+                state.visit_mark_bit::<VM>(addr, &self.stub_table)
             });
             // SAFETY: We are creating an ObjectReference from a valid object since we call this
             // function only for objects
@@ -1198,7 +1259,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 block.start(),
                 block.end(),
                 &mut |addr: Address| {
-                    state.visit_mark_bit::<VM>(addr);
+                    state.visit_mark_bit::<VM>(addr, &self.stub_table);
                     if state.in_object {
                         let o = ObjectReference::from_raw_address(addr).unwrap();
                         VM::VMObjectModel::finalise_threading_list(o);
@@ -1211,7 +1272,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 block.start(),
                 block.end(),
                 &mut |addr: Address| {
-                    second_state.visit_mark_bit::<VM>(addr);
+                    second_state.visit_mark_bit::<VM>(addr, &self.stub_table);
                     if second_state.in_object {
                         let o = ObjectReference::from_raw_address(addr).unwrap();
                         move_object(o);

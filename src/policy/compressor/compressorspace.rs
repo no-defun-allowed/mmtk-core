@@ -12,8 +12,6 @@ use crate::policy::compressor::forwarding::{
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
-#[cfg(feature = "object_pinning")]
-use crate::scheduler::gc_work::ScanObjects;
 use crate::scheduler::GCWorkContext;
 use crate::scheduler::{GCWork, GCWorkScheduler, GCWorker, WorkBucketStage};
 #[cfg(feature = "object_pinning")]
@@ -33,7 +31,7 @@ use crate::util::object_enum::ObjectEnumerator;
 use crate::util::options::{PagePinningMode, PinningMode};
 #[cfg(all(feature = "object_pinning", debug_assertions))]
 use crate::util::os::OSMemory;
-use crate::util::{Address, ObjectReference, VMThread, VMWorkerThread};
+use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
 use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
@@ -272,14 +270,14 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for Compressor
         queue: &mut Q,
         object: ObjectReference,
         _copy: Option<CopySemantics>,
-        _worker: &mut GCWorker<VM>,
+        worker: &mut GCWorker<VM>,
     ) -> ObjectReference {
         debug_assert!(
             KIND != TRACE_KIND_TRANSITIVE_PIN,
             "Compressor does not support transitive pin trace."
         );
         if KIND == TRACE_KIND_MARK {
-            self.trace_mark_object(queue, object)
+            self.trace_mark_object(queue, object, worker)
         } else if KIND == TRACE_KIND_FORWARD {
             self.forward::<false>(object, true)
         } else {
@@ -364,6 +362,13 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 self.forwarding.pinning_mode,
                 PinningMode::RandomPagePinning(PagePinningMode::FirstGC, _)
             ));
+
+        #[cfg(feature = "object_pinning")]
+        if is_pinning {
+            let mut stub_table = self.forwarding.stub_table.write().unwrap();
+            stub_table.clear();
+        }
+
         #[cfg(feature = "object_pinning")]
         let mut total_nursery = 0_usize;
         #[cfg(feature = "object_pinning")]
@@ -482,15 +487,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .set_sentinel(Box::new(ProtectPinnedPages::new(space)));
     }
 
-    fn scan_pinned_pages(
-        &self,
-        region: forwarding::CompressorRegion,
-        cursor: Address,
-    ) -> Vec<ObjectReference> {
+    fn scan_pinned_pages(&self, region: forwarding::CompressorRegion, cursor: Address) {
         let start = region.start();
         let mut curr = start;
         let end = cursor;
-        let mut pinned_objects = vec![];
         while curr < end {
             // SAFETY: No one will modify the VO-bits when we are scanning pinned pages
             if unsafe { vo_bit::is_vo_addr(curr) } {
@@ -501,18 +501,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     does_new_address_intersect_pinned_pages(curr, obj_size);
 
                 if intersects_pinned_page {
-                    // This object is on a pinned page, so we pin it.
-                    while !forwarding::is_object_pinned::<VM>(obj) {
-                        forwarding::pin_object::<VM>(obj);
-                    }
-                    debug_assert!(forwarding::is_object_pinned::<VM>(obj));
-                    // Mark the pinned object as live.
-                    if CompressorSpace::<VM>::test_and_mark(obj) {
-                        // Mark the end of the object
-                        self.forwarding.mark_rest_of_object(obj);
-                    }
-
-                    pinned_objects.push(obj);
+                    self.forwarding.stub_table.write().unwrap().add_stub(obj);
                 }
 
                 // Skip to end of object
@@ -522,7 +511,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 curr += VM::MIN_ALIGNMENT;
             }
         }
-        pinned_objects
     }
 
     pub fn release(&self) {
@@ -638,6 +626,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         &self,
         queue: &mut Q,
         object: ObjectReference,
+        worker: &mut GCWorker<VM>,
     ) -> ObjectReference {
         #[cfg(feature = "vo_bit")]
         debug_assert!(
@@ -645,7 +634,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             "{:x}: VO bit not set",
             object
         );
-        if CompressorSpace::<VM>::test_and_mark(object) {
+        let stub_table = self.forwarding.stub_table.read().unwrap();
+        if stub_table.has_stub(object) {
+            stub_table.mark_object_stub(queue, object, &self.forwarding, worker);
+        } else if CompressorSpace::<VM>::test_and_mark(object) {
+            drop(stub_table);
             queue.enqueue(object);
             self.forwarding.mark_rest_of_object(object);
         }
@@ -1057,47 +1050,8 @@ impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> ScanPinnedPages<VM, Context
 #[cfg(feature = "object_pinning")]
 impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> GCWork<VM> for ScanPinnedPages<VM, Context> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        let pinned_objects = self
-            .compressor_space
+        self.compressor_space
             .scan_pinned_pages(self.region, self.cursor);
-
-        let mut closure = |slot: VM::VMSlot| {
-            let Some(object) = slot.load() else { return };
-            while !forwarding::is_object_pinned::<VM>(object) {
-                forwarding::pin_object::<VM>(object);
-                debug!(
-                    "Pinning reachable object at {:?} of size {} bytes",
-                    object.to_raw_address(),
-                    VM::VMObjectModel::get_current_size(object),
-                );
-            }
-            debug_assert!(
-                forwarding::is_object_pinned::<VM>(object),
-                "Directly reachable object {:?} should be pinned",
-                object
-            );
-        };
-
-        pinned_objects.iter().for_each(|obj| {
-            debug_assert!(
-                forwarding::is_object_pinned::<VM>(*obj),
-                "Object {:?} should be pinned",
-                obj
-            );
-            VM::VMScanning::scan_object(
-                VMWorkerThread(VMThread::UNINITIALIZED),
-                *obj,
-                &mut closure,
-            );
-        });
-
-        self.compressor_space.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace].add_boxed(
-            Box::new(ScanObjects::<Context::DefaultProcessEdges>::new(
-                pinned_objects,
-                false,
-                WorkBucketStage::PinningRootsTrace,
-            )),
-        );
     }
 }
 
