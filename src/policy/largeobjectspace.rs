@@ -385,7 +385,7 @@ impl<VM: VMBinding> LargeObjectSpace<VM> {
                 VM::VMObjectModel::GLOBAL_LOG_BIT_SPEC.clear::<VM>(object, Ordering::SeqCst);
             }
             #[cfg(feature = "object_pinning")]
-            VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.unpin_object::<VM>(object, Ordering::SeqCst);
+            VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.unpin_object::<VM>(object);
             self.pr
                 .release_pages(get_super_page(object.to_object_start::<VM>()));
         };
