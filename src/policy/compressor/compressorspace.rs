@@ -76,11 +76,11 @@ impl PinRng {
         assert!((0.0..=1.0).contains(&mature_frac));
         let nursery_frac = 1.0 - mature_frac;
         let p_nursery = pin_rate / (mature_frac * bias + nursery_frac);
-        let p_mature = bias * p_nursery;
-        assert!(
-            p_mature <= 1.0,
-            "bias {bias} too high for mature_frac {mature_frac}: p_mature={p_mature:.3} > 1"
-        );
+        let mut p_mature = bias * p_nursery;
+        if p_mature > 1.0 {
+            warn!("bias {bias} too high for mature_frac {mature_frac}: p_mature={p_mature:.3} > 1");
+            p_mature = 1.0;
+        }
         Self {
             state: seed.wrapping_add(0x9e3779b97f4a7c15),
             mature_threshold: (p_mature * u32::MAX as f64) as u32,
