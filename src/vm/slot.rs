@@ -105,7 +105,7 @@ use crate::util::{Address, ObjectReference};
 /// This trait only concerns the representation (i.e. the shape) of the slot, not its semantics,
 /// such as whether it holds strong or weak references.  Therefore, one `Slot` implementation can be
 /// used for both slots that hold strong references and slots that hold weak references.
-pub trait Slot: Copy + Send + Debug + PartialEq + Eq + Hash {
+pub trait Slot: Copy + Send + Sync + Debug + PartialEq + Eq + Hash {
     /// Load object reference from the slot.
     ///
     /// If the slot is not holding an object reference (For example, if it is holding NULL or a
@@ -169,6 +169,7 @@ impl SimpleSlot {
 }
 
 unsafe impl Send for SimpleSlot {}
+unsafe impl Sync for SimpleSlot {}
 
 impl Slot for SimpleSlot {
     fn load(&self) -> Option<ObjectReference> {

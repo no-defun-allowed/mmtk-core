@@ -518,6 +518,19 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         // Unprotect pinned pages
         #[cfg(all(feature = "object_pinning", debug_assertions))]
         self.protect_pinned_pages(true);
+        #[cfg(feature = "object_pinning")]
+        {
+            let stub_table = self.forwarding.stub_table.read().unwrap();
+            let all_objects = stub_table.stubs.keys();
+            for object in all_objects {
+                if forwarding::MARK_SPEC.load_atomic::<u8>(*object, Ordering::SeqCst) != 0 {
+                    // SAFETY: We are using an object reference from the stub table, which is always valid.
+                    stub_table.regenerate_object(unsafe {
+                        ObjectReference::from_raw_address_unchecked(*object)
+                    });
+                }
+            }
+        }
     }
 
     #[cfg(feature = "object_pinning")]
@@ -704,7 +717,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .collect();
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
             .bulk_add(offset_vector_packets);
-        #[cfg(debug_assertions)]
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
             .set_sentinel(Box::new(AfterCalculateOffsetVector::new(self)));
     }
@@ -756,15 +768,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             object
         );
         #[cfg(feature = "object_pinning")]
-        if self.is_pinned(object) {
-            let size = forwarding::get_object_size_from_mark_bits(object.to_object_start::<VM>());
-            let (intersect_pinned_page, _) =
-                does_new_address_intersect_pinned_pages(object.to_raw_address(), size);
-            if intersect_pinned_page {
-                // We don't need to update references in an object that
-                // intersects a pinned page because we have already pinned the
-                // directly reachable objects and hence we have no reason to
-                // update references.
+        {
+            let mut stub_table = self.forwarding.stub_table.write().unwrap();
+            if stub_table.has_stub(object) {
+                let mut update_closure = |o: ObjectReference| self.forward::<CAN_CLMUL>(o, false);
+                stub_table.update_object_stub(object, &mut update_closure);
                 return;
             }
         }
@@ -951,21 +959,23 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 }
 
-#[cfg(debug_assertions)]
 pub struct AfterCalculateOffsetVector<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
 }
 
-#[cfg(debug_assertions)]
 impl<VM: VMBinding> AfterCalculateOffsetVector<VM> {
     pub fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
         Self { compressor_space }
     }
 }
 
-#[cfg(debug_assertions)]
 impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        {
+            let mut stub_table = self.compressor_space.forwarding.stub_table.write().unwrap();
+            stub_table.prune_stubs();
+        }
+        #[cfg(debug_assertions)]
         {
             let map = FORWARDING_MAP.lock().unwrap();
             map.iter().for_each(|(from_obj, to_obj)| {
@@ -1017,9 +1027,9 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
                     }
                 }
             });
-        }
 
-        COMPUTING_FORWARDING_INFO.store(false, Ordering::SeqCst);
+            COMPUTING_FORWARDING_INFO.store(false, Ordering::SeqCst);
+        }
     }
 }
 

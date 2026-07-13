@@ -1,6 +1,8 @@
 use crate::policy::compressor::{forwarding, CompressorSpace};
 use crate::scheduler::GCWorker;
 use crate::util::constants::BYTES_IN_WORD;
+#[cfg(feature = "vo_bit")]
+use crate::util::metadata::vo_bit;
 use crate::util::{Address, ObjectReference, VMThread, VMWorkerThread};
 use crate::vm::slot::Slot;
 use crate::{vm::*, ObjectQueue};
@@ -25,30 +27,34 @@ use std::sync::atomic::Ordering;
 /// object so that we can avoid updating references in the stubbed object.
 pub struct StubTable<VM: VMBinding> {
     /// Map from object to its [`Stub`].
-    pub stubs: HashMap<Address, Stub>,
-    phantom: PhantomData<VM>,
+    pub stubs: HashMap<Address, Stub<VM>>,
 }
 
 /// A stub is a representation of an object that keeps track of its references
 /// and its size. Stubs live in the [`StubTable`].
-pub struct Stub {
-    /// List of references from the object to other objects.
-    pub references: Vec<ObjectReference>,
+pub struct Stub<VM: VMBinding> {
+    /// List of references from the object to other objects. We store the
+    /// references as a tuple of the slot of the reference in the object and
+    /// the reference itself. This allows us to update the object to point to
+    /// correct references when we swap the page back in.
+    pub references: Vec<(VM::VMSlot, ObjectReference)>,
     /// The size of the object.
     pub size: usize,
+    phantom: PhantomData<VM>,
 }
 
-impl Stub {
+impl<VM: VMBinding> Stub<VM> {
     pub fn new() -> Self {
         Stub {
             references: Vec::new(),
             size: 0,
+            phantom: PhantomData,
         }
     }
 
     /// Add a reference to the stub.
-    pub fn add_reference(&mut self, reference: ObjectReference) {
-        self.references.push(reference);
+    pub fn add_reference(&mut self, slot: VM::VMSlot, reference: ObjectReference) {
+        self.references.push((slot, reference));
     }
 
     /// Set the size of the stub.
@@ -66,7 +72,6 @@ impl<VM: VMBinding> StubTable<VM> {
     pub fn new() -> Self {
         StubTable {
             stubs: HashMap::new(),
-            phantom: PhantomData,
         }
     }
 
@@ -82,7 +87,7 @@ impl<VM: VMBinding> StubTable<VM> {
         let mut stub = Stub::new();
         let mut closure = |slot: VM::VMSlot| {
             let Some(child_obj) = slot.load() else { return };
-            stub.add_reference(child_obj);
+            stub.add_reference(slot, child_obj);
         };
         VM::VMScanning::scan_object(
             VMWorkerThread(VMThread::UNINITIALIZED),
@@ -90,6 +95,11 @@ impl<VM: VMBinding> StubTable<VM> {
             &mut closure,
         );
         stub.set_size(VM::VMObjectModel::get_current_size(object));
+        debug!(
+            "Adding stub for object {:?} (size {})",
+            object,
+            stub.get_size(),
+        );
         self.stubs.insert(object_start, stub);
     }
 
@@ -99,6 +109,25 @@ impl<VM: VMBinding> StubTable<VM> {
         debug_assert!(self.has_stub(object));
         let object_start = object.to_raw_address();
         self.stubs.remove(&object_start);
+    }
+
+    /// Remove all unmarked stubs from the stub table. This is called after the
+    /// transitive closure phase of a GC to remove stubs for objects that are no
+    /// longer reachable.
+    ///
+    /// Note that we call this because a moveable object may get moved to an
+    /// address that happens to be in the stub table. If we don't clean the stub
+    /// table, we may incorrectly think a moveable object is actually stubbed.
+    pub fn prune_stubs(&mut self) {
+        let mut to_remove = Vec::new();
+        for (object, _) in &self.stubs {
+            if forwarding::MARK_SPEC.load_atomic::<u8>(*object, Ordering::SeqCst) == 0 {
+                to_remove.push(*object);
+            }
+        }
+        for object in to_remove {
+            self.stubs.remove(&object);
+        }
     }
 
     /// Check if the stub table has a stub for the given object.
@@ -158,18 +187,90 @@ impl<VM: VMBinding> StubTable<VM> {
                 .get_plan()
                 .downcast_ref::<crate::plan::compressor::Compressor<VM>>()
                 .unwrap();
-            for reference in &stub.references {
-                while !forwarding::is_object_pinned::<VM>(*reference) {
-                    forwarding::pin_object::<VM>(*reference);
-                }
-                debug_assert!(forwarding::is_object_pinned::<VM>(*reference));
-                // XXX(kunals): Be careful. We actually need to mark the referent objects.
-                compressor.trace_object::<Q, { super::TRACE_KIND_MARK }>(queue, *reference, worker);
+            for (_, reference) in &stub.references {
                 debug!(
                     "Marking reference {:?} from stub object {:?}",
                     reference, object
                 );
+                // XXX(kunals): Be careful. We actually need to mark the referent objects.
+                compressor.trace_object::<Q, { super::TRACE_KIND_MARK }>(queue, *reference, worker);
+                debug_assert!(
+                    reference.is_reachable(),
+                    "Reference {:?} in stub object {:?} is not marked!",
+                    reference,
+                    object
+                );
             }
+        }
+    }
+
+    /// Update the references in the given stub object. This is called during the
+    /// forwarding phase of a GC to update the references in the stub object to
+    /// point to the correct objects.
+    ///
+    /// Note that this does not actually update the slots inside the object
+    /// itself. It only updates the references in the stub table. The actual
+    /// slots in the object will be updated when the page is swapped back in.
+    pub fn update_object_stub(
+        &mut self,
+        object: ObjectReference,
+        update_closure: &mut dyn FnMut(ObjectReference) -> ObjectReference,
+    ) {
+        debug_assert!(self.has_stub(object));
+        let object_start = object.to_raw_address();
+        let Some(stub) = self.stubs.get_mut(&object_start) else {
+            unreachable!()
+        };
+
+        debug_assert!(
+            forwarding::MARK_SPEC.load_atomic::<u8>(object_start, Ordering::SeqCst) != 0,
+            "Trying to update unmarked object {:?} in stub table!",
+            object
+        );
+
+        for (_, reference) in &mut stub.references {
+            debug_assert!(
+                reference.is_reachable(),
+                "Reference {:?} in stub object {:?} is not marked!",
+                reference,
+                object,
+            );
+            let new_reference = update_closure(*reference);
+            if new_reference != *reference {
+                debug!(
+                    "Updating reference {:?} -> {:?} in stub object {:?}",
+                    reference, new_reference, object
+                );
+                *reference = new_reference;
+            }
+        }
+    }
+
+    /// Regenerate the references in a given stubbed object. This is called when
+    /// a page is swapped back in to update the slots in the object to point to
+    /// the correct references.
+    pub fn regenerate_object(&self, object: ObjectReference) {
+        debug_assert!(self.has_stub(object));
+        #[cfg(feature = "vo_bit")]
+        debug_assert!(vo_bit::is_vo_bit_set(object));
+        let object_start = object.to_raw_address();
+        let Some(stub) = self.stubs.get(&object_start) else {
+            unreachable!()
+        };
+
+        for (slot, reference) in &stub.references {
+            debug!(
+                "Regenerating reference {:?} in stub object {:?}",
+                reference, object
+            );
+            #[cfg(feature = "vo_bit")]
+            debug_assert!(
+                vo_bit::is_vo_bit_set(*reference),
+                "Reference {:?} in stub object {:?} does not have VO bit set!",
+                reference,
+                object
+            );
+            slot.store(*reference);
         }
     }
 
