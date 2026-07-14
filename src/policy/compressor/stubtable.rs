@@ -22,9 +22,6 @@ use std::sync::atomic::Ordering;
 /// of increased memory usage in storing the stubs. If we are conservative and
 /// mark all reachable objects from a page, then we may be keeping completely
 /// unreachable objects alive.
-///
-/// Note that we will pin/mark the directly reachable objects from the stubbed
-/// object so that we can avoid updating references in the stubbed object.
 pub struct StubTable<VM: VMBinding> {
     /// Map from object to its [`Stub`].
     pub stubs: HashMap<Address, Stub<VM>>,
