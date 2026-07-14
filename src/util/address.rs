@@ -3,7 +3,7 @@ use bytemuck::NoUninit;
 
 use std::fmt;
 use std::mem;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 use std::ops::*;
 use std::sync::atomic::Ordering;
 
@@ -602,7 +602,7 @@ use crate::vm::VMBinding;
 /// [NPO]: https://doc.rust-lang.org/std/option/index.html#representation
 #[repr(transparent)]
 #[derive(Copy, Clone, Eq, Hash, PartialOrd, Ord, PartialEq, NoUninit)]
-pub struct ObjectReference(NonZeroUsize);
+pub struct ObjectReference(NonZeroU32);
 
 impl ObjectReference {
     /// The required minimal alignment for object reference. If the object reference's raw address is not aligned to this value,
@@ -611,7 +611,7 @@ impl ObjectReference {
 
     /// Cast the object reference to its raw address.
     pub fn to_raw_address(self) -> Address {
-        Address(self.0.get())
+        Address(self.0.get() as usize)
     }
 
     /// Cast a raw address to an object reference.
@@ -622,7 +622,7 @@ impl ObjectReference {
             addr.is_aligned_to(Self::ALIGNMENT),
             "ObjectReference is required to be word aligned.  addr: {addr}"
         );
-        NonZeroUsize::new(addr.0).map(ObjectReference)
+        NonZeroU32::new(addr.0 as u32).map(ObjectReference)
     }
 
     /// Like `from_raw_address`, but assume `addr` is not zero.  This can be used to elide a check
@@ -639,7 +639,7 @@ impl ObjectReference {
             addr.is_aligned_to(Self::ALIGNMENT),
             "ObjectReference is required to be word aligned.  addr: {addr}"
         );
-        ObjectReference(NonZeroUsize::new_unchecked(addr.0))
+        ObjectReference(NonZeroU32::new_unchecked(addr.0 as u32))
     }
 
     /// Get the header base address from an object reference. This method is used by MMTk to get a base address for the
