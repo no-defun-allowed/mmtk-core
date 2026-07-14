@@ -767,6 +767,18 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             "{:?}: VO bit not set",
             object
         );
+
+        // There is an edge case here wherein an object starts on an unpinned
+        // page and spans into a pinned page, and hence itself is pinned and in
+        // the stub table. However, if such an object dies (since we have
+        // exact GCs), another object may get moved to its location.
+        //
+        // In this case, the new object's address will be in the stub table,
+        // however it is not the same object that intersected a pinned page.
+        // Hence, we need to prune the stub table to remove dead entries. This
+        // saves on space as well so in general, it seems like a good idea. We
+        // prune the stub table at the end of the `CalculateForwarding` phase of
+        // the GC in [`AfterCalculateOffsetVector`].
         #[cfg(feature = "object_pinning")]
         {
             let mut stub_table = self.forwarding.stub_table.write().unwrap();
