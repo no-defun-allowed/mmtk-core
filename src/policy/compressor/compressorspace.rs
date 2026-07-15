@@ -576,7 +576,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         let mut pages_pinned = 0;
         let fraction = fraction.clamp(0.0, 1.0);
         let mut rng = PinRng::new(
-            42,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
             fraction,
             *self.common().options.compressor_mature_pinning_bias,
             mature_fraction,
