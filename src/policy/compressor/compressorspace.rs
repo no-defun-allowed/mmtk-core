@@ -130,6 +130,8 @@ pub struct CompressorSpace<VM: VMBinding> {
     forwarding: forwarding::ForwardingMetadata<VM>,
     scheduler: Arc<GCWorkScheduler<VM>>,
     #[cfg(feature = "object_pinning")]
+    num_pinned_pages: AtomicU32,
+    #[cfg(feature = "object_pinning")]
     cached_pinned_pages: RwLock<HashSet<Address>>,
 }
 
@@ -333,6 +335,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             common,
             scheduler,
             #[cfg(feature = "object_pinning")]
+            num_pinned_pages: AtomicU32::new(0),
+            #[cfg(feature = "object_pinning")]
             cached_pinned_pages: RwLock::new(HashSet::new()),
         }
     }
@@ -482,7 +486,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 )) as Box<dyn GCWork<VM>>);
             });
         self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace].bulk_add(packets);
-        #[cfg(debug_assertions)]
         self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace]
             .set_sentinel(Box::new(ProtectPinnedPages::new(space)));
     }
@@ -611,6 +614,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     total_pages += 1;
                 }
             });
+        self.num_pinned_pages
+            .store(pages_pinned as u32, Ordering::Relaxed);
         info!(
             "Pinned {}/{} pages ({:.2}%) = {} KB",
             pages_pinned,
@@ -1080,24 +1085,47 @@ impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> GCWork<VM> for ScanPinnedPa
     }
 }
 
-#[cfg(all(feature = "object_pinning", debug_assertions))]
+#[cfg(feature = "object_pinning")]
 struct ProtectPinnedPages<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
 }
 
-#[cfg(all(feature = "object_pinning", debug_assertions))]
+#[cfg(feature = "object_pinning")]
 impl<VM: VMBinding> ProtectPinnedPages<VM> {
     fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
         Self { compressor_space }
     }
 }
 
-#[cfg(all(feature = "object_pinning", debug_assertions))]
+#[cfg(feature = "object_pinning")]
 impl<VM: VMBinding> GCWork<VM> for ProtectPinnedPages<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        if *self
+            .compressor_space
+            .common()
+            .options
+            .compressor_print_stub_table_stats
+        {
+            let num_pinned_pages = self
+                .compressor_space
+                .num_pinned_pages
+                .load(Ordering::Relaxed);
+            let filename: &str = &self
+                .compressor_space
+                .common()
+                .options
+                .compressor_stub_table_metadata_file;
+            self.compressor_space
+                .forwarding
+                .stub_table
+                .read()
+                .unwrap()
+                .print_table_size(filename, num_pinned_pages);
+        }
         // Protect pinned pages for the duration of the GC so that we don't touch them accidentally
         // TODO(kunals): Reference processing may need to read from pinned pages.
         // We disable reference processing for now
+        #[cfg(debug_assertions)]
         self.compressor_space.protect_pinned_pages(false);
     }
 }

@@ -3,6 +3,7 @@ use crate::scheduler::GCWorker;
 use crate::util::constants::BYTES_IN_WORD;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
+use crate::util::rust_util::compact_vec::CompactVec;
 use crate::util::{Address, ObjectReference, VMThread, VMWorkerThread};
 use crate::vm::slot::Slot;
 use crate::{vm::*, ObjectQueue};
@@ -25,6 +26,9 @@ use std::sync::atomic::Ordering;
 pub struct StubTable<VM: VMBinding> {
     /// Map from object to its [`Stub`].
     pub stubs: HashMap<Address, Stub<VM>>,
+    pub num_stubs: usize,
+    pub num_references: usize,
+    pub total_object_size: usize,
 }
 
 /// A stub is a representation of an object that keeps track of its references
@@ -34,16 +38,16 @@ pub struct Stub<VM: VMBinding> {
     /// references as a tuple of the slot of the reference in the object and
     /// the reference itself. This allows us to update the object to point to
     /// correct references when we swap the page back in.
-    pub references: Vec<(VM::VMSlot, ObjectReference)>,
+    pub references: CompactVec<(VM::VMSlot, ObjectReference)>,
     /// The size of the object.
-    pub size: usize,
+    pub size: u16,
     phantom: PhantomData<VM>,
 }
 
 impl<VM: VMBinding> Stub<VM> {
     pub fn new() -> Self {
         Stub {
-            references: Vec::new(),
+            references: CompactVec::new(),
             size: 0,
             phantom: PhantomData,
         }
@@ -56,12 +60,12 @@ impl<VM: VMBinding> Stub<VM> {
 
     /// Set the size of the stub.
     pub fn set_size(&mut self, size: usize) {
-        self.size = size;
+        self.size = size as u16;
     }
 
     /// Get the size of the stub.
     pub fn get_size(&self) -> usize {
-        self.size
+        self.size as usize
     }
 }
 
@@ -69,12 +73,69 @@ impl<VM: VMBinding> StubTable<VM> {
     pub fn new() -> Self {
         StubTable {
             stubs: HashMap::new(),
+            num_stubs: 0,
+            num_references: 0,
+            total_object_size: 0,
         }
+    }
+
+    /// Count how many references in the stub table point at an object that is
+    /// also pointed at by at least one other reference in the stub table
+    /// (across the same stub or different stubs). Returns
+    /// `(num_duplicate_references, num_unique_referenced_objects)`.
+    pub fn count_duplicate_references(&self) -> (usize, usize) {
+        let mut counts: HashMap<ObjectReference, usize> = HashMap::new();
+        for stub in self.stubs.values() {
+            for (_, reference) in &stub.references {
+                *counts.entry(*reference).or_insert(0) += 1;
+            }
+        }
+        let num_unique = counts.len();
+        // Every occurrence past the first one for a given object is a duplicate.
+        let num_duplicates = counts.values().map(|&count| count - 1).sum();
+        (num_duplicates, num_unique)
+    }
+
+    pub fn print_table_size(&self, filename: &str, num_pinned_pages: u32) {
+        use std::io::Write;
+
+        let mut metadata_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(filename)
+            .unwrap();
+
+        let stub_size = self.num_stubs * std::mem::size_of::<Stub<VM>>();
+        let moving_metadata_size =
+            stub_size + self.num_references * std::mem::size_of::<(VM::VMSlot, ObjectReference)>();
+        let nonmoving_metadata_size =
+            stub_size + self.num_references * std::mem::size_of::<ObjectReference>();
+        let (num_duplicate_references, num_unique_referenced_objects) =
+            self.count_duplicate_references();
+        writeln!(
+            metadata_file,
+            "num pinned pages: {} ({} bytes); num stubs: {} ({} bytes); num references: {}; num duplicate references: {}; num unique referenced objects: {}; total object size: {}; metadata size (moving): {} (average: {:.2} bytes per page); metadata size (non-moving): {} (average: {:.2} bytes per page)",
+            num_pinned_pages,
+            num_pinned_pages as usize * crate::util::constants::BYTES_IN_PAGE,
+            self.num_stubs,
+            stub_size,
+            self.num_references,
+            num_duplicate_references,
+            num_unique_referenced_objects,
+            self.total_object_size,
+            moving_metadata_size,
+            moving_metadata_size as f64 / num_pinned_pages as f64,
+            nonmoving_metadata_size,
+            nonmoving_metadata_size as f64 / num_pinned_pages as f64,
+        ).unwrap();
     }
 
     /// Clear the stub table.
     pub fn clear(&mut self) {
         self.stubs.clear();
+        self.num_stubs = 0;
+        self.num_references = 0;
+        self.total_object_size = 0;
     }
 
     /// Create a stub for the given object and add it to the stub table.
@@ -97,15 +158,22 @@ impl<VM: VMBinding> StubTable<VM> {
             object,
             stub.get_size(),
         );
+        self.num_stubs += 1;
+        self.num_references += stub.references.len();
+        self.total_object_size += stub.get_size();
         self.stubs.insert(object_start, stub);
     }
 
     /// Remove the stub for the given object from the stub table.
-    #[allow(unused)]
     pub fn remove_stub(&mut self, object: ObjectReference) {
         debug_assert!(self.has_stub(object));
         let object_start = object.to_raw_address();
-        self.stubs.remove(&object_start);
+        let Some(stub) = self.stubs.remove(&object_start) else {
+            unreachable!()
+        };
+        self.num_stubs -= 1;
+        self.num_references -= stub.references.len();
+        self.total_object_size -= stub.get_size();
     }
 
     /// Remove all unmarked stubs from the stub table. This is called after the
@@ -123,7 +191,9 @@ impl<VM: VMBinding> StubTable<VM> {
             }
         }
         for object in to_remove {
-            self.stubs.remove(&object);
+            // SAFETY: We are iterating over the keys of the stub table, which are valid object addresses.
+            let obj = unsafe { ObjectReference::from_raw_address_unchecked(object) };
+            self.remove_stub(obj);
         }
     }
 

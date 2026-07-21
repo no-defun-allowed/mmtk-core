@@ -259,6 +259,11 @@ impl<VM: VMBinding> MMTK<VM> {
             !self.state.is_initialized(),
             "MMTk collection has been initialized (was initialize_collection() already called before?)"
         );
+
+        if *self.options.compressor_print_stub_table_stats {
+            let filename: &str = &self.options.compressor_stub_table_metadata_file;
+            let _ = std::fs::File::create(filename).unwrap();
+        }
         self.scheduler.spawn_gc_threads(self, tls);
         self.state.initialized.store(true, Ordering::SeqCst);
         probe!(mmtk, collection_initialized);

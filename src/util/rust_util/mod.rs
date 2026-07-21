@@ -3,6 +3,7 @@
 //! to provide.
 
 pub mod atomic_box;
+pub mod compact_vec;
 pub mod rev_group;
 pub mod zeroed_alloc;
 

@@ -214,6 +214,7 @@ macro_rules! options {
 
         impl Options {
             /// Set an option and run its validator for its value.
+            #[allow(irrefutable_let_patterns)]
             fn set_from_string_inner(&mut self, s: &str, val: &str) -> Result<(), SetOptionByStringError> {
                 match s {
                     // Parse the given value from str (by env vars or by calling process()) to the right type
@@ -1080,7 +1081,11 @@ options! {
     /// in-place but are never moved. The default of NoPinning disables pinning.
     compressor_pinning_mode: PinningMode            [always_valid] = PinningMode::NoPinning,
     /// Bias for how much more likely is a mature page to be pinned than a nursery one.
-    compressor_mature_pinning_bias: f64             [|v: &f64| *v >= 1.0] = 1.0
+    compressor_mature_pinning_bias: f64             [|v: &f64| *v >= 1.0] = 1.0,
+    /// Print the Compressor stub table stats to a file.
+    compressor_print_stub_table_stats: bool         [always_valid] = false,
+    /// The file name to store the Compressor stub table metadata.
+    compressor_stub_table_metadata_file: String     [always_valid] = String::from("stub_table_metadata.txt")
 }
 
 #[cfg(test)]
