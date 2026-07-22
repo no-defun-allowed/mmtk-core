@@ -50,7 +50,7 @@ pub(crate) const TRACE_KIND_FORWARD: TraceKind = 1;
 #[cfg(feature = "object_pinning")]
 static CACHED_PINNED_PAGES: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "object_pinning")]
-static NUM_GCS: AtomicU32 = AtomicU32::new(0);
+pub(super) static NUM_GCS: AtomicU32 = AtomicU32::new(0);
 
 /// Pins a fixed fraction of all pages (pin_rate), but spends that budget
 /// disproportionately on mature pages.
@@ -1120,7 +1120,7 @@ impl<VM: VMBinding> GCWork<VM> for ProtectPinnedPages<VM> {
                 .stub_table
                 .read()
                 .unwrap()
-                .print_table_size(filename, num_pinned_pages);
+                .print_table_metrics(filename, num_pinned_pages);
         }
         // Protect pinned pages for the duration of the GC so that we don't touch them accidentally
         // TODO(kunals): Reference processing may need to read from pinned pages.
