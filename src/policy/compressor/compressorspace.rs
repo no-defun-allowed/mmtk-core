@@ -524,7 +524,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         #[cfg(feature = "object_pinning")]
         {
             let stub_table = self.forwarding.stub_table.read().unwrap();
-            let all_objects = stub_table.stubs.keys();
+            let all_objects = stub_table.stub_map.keys();
             for object in all_objects {
                 if forwarding::MARK_SPEC.load_atomic::<u8>(*object, Ordering::SeqCst) != 0 {
                     // SAFETY: We are using an object reference from the stub table, which is always valid.

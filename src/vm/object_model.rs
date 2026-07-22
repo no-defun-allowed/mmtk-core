@@ -478,6 +478,10 @@ pub trait ObjectModel<VM: VMBinding> {
         true
     }
 
+    unsafe fn slot_from_object_and_offset(_object: ObjectReference, _offset: isize) -> VM::VMSlot {
+        unimplemented!();
+    }
+
     fn push_threading_list(_object: ObjectReference, _slot: VM::VMSlot) -> bool {
         unimplemented!();
     }
