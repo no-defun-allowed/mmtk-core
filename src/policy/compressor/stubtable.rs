@@ -470,6 +470,20 @@ impl<VM: VMBinding> StubTable<VM> {
         }
     }
 
+    /// Regenerate the references in all stubbed objects. This is called when a
+    /// page is swapped back in to update the slots in the object to point to
+    /// the correct references.
+    pub fn regenerate_objects(&self) {
+        for &object in self.stub_map.keys() {
+            if forwarding::MARK_SPEC
+                .load_atomic::<u8>(object.to_object_start::<VM>(), Ordering::SeqCst)
+                != 0
+            {
+                self.regenerate_object(object);
+            }
+        }
+    }
+
     /// Regenerate the references in a given stubbed object. This is called when
     /// a page is swapped back in to update the slots in the object to point to
     /// the correct references.

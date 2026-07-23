@@ -522,19 +522,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         #[cfg(all(feature = "object_pinning", debug_assertions))]
         self.protect_pinned_pages(true);
         #[cfg(feature = "object_pinning")]
-        {
-            let stub_table = self.forwarding.stub_table.read().unwrap();
-            let all_objects = stub_table.stub_map.keys();
-            for object in all_objects {
-                if forwarding::MARK_SPEC
-                    .load_atomic::<u8>(object.to_object_start::<VM>(), Ordering::SeqCst)
-                    != 0
-                {
-                    // SAFETY: We are using an object reference from the stub table, which is always valid.
-                    stub_table.regenerate_object(*object);
-                }
-            }
-        }
+        self.forwarding
+            .stub_table
+            .read()
+            .unwrap()
+            .regenerate_objects();
     }
 
     #[cfg(feature = "object_pinning")]
