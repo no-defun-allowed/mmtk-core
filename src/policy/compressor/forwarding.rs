@@ -109,7 +109,7 @@ pub(super) fn does_new_address_intersect_pinned_pages(
 
 pub(super) fn get_object_size_from_mark_bits(start: Address) -> usize {
     debug_assert!(
-        MARK_SPEC.load_atomic::<u8>(start, Ordering::Relaxed) != 0,
+        is_address_marked(start, Ordering::Relaxed),
         "The start address {} should have its mark bit set when calculating object size from mark bits.",
         start
     );
@@ -714,6 +714,14 @@ pub(super) fn pin_object<VM: VMBinding>(object: ObjectReference) {
     VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.pin_object::<VM>(object);
 }
 
+pub(super) fn is_object_marked<VM: VMBinding>(object: ObjectReference, order: Ordering) -> bool {
+    MARK_SPEC.load_atomic::<u8>(object.to_object_start::<VM>(), order) != 0
+}
+
+pub(super) fn is_address_marked(address: Address, order: Ordering) -> bool {
+    MARK_SPEC.load_atomic::<u8>(address, order) != 0
+}
+
 impl<VM: VMBinding> ForwardingMetadata<VM> {
     pub fn new(
         compact_limit: CompactLimit,
@@ -1125,7 +1133,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             // let from_obj = unsafe { ObjectReference::from_raw_address_unchecked(address) };
             let region = CompressorRegion::from_unaligned_address(address);
             debug_assert!(
-                MARK_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) != 0,
+                is_address_marked(address, Ordering::Relaxed),
                 "The address to forward should be marked in the bitmap."
             );
             let size = get_object_size_from_mark_bits(address);

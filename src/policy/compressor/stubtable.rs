@@ -282,10 +282,7 @@ impl<VM: VMBinding> StubTable<VM> {
         // arena left-to-right and compact it in a single pass.
         let mut live = Vec::with_capacity(self.stub_map.len());
         for (&object, stub) in &self.stub_map {
-            if forwarding::MARK_SPEC
-                .load_atomic::<u8>(object.to_object_start::<VM>(), Ordering::SeqCst)
-                == 0
-            {
+            if !forwarding::is_object_marked::<VM>(object, Ordering::Relaxed) {
                 to_remove.push(object);
             } else {
                 live.push((stub.offset, object));
@@ -293,10 +290,7 @@ impl<VM: VMBinding> StubTable<VM> {
         }
 
         for (&object, _) in &self.leaf_map {
-            if forwarding::MARK_SPEC
-                .load_atomic::<u8>(object.to_object_start::<VM>(), Ordering::SeqCst)
-                == 0
-            {
+            if !forwarding::is_object_marked::<VM>(object, Ordering::Relaxed) {
                 to_remove.push(object);
             }
         }
@@ -352,12 +346,11 @@ impl<VM: VMBinding> StubTable<VM> {
                     object
                 );
                 debug_assert!(
-                    forwarding::MARK_SPEC
-                        .load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst)
-                        != 0,
+                    forwarding::is_object_marked::<VM>(object, Ordering::SeqCst),
                     "Object {:?} in stub table is not marked!",
                     object
                 );
+                #[cfg(not(feature = "compressor_art_marking"))]
                 debug_assert!(
                     forwarding::MARK_SPEC.load_atomic::<u8>(
                         object.to_raw_address() + size - BYTES_IN_WORD,
@@ -386,11 +379,11 @@ impl<VM: VMBinding> StubTable<VM> {
                 object
             );
             debug_assert!(
-                forwarding::MARK_SPEC.load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst)
-                    != 0,
+                forwarding::is_object_marked::<VM>(object, Ordering::SeqCst),
                 "Object {:?} in stub table is not marked!",
                 object
             );
+            #[cfg(not(feature = "compressor_art_marking"))]
             debug_assert!(
                 forwarding::MARK_SPEC.load_atomic::<u8>(
                     object.to_raw_address() + size - BYTES_IN_WORD,
@@ -441,13 +434,12 @@ impl<VM: VMBinding> StubTable<VM> {
             return;
         }
 
-        let object_start = object.to_raw_address();
         let stub = self.stub_map.get(&object).unwrap();
         let start = stub.offset as usize;
         let end = start + stub.len as usize;
 
         debug_assert!(
-            forwarding::MARK_SPEC.load_atomic::<u8>(object_start, Ordering::SeqCst) != 0,
+            forwarding::is_object_marked::<VM>(object, Ordering::Relaxed),
             "Trying to update unmarked object {:?} in stub table!",
             object
         );
@@ -475,10 +467,7 @@ impl<VM: VMBinding> StubTable<VM> {
     /// the correct references.
     pub fn regenerate_objects(&self) {
         for &object in self.stub_map.keys() {
-            if forwarding::MARK_SPEC
-                .load_atomic::<u8>(object.to_object_start::<VM>(), Ordering::SeqCst)
-                != 0
-            {
+            if forwarding::is_object_marked::<VM>(object, Ordering::Relaxed) {
                 self.regenerate_object(object);
             }
         }
