@@ -25,11 +25,6 @@ use std::sync::Mutex;
 #[cfg(feature = "object_pinning")]
 use std::sync::RwLock;
 
-/// Can we move an object into a pinned page? If not, then we will need to skip over pinned pages
-/// when we are Computing forwarding addresses.
-#[allow(unused)]
-const CAN_MOVE_INTO_PINNED_PAGE: bool = false;
-
 #[cfg(debug_assertions)]
 pub(super) static COMPUTING_FORWARDING_INFO: AtomicBool = AtomicBool::new(false);
 
