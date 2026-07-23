@@ -34,12 +34,17 @@ use std::sync::atomic::Ordering;
 /// arena is compacted lazily, in-place, the next time [`Self::prune_stubs`]
 /// runs (once per GC), so garbage can persist for at most one GC cycle.
 pub struct StubTable<VM: VMBinding> {
-    /// Map from object to its [`Stub`].
+    /// Map from object to its [`Stub`]. Only objects with references are added
+    /// to this map. Leaf objects (i.e. objects with no references) are added to
+    /// [`Self::leaf_map`].
     pub stub_map: HashMap<ObjectReference, Stub<VM>>,
+    /// Map from a leaf object to its size.
+    pub leaf_map: HashMap<ObjectReference, u16>,
     /// Shared backing storage for every stub's references. See the
     /// struct-level docs for how stubs index into this.
     pub stubs: Vec<(u16, ObjectReference)>,
     pub num_stubs: usize,
+    pub num_leaf_stubs: usize,
     pub num_references: usize,
     pub total_object_size: usize,
 }
@@ -81,8 +86,10 @@ impl<VM: VMBinding> StubTable<VM> {
     pub fn new() -> Self {
         StubTable {
             stub_map: HashMap::new(),
+            leaf_map: HashMap::new(),
             stubs: Vec::new(),
             num_stubs: 0,
+            num_leaf_stubs: 0,
             num_references: 0,
             total_object_size: 0,
         }
@@ -117,11 +124,6 @@ impl<VM: VMBinding> StubTable<VM> {
         (num_duplicates, num_unique, top_5pct)
     }
 
-    /// Count how many stubs in the stub table have no references (i.e., they are leaf objects).
-    fn count_leaf_objects(&self) -> usize {
-        self.stub_map.values().filter(|stub| stub.len == 0).count()
-    }
-
     /// Print metrics about the stub table to a file.
     pub fn print_table_metrics(&self, filename: &str, num_pinned_pages: u32) {
         use std::io::Write;
@@ -136,19 +138,20 @@ impl<VM: VMBinding> StubTable<VM> {
         writeln!(metadata_file, "GC epoch {}:", epoch).unwrap();
 
         let stub_size = self.num_stubs * std::mem::size_of::<Stub<VM>>();
+        let leaf_stub_size = self.num_leaf_stubs * std::mem::size_of::<u16>();
         // Use the arena's actual capacity (rather than `num_references *
         // size_of`) since the arena can hold garbage left behind by
         // `remove_stub` until the next `prune_stubs` compacts it away.
         let arena_size = self.stubs.capacity() * std::mem::size_of::<(u16, ObjectReference)>();
-        let moving_metadata_size = stub_size + arena_size;
-        let nonmoving_metadata_size =
-            stub_size + self.num_references * std::mem::size_of::<ObjectReference>();
+        let moving_metadata_size = stub_size + leaf_stub_size + arena_size;
+        let nonmoving_metadata_size = stub_size
+            + leaf_stub_size
+            + self.num_references * std::mem::size_of::<ObjectReference>();
         let (num_duplicate_references, num_unique_referenced_objects, sum_top_5pct_duplicates) =
             self.count_duplicate_references();
-        let num_leaf_objects = self.count_leaf_objects();
         writeln!(
             metadata_file,
-            "  total object size: {} bytes;\n  num pinned pages: {} ({} bytes);\n  num stubs: {} ({} metadata bytes);\n  num references: {} (average: {:.2} references per stub; {:.2} references per page);\n  num duplicate references: {} (sum top 5%: {}; top 5% fraction: {:.2}); num unique referenced objects: {};\n  num leaf objects: {} ({:.2} fraction; {} metadata bytes);\n  metadata size (moving): {} (average: {:.2} bytes per page);\n  metadata size (non-moving): {} (average: {:.2} bytes per page)",
+            "  total object size: {} bytes;\n  num pinned pages: {} ({} bytes);\n  num non-leaf stubs: {} ({} metadata bytes);\n  num references: {} (average: {:.2} references per non-leaf stub; {:.2} references per page);\n  num duplicate references: {} (sum top 5%: {}; top 5% fraction: {:.2}); num unique referenced objects: {};\n  num leaf stubs: {} ({:.2} fraction; {} metadata bytes);\n  metadata size (moving): {} (average: {:.2} bytes per page);\n  metadata size (non-moving): {} (average: {:.2} bytes per page)",
             self.total_object_size,
             num_pinned_pages,
             num_pinned_pages as usize * crate::util::constants::BYTES_IN_PAGE,
@@ -161,9 +164,9 @@ impl<VM: VMBinding> StubTable<VM> {
             sum_top_5pct_duplicates,
             sum_top_5pct_duplicates as f64 / num_duplicate_references as f64,
             num_unique_referenced_objects,
-            num_leaf_objects,
-            num_leaf_objects as f64 / self.num_stubs as f64,
-            num_leaf_objects * std::mem::size_of::<Stub<VM>>(),
+            self.num_leaf_stubs,
+            self.num_leaf_stubs as f64 / (self.num_leaf_stubs + self.num_stubs) as f64,
+            leaf_stub_size,
             moving_metadata_size,
             moving_metadata_size as f64 / num_pinned_pages as f64,
             nonmoving_metadata_size,
@@ -174,8 +177,10 @@ impl<VM: VMBinding> StubTable<VM> {
     /// Clear the stub table.
     pub fn clear(&mut self) {
         self.stub_map.clear();
+        self.leaf_map.clear();
         self.stubs.clear();
         self.num_stubs = 0;
+        self.num_leaf_stubs = 0;
         self.num_references = 0;
         self.total_object_size = 0;
     }
@@ -207,23 +212,36 @@ impl<VM: VMBinding> StubTable<VM> {
             object,
             len
         );
-        let offset = self.stubs.len() as u32;
-        self.stubs.extend(references);
+        if len > 0 {
+            let offset = self.stubs.len() as u32;
+            self.stubs.extend(references);
 
-        let mut stub = Stub::new();
-        stub.offset = offset;
-        stub.len = len as u16;
-        stub.set_size(VM::VMObjectModel::get_current_size(object));
-        debug!(
-            "Adding stub for object {:?} (size {})",
-            object,
-            stub.get_size(),
-        );
+            let mut stub = Stub::new();
+            stub.offset = offset;
+            stub.len = len as u16;
+            stub.set_size(VM::VMObjectModel::get_current_size(object));
+            debug!(
+                "Adding stub for object {:?} (size {})",
+                object,
+                stub.get_size(),
+            );
 
-        self.num_stubs += 1;
-        self.num_references += len;
-        self.total_object_size += stub.get_size();
-        self.stub_map.insert(object, stub);
+            self.num_stubs += 1;
+            self.num_references += len;
+            self.total_object_size += stub.get_size();
+            self.stub_map.insert(object, stub);
+        } else {
+            debug_assert_eq!(len, 0);
+            let size = VM::VMObjectModel::get_current_size(object);
+            debug!("Adding leaf stub for object {:?} (size {})", object, size);
+            self.num_leaf_stubs += 1;
+            self.total_object_size += size;
+            self.leaf_map.insert(object, size as u16);
+        }
+    }
+
+    fn is_leaf_stub(&self, object: ObjectReference) -> bool {
+        self.leaf_map.contains_key(&object)
     }
 
     /// Remove the stub for the given object from the stub table.
@@ -233,12 +251,17 @@ impl<VM: VMBinding> StubTable<VM> {
     /// [`Self::prune_stubs`] compacts the arena.
     pub fn remove_stub(&mut self, object: ObjectReference) {
         debug_assert!(self.has_stub(object));
-        let Some(stub) = self.stub_map.remove(&object) else {
-            unreachable!()
-        };
-        self.num_stubs -= 1;
-        self.num_references -= stub.len as usize;
-        self.total_object_size -= stub.get_size();
+        let is_leaf = self.is_leaf_stub(object);
+        if is_leaf {
+            let size = self.leaf_map.remove(&object).unwrap();
+            self.num_leaf_stubs -= 1;
+            self.total_object_size -= size as usize;
+        } else {
+            let stub = self.stub_map.remove(&object).unwrap();
+            self.num_stubs -= 1;
+            self.num_references -= stub.len as usize;
+            self.total_object_size -= stub.get_size();
+        }
     }
 
     /// Remove all unmarked stubs from the stub table. This is called after the
@@ -269,6 +292,15 @@ impl<VM: VMBinding> StubTable<VM> {
             }
         }
 
+        for (&object, _) in &self.leaf_map {
+            if forwarding::MARK_SPEC
+                .load_atomic::<u8>(object.to_object_start::<VM>(), Ordering::SeqCst)
+                == 0
+            {
+                to_remove.push(object);
+            }
+        }
+
         for object in to_remove {
             self.remove_stub(object);
         }
@@ -291,7 +323,7 @@ impl<VM: VMBinding> StubTable<VM> {
 
     /// Check if the stub table has a stub for the given object.
     pub fn has_stub(&self, object: ObjectReference) -> bool {
-        self.stub_map.contains_key(&object)
+        self.stub_map.contains_key(&object) || self.leaf_map.contains_key(&object)
     }
 
     /// Mark the given stub object and its references. This is called during the
@@ -303,16 +335,45 @@ impl<VM: VMBinding> StubTable<VM> {
         forwarding: &forwarding::ForwardingMetadata<VM>,
         worker: &mut GCWorker<VM>,
     ) {
+        use crate::plan::PlanTraceObject;
+
         debug_assert!(self.has_stub(object));
-        let Some(stub) = self.stub_map.get(&object) else {
-            unreachable!()
-        };
+        if self.is_leaf_stub(object) {
+            if CompressorSpace::<VM>::test_and_mark(object) {
+                let size = self.leaf_map.get(&object).copied().unwrap() as usize;
+                forwarding.mark_rest_of_object_known_size(object, size);
+                while !forwarding::is_object_pinned::<VM>(object) {
+                    forwarding::pin_object::<VM>(object);
+                }
+
+                debug_assert!(
+                    forwarding::is_object_pinned::<VM>(object),
+                    "Object {:?} in stub table is not pinned!",
+                    object
+                );
+                debug_assert!(
+                    forwarding::MARK_SPEC
+                        .load_atomic::<u8>(object.to_raw_address(), Ordering::SeqCst)
+                        != 0,
+                    "Object {:?} in stub table is not marked!",
+                    object
+                );
+                debug_assert!(
+                    forwarding::MARK_SPEC.load_atomic::<u8>(
+                        object.to_raw_address() + size - BYTES_IN_WORD,
+                        Ordering::SeqCst
+                    ) != 0,
+                    "Object end {:?} in stub table is not marked!",
+                    object
+                );
+            }
+            return;
+        }
 
         // If we are the first the mark the object, then go and mark its
         // children as well
+        let stub = self.stub_map.get(&object).unwrap();
         if CompressorSpace::<VM>::test_and_mark(object) {
-            use crate::plan::PlanTraceObject;
-
             let size = stub.get_size();
             forwarding.mark_rest_of_object_known_size(object, size);
             while !forwarding::is_object_pinned::<VM>(object) {
@@ -374,10 +435,14 @@ impl<VM: VMBinding> StubTable<VM> {
         update_closure: &mut dyn FnMut(ObjectReference) -> ObjectReference,
     ) {
         debug_assert!(self.has_stub(object));
+
+        if self.is_leaf_stub(object) {
+            // Nothing to do here; leaf objects have no references to update.
+            return;
+        }
+
         let object_start = object.to_raw_address();
-        let Some(stub) = self.stub_map.get(&object) else {
-            unreachable!()
-        };
+        let stub = self.stub_map.get(&object).unwrap();
         let start = stub.offset as usize;
         let end = start + stub.len as usize;
 
@@ -412,10 +477,13 @@ impl<VM: VMBinding> StubTable<VM> {
         debug_assert!(self.has_stub(object));
         #[cfg(feature = "vo_bit")]
         debug_assert!(vo_bit::is_vo_bit_set(object));
-        let Some(stub) = self.stub_map.get(&object) else {
-            unreachable!()
-        };
 
+        if self.is_leaf_stub(object) {
+            // Nothing to do here; leaf objects have no references to regenerate.
+            return;
+        }
+
+        let stub = self.stub_map.get(&object).unwrap();
         for (offset, reference) in self.references_of(stub) {
             debug!(
                 "Regenerating reference {:?} in stub object {:?}",
@@ -438,9 +506,15 @@ impl<VM: VMBinding> StubTable<VM> {
     /// Get the size of the given object from the stub table. Returns `None` if
     /// the object is not in the stub table.
     pub fn get_size(&self, object: ObjectReference) -> Option<NonZeroUsize> {
-        self.stub_map
-            .get(&object)
-            // SAFETY: The size of an object is always non-zero
-            .map(|stub| unsafe { NonZeroUsize::new_unchecked(stub.get_size()) })
+        if self.is_leaf_stub(object) {
+            let size = self.leaf_map.get(&object).copied()?;
+            // SAFETY: The size of a leaf object is always non-zero
+            return Some(unsafe { NonZeroUsize::new_unchecked(size as usize) });
+        } else {
+            self.stub_map
+                .get(&object)
+                // SAFETY: The size of an object is always non-zero
+                .map(|stub| unsafe { NonZeroUsize::new_unchecked(stub.get_size()) })
+        }
     }
 }
