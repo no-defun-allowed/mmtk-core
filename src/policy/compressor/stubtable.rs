@@ -95,85 +95,6 @@ impl<VM: VMBinding> StubTable<VM> {
         }
     }
 
-    /// Get the references belonging to `stub`.
-    fn references_of(&self, stub: &Stub<VM>) -> &[(u16, ObjectReference)] {
-        let start = stub.offset as usize;
-        let end = start + stub.len as usize;
-        &self.stubs[start..end]
-    }
-
-    /// Count how many references in the stub table point at an object that is
-    /// also pointed at by at least one other reference in the stub table
-    /// (across the same stub or different stubs). Returns
-    /// `(num_duplicate_references, num_unique_referenced_objects, sum_top_5pct_duplicates)`.
-    fn count_duplicate_references(&self) -> (usize, usize, usize) {
-        let mut counts: HashMap<ObjectReference, usize> = HashMap::new();
-        for stub in self.stub_map.values() {
-            for (_, reference) in self.references_of(stub) {
-                *counts.entry(*reference).or_insert(0) += 1;
-            }
-        }
-        let num_unique = counts.len();
-        // Every occurrence past the first one for a given object is a duplicate.
-        let num_duplicates = counts.values().map(|&count| count - 1).sum();
-        let five_pct = (num_unique as f64 * 0.05).ceil() as usize;
-        let mut top_5pct = counts.values().copied().collect::<Vec<_>>();
-        top_5pct.sort_unstable_by(|a, b| b.cmp(a));
-        // The sum of the top 5% of duplicate counts, minus the 1st occurrence for each reference.
-        let top_5pct = top_5pct.into_iter().take(five_pct).sum::<usize>() - five_pct;
-        (num_duplicates, num_unique, top_5pct)
-    }
-
-    /// Print metrics about the stub table to a file.
-    pub fn print_table_metrics(&self, filename: &str, num_pinned_pages: u32) {
-        use std::io::Write;
-
-        let mut metadata_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(filename)
-            .unwrap();
-
-        let epoch = super::NUM_GCS.load(Ordering::SeqCst);
-        writeln!(metadata_file, "GC epoch {}:", epoch).unwrap();
-
-        let stub_size = self.num_stubs * std::mem::size_of::<Stub<VM>>();
-        let leaf_stub_size = self.num_leaf_stubs * std::mem::size_of::<u16>();
-        // Use the arena's actual capacity (rather than `num_references *
-        // size_of`) since the arena can hold garbage left behind by
-        // `remove_stub` until the next `prune_stubs` compacts it away.
-        let arena_size = self.stubs.capacity() * std::mem::size_of::<(u16, ObjectReference)>();
-        let moving_metadata_size = stub_size + leaf_stub_size + arena_size;
-        let nonmoving_metadata_size = stub_size
-            + leaf_stub_size
-            + self.num_references * std::mem::size_of::<ObjectReference>();
-        let (num_duplicate_references, num_unique_referenced_objects, sum_top_5pct_duplicates) =
-            self.count_duplicate_references();
-        writeln!(
-            metadata_file,
-            "  total object size: {} bytes;\n  num pinned pages: {} ({} bytes);\n  num non-leaf stubs: {} ({} metadata bytes);\n  num references: {} (average: {:.2} references per non-leaf stub; {:.2} references per page);\n  num duplicate references: {} (sum top 5%: {}; top 5% fraction: {:.2}); num unique referenced objects: {};\n  num leaf stubs: {} ({:.2} fraction; {} metadata bytes);\n  metadata size (moving): {} (average: {:.2} bytes per page);\n  metadata size (non-moving): {} (average: {:.2} bytes per page)",
-            self.total_object_size,
-            num_pinned_pages,
-            num_pinned_pages as usize * crate::util::constants::BYTES_IN_PAGE,
-            self.num_stubs,
-            stub_size,
-            self.num_references,
-            self.num_references as f64 / self.num_stubs as f64,
-            self.num_references as f64 / num_pinned_pages as f64,
-            num_duplicate_references,
-            sum_top_5pct_duplicates,
-            sum_top_5pct_duplicates as f64 / num_duplicate_references as f64,
-            num_unique_referenced_objects,
-            self.num_leaf_stubs,
-            self.num_leaf_stubs as f64 / (self.num_leaf_stubs + self.num_stubs) as f64,
-            leaf_stub_size,
-            moving_metadata_size,
-            moving_metadata_size as f64 / num_pinned_pages as f64,
-            nonmoving_metadata_size,
-            nonmoving_metadata_size as f64 / num_pinned_pages as f64,
-        ).unwrap();
-    }
-
     /// Clear the stub table.
     pub fn clear(&mut self) {
         self.stub_map.clear();
@@ -183,6 +104,17 @@ impl<VM: VMBinding> StubTable<VM> {
         self.num_leaf_stubs = 0;
         self.num_references = 0;
         self.total_object_size = 0;
+    }
+
+    fn is_leaf_stub(&self, object: ObjectReference) -> bool {
+        self.leaf_map.contains_key(&object)
+    }
+
+    /// Get the references belonging to `stub`.
+    fn references_of(&self, stub: &Stub<VM>) -> &[(u16, ObjectReference)] {
+        let start = stub.offset as usize;
+        let end = start + stub.len as usize;
+        &self.stubs[start..end]
     }
 
     /// Create a stub for the given object and add it to the stub table.
@@ -238,10 +170,6 @@ impl<VM: VMBinding> StubTable<VM> {
             self.total_object_size += size;
             self.leaf_map.insert(object, size as u16);
         }
-    }
-
-    fn is_leaf_stub(&self, object: ObjectReference) -> bool {
-        self.leaf_map.contains_key(&object)
     }
 
     /// Remove the stub for the given object from the stub table.
@@ -515,5 +443,77 @@ impl<VM: VMBinding> StubTable<VM> {
                 // SAFETY: The size of an object is always non-zero
                 .map(|stub| unsafe { NonZeroUsize::new_unchecked(stub.get_size()) })
         }
+    }
+
+    /// Count how many references in the stub table point at an object that is
+    /// also pointed at by at least one other reference in the stub table
+    /// (across the same stub or different stubs). Returns
+    /// `(num_duplicate_references, num_unique_referenced_objects, sum_top_5pct_duplicates)`.
+    fn count_duplicate_references(&self) -> (usize, usize, usize) {
+        let mut counts: HashMap<ObjectReference, usize> = HashMap::new();
+        for stub in self.stub_map.values() {
+            for (_, reference) in self.references_of(stub) {
+                *counts.entry(*reference).or_insert(0) += 1;
+            }
+        }
+        let num_unique = counts.len();
+        // Every occurrence past the first one for a given object is a duplicate.
+        let num_duplicates = counts.values().map(|&count| count - 1).sum();
+        let five_pct = (num_unique as f64 * 0.05).ceil() as usize;
+        let mut top_5pct = counts.values().copied().collect::<Vec<_>>();
+        top_5pct.sort_unstable_by(|a, b| b.cmp(a));
+        // The sum of the top 5% of duplicate counts, minus the 1st occurrence for each reference.
+        let top_5pct = top_5pct.into_iter().take(five_pct).sum::<usize>() - five_pct;
+        (num_duplicates, num_unique, top_5pct)
+    }
+
+    /// Print metrics about the stub table to a file.
+    pub fn print_table_metrics(&self, filename: &str, num_pinned_pages: u32) {
+        use std::io::Write;
+
+        let mut metadata_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(filename)
+            .unwrap();
+
+        let epoch = super::NUM_GCS.load(Ordering::SeqCst);
+        writeln!(metadata_file, "GC epoch {}:", epoch).unwrap();
+
+        let stub_size = self.num_stubs * std::mem::size_of::<Stub<VM>>();
+        let leaf_stub_size = self.num_leaf_stubs * std::mem::size_of::<u16>();
+        // Use the arena's actual capacity (rather than `num_references *
+        // size_of`) since the arena can hold garbage left behind by
+        // `remove_stub` until the next `prune_stubs` compacts it away.
+        let arena_size = self.stubs.capacity() * std::mem::size_of::<(u16, ObjectReference)>();
+        let moving_metadata_size = stub_size + leaf_stub_size + arena_size;
+        let nonmoving_metadata_size = stub_size
+            + leaf_stub_size
+            + self.num_references * std::mem::size_of::<ObjectReference>();
+        let (num_duplicate_references, num_unique_referenced_objects, sum_top_5pct_duplicates) =
+            self.count_duplicate_references();
+        writeln!(
+            metadata_file,
+            "  total object size: {} bytes;\n  num pinned pages: {} ({} bytes);\n  num non-leaf stubs: {} ({} metadata bytes);\n  num references: {} (average: {:.2} references per non-leaf stub; {:.2} references per page);\n  num duplicate references: {} (sum top 5%: {}; top 5% fraction: {:.2}); num unique referenced objects: {};\n  num leaf stubs: {} ({:.2} fraction; {} metadata bytes);\n  metadata size (moving): {} (average: {:.2} bytes per page);\n  metadata size (non-moving): {} (average: {:.2} bytes per page)",
+            self.total_object_size,
+            num_pinned_pages,
+            num_pinned_pages as usize * crate::util::constants::BYTES_IN_PAGE,
+            self.num_stubs,
+            stub_size,
+            self.num_references,
+            self.num_references as f64 / self.num_stubs as f64,
+            self.num_references as f64 / num_pinned_pages as f64,
+            num_duplicate_references,
+            sum_top_5pct_duplicates,
+            sum_top_5pct_duplicates as f64 / num_duplicate_references as f64,
+            num_unique_referenced_objects,
+            self.num_leaf_stubs,
+            self.num_leaf_stubs as f64 / (self.num_leaf_stubs + self.num_stubs) as f64,
+            leaf_stub_size,
+            moving_metadata_size,
+            moving_metadata_size as f64 / num_pinned_pages as f64,
+            nonmoving_metadata_size,
+            nonmoving_metadata_size as f64 / num_pinned_pages as f64,
+        ).unwrap();
     }
 }
