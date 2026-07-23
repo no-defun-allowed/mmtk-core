@@ -162,7 +162,7 @@ impl<VM: VMBinding> SFT for CompressorSpace<VM> {
 
     #[cfg(feature = "object_pinning")]
     fn pin_object(&self, object: ObjectReference) -> bool {
-        VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.pin_object::<VM>(object)
+        forwarding::pin_object::<VM>(object)
     }
 
     #[cfg(feature = "object_pinning")]

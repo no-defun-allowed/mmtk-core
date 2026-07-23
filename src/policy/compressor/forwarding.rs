@@ -710,8 +710,17 @@ pub(super) fn is_object_pinned<VM: VMBinding>(object: ObjectReference) -> bool {
 }
 
 #[cfg(feature = "object_pinning")]
-pub(super) fn pin_object<VM: VMBinding>(object: ObjectReference) {
-    VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.pin_object::<VM>(object);
+fn pin_object_inner<VM: VMBinding>(object: ObjectReference) -> bool {
+    VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.pin_object::<VM>(object)
+}
+
+#[cfg(feature = "object_pinning")]
+pub(super) fn pin_object<VM: VMBinding>(object: ObjectReference) -> bool {
+    let mut pinned = false;
+    while !is_object_pinned::<VM>(object) {
+        pinned = pin_object_inner::<VM>(object);
+    }
+    pinned
 }
 
 pub(super) fn is_object_marked<VM: VMBinding>(object: ObjectReference, order: Ordering) -> bool {
@@ -845,9 +854,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 // Pin the object with probability of pin_fraction
                 let should_pin = rand::random_bool(fraction);
                 if should_pin {
-                    while !is_object_pinned::<VM>(object) {
-                        pin_object::<VM>(object);
-                    }
+                    pin_object::<VM>(object);
                     debug!(
                         "Pinning object at {} of size {} bytes",
                         object.to_raw_address(),
@@ -871,9 +878,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     current_page += BYTES_IN_PAGE;
                 }
                 if should_pin {
-                    while !is_object_pinned::<VM>(object) {
-                        pin_object::<VM>(object);
-                    }
+                    pin_object::<VM>(object);
                     debug!(
                         "Pinning object at {} of size {} bytes",
                         object.to_raw_address(),

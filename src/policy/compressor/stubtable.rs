@@ -336,9 +336,7 @@ impl<VM: VMBinding> StubTable<VM> {
             if CompressorSpace::<VM>::test_and_mark(object) {
                 let size = self.leaf_map.get(&object).copied().unwrap() as usize;
                 forwarding.mark_rest_of_object_known_size(object, size);
-                while !forwarding::is_object_pinned::<VM>(object) {
-                    forwarding::pin_object::<VM>(object);
-                }
+                forwarding::pin_object::<VM>(object);
 
                 debug_assert!(
                     forwarding::is_object_pinned::<VM>(object),
@@ -369,9 +367,7 @@ impl<VM: VMBinding> StubTable<VM> {
         if CompressorSpace::<VM>::test_and_mark(object) {
             let size = stub.get_size();
             forwarding.mark_rest_of_object_known_size(object, size);
-            while !forwarding::is_object_pinned::<VM>(object) {
-                forwarding::pin_object::<VM>(object);
-            }
+            forwarding::pin_object::<VM>(object);
 
             debug_assert!(
                 forwarding::is_object_pinned::<VM>(object),
