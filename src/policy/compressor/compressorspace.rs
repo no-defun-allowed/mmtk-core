@@ -487,7 +487,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             });
         self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace].bulk_add(packets);
         self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace]
-            .set_sentinel(Box::new(ProtectPinnedPages::new(space)));
+            .set_sentinel(Box::new(AfterScanPinnedPages::new(space)));
     }
 
     fn scan_pinned_pages(&self, region: forwarding::CompressorRegion, cursor: Address) {
@@ -1087,19 +1087,19 @@ impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> GCWork<VM> for ScanPinnedPa
 }
 
 #[cfg(feature = "object_pinning")]
-struct ProtectPinnedPages<VM: VMBinding> {
+struct AfterScanPinnedPages<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
 }
 
 #[cfg(feature = "object_pinning")]
-impl<VM: VMBinding> ProtectPinnedPages<VM> {
+impl<VM: VMBinding> AfterScanPinnedPages<VM> {
     fn new(compressor_space: &'static CompressorSpace<VM>) -> Self {
         Self { compressor_space }
     }
 }
 
 #[cfg(feature = "object_pinning")]
-impl<VM: VMBinding> GCWork<VM> for ProtectPinnedPages<VM> {
+impl<VM: VMBinding> GCWork<VM> for AfterScanPinnedPages<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         if *self
             .compressor_space
