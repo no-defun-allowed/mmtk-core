@@ -3,7 +3,7 @@ use crate::scheduler::GCWorker;
 use crate::util::constants::BYTES_IN_WORD;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
-use crate::util::{Address, ObjectReference, VMThread, VMWorkerThread};
+use crate::util::{ObjectReference, VMThread, VMWorkerThread};
 use crate::vm::slot::Slot;
 use crate::{vm::*, ObjectQueue};
 
@@ -35,7 +35,7 @@ use std::sync::atomic::Ordering;
 /// runs (once per GC), so garbage can persist for at most one GC cycle.
 pub struct StubTable<VM: VMBinding> {
     /// Map from object to its [`Stub`].
-    pub stub_map: HashMap<Address, Stub<VM>>,
+    pub stub_map: HashMap<ObjectReference, Stub<VM>>,
     /// Shared backing storage for every stub's references. See the
     /// struct-level docs for how stubs index into this.
     pub stubs: Vec<(u16, ObjectReference)>,
@@ -223,7 +223,7 @@ impl<VM: VMBinding> StubTable<VM> {
         self.num_stubs += 1;
         self.num_references += len;
         self.total_object_size += stub.get_size();
-        self.stub_map.insert(object_start, stub);
+        self.stub_map.insert(object, stub);
     }
 
     /// Remove the stub for the given object from the stub table.
@@ -233,8 +233,7 @@ impl<VM: VMBinding> StubTable<VM> {
     /// [`Self::prune_stubs`] compacts the arena.
     pub fn remove_stub(&mut self, object: ObjectReference) {
         debug_assert!(self.has_stub(object));
-        let object_start = object.to_raw_address();
-        let Some(stub) = self.stub_map.remove(&object_start) else {
+        let Some(stub) = self.stub_map.remove(&object) else {
             unreachable!()
         };
         self.num_stubs -= 1;
@@ -260,7 +259,10 @@ impl<VM: VMBinding> StubTable<VM> {
         // arena left-to-right and compact it in a single pass.
         let mut live = Vec::with_capacity(self.stub_map.len());
         for (&object, stub) in &self.stub_map {
-            if forwarding::MARK_SPEC.load_atomic::<u8>(object, Ordering::SeqCst) == 0 {
+            if forwarding::MARK_SPEC
+                .load_atomic::<u8>(object.to_object_start::<VM>(), Ordering::SeqCst)
+                == 0
+            {
                 to_remove.push(object);
             } else {
                 live.push((stub.offset, object));
@@ -268,9 +270,7 @@ impl<VM: VMBinding> StubTable<VM> {
         }
 
         for object in to_remove {
-            // SAFETY: We are iterating over the keys of the stub table, which are valid object addresses.
-            let obj = unsafe { ObjectReference::from_raw_address_unchecked(object) };
-            self.remove_stub(obj);
+            self.remove_stub(object);
         }
 
         live.sort_unstable_by_key(|&(offset, _)| offset);
@@ -291,8 +291,7 @@ impl<VM: VMBinding> StubTable<VM> {
 
     /// Check if the stub table has a stub for the given object.
     pub fn has_stub(&self, object: ObjectReference) -> bool {
-        let object_start = object.to_raw_address();
-        self.stub_map.contains_key(&object_start)
+        self.stub_map.contains_key(&object)
     }
 
     /// Mark the given stub object and its references. This is called during the
@@ -305,8 +304,7 @@ impl<VM: VMBinding> StubTable<VM> {
         worker: &mut GCWorker<VM>,
     ) {
         debug_assert!(self.has_stub(object));
-        let object_start = object.to_raw_address();
-        let Some(stub) = self.stub_map.get(&object_start) else {
+        let Some(stub) = self.stub_map.get(&object) else {
             unreachable!()
         };
 
@@ -377,7 +375,7 @@ impl<VM: VMBinding> StubTable<VM> {
     ) {
         debug_assert!(self.has_stub(object));
         let object_start = object.to_raw_address();
-        let Some(stub) = self.stub_map.get(&object_start) else {
+        let Some(stub) = self.stub_map.get(&object) else {
             unreachable!()
         };
         let start = stub.offset as usize;
@@ -414,8 +412,7 @@ impl<VM: VMBinding> StubTable<VM> {
         debug_assert!(self.has_stub(object));
         #[cfg(feature = "vo_bit")]
         debug_assert!(vo_bit::is_vo_bit_set(object));
-        let object_start = object.to_raw_address();
-        let Some(stub) = self.stub_map.get(&object_start) else {
+        let Some(stub) = self.stub_map.get(&object) else {
             unreachable!()
         };
 
@@ -441,9 +438,8 @@ impl<VM: VMBinding> StubTable<VM> {
     /// Get the size of the given object from the stub table. Returns `None` if
     /// the object is not in the stub table.
     pub fn get_size(&self, object: ObjectReference) -> Option<NonZeroUsize> {
-        let object_start = object.to_raw_address();
         self.stub_map
-            .get(&object_start)
+            .get(&object)
             // SAFETY: The size of an object is always non-zero
             .map(|stub| unsafe { NonZeroUsize::new_unchecked(stub.get_size()) })
     }

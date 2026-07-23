@@ -526,11 +526,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             let stub_table = self.forwarding.stub_table.read().unwrap();
             let all_objects = stub_table.stub_map.keys();
             for object in all_objects {
-                if forwarding::MARK_SPEC.load_atomic::<u8>(*object, Ordering::SeqCst) != 0 {
+                if forwarding::MARK_SPEC
+                    .load_atomic::<u8>(object.to_object_start::<VM>(), Ordering::SeqCst)
+                    != 0
+                {
                     // SAFETY: We are using an object reference from the stub table, which is always valid.
-                    stub_table.regenerate_object(unsafe {
-                        ObjectReference::from_raw_address_unchecked(*object)
-                    });
+                    stub_table.regenerate_object(*object);
                 }
             }
         }
