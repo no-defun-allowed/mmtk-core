@@ -290,6 +290,7 @@ impl Transducer {
                     } else {
                         map.insert(first_word, region.start() + self.offset as usize - size);
                     }
+                    drop(map);
                     debug!(
                         "Move object at {first_word} -> {} (size {size}): {:#x}",
                         region.start() + self.offset as usize - size,
