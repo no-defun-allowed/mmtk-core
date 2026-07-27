@@ -1018,6 +1018,7 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
         #[cfg(debug_assertions)]
         {
             let map = FORWARDING_MAP.lock().unwrap();
+            info!("Forwarding map has {} live objects", map.len());
             map.iter().for_each(|(from_obj, to_obj)| {
                 use crate::policy::compressor::forwarding::is_object_in_pinned_block;
 
