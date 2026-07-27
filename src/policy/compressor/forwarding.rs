@@ -16,8 +16,10 @@ use crate::util::{Address, ObjectReference};
 use crate::vm::object_model::ObjectModel;
 use crate::vm::VMBinding;
 use atomic::Ordering;
+use itertools::Itertools;
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
+use std::debug_assert;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicBool;
 #[cfg(debug_assertions)]
@@ -68,6 +70,19 @@ impl Region for CompressorRegion {
 pub(crate) type Offset = u32;
 pub(crate) const LOG_BITS_IN_OFFSET: usize = Offset::BITS.ilog2() as usize;
 
+/// Pinned block bit in an offset. If this bit it set, then the block is pinned
+/// and all objects that *start* in this block are considered pinned.
+pub(crate) const PINNED_BLOCK_BIT: u32 = 1 << 2;
+/// Mask for [`PINNED_BLOCK_BIT`].
+pub(crate) const PINNED_BLOCK_MASK: u32 = !PINNED_BLOCK_BIT;
+/// Metadata bits in an offset vector entry.
+pub(crate) const OFFSET_METADATA_BITS: u32 = PINNED_BLOCK_BIT | 0b11;
+/// Mask for the offset value in an offset vector entry.
+pub(crate) const OFFSET_MASK: u32 = !OFFSET_METADATA_BITS;
+
+/// The minimum size of a hole that we will consider for allocation.
+pub(super) const MINIMUM_HOLE_SIZE: usize = 1;
+
 #[cfg(feature = "object_pinning")]
 pub(super) fn does_new_address_intersect_pinned_objects<VM: VMBinding>(
     start: Address,
@@ -75,18 +90,43 @@ pub(super) fn does_new_address_intersect_pinned_objects<VM: VMBinding>(
 ) -> (bool, Option<ObjectReference>) {
     let start_address = start;
     let end_address = start_address + size;
-    let mut current_address = start_address;
-    while current_address < end_address {
-        // SAFETY: We are only creating ObjectReferences from addresses within the MMTk heap
-        let object =
-            unsafe { ObjectReference::from_raw_address_unchecked(Address::from(current_address)) };
-        // TODO(kunals): What if we have multiple objects pinned after one-another? In that case, we should
-        // probably return the end address of the last pinned object
-        if is_object_pinned::<VM>(object) {
-            return (true, Some(object));
+
+    // SAFETY: This function is only called after the Closure phase, so no one
+    // will be modifying the pinning bits of objects.
+    let next_pinned_address = unsafe {
+        VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC
+            .extract_side_spec()
+            .find_next_non_zero_value::<u8>(start + BYTES_IN_WORD, CompressorRegion::BYTES)
+    };
+
+    // SAFETY: This function is only called after the Closure phase, so no one
+    // will be modifying the pinning bits of objects.
+    let prev_pinned_address = unsafe {
+        VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC
+            .extract_side_spec()
+            .find_prev_non_zero_value::<u8>(start, CompressorRegion::BYTES)
+    };
+    // SAFETY: We are only creating ObjectReferences from addresses within the MMTk heap
+    let prev_pinned_object = prev_pinned_address
+        .map(|addr| unsafe { ObjectReference::from_raw_address_unchecked(addr) });
+    let prev_pinned_object_end =
+        prev_pinned_address.map(|addr| addr + get_object_size_from_mark_bits(addr));
+
+    if let Some(prev_pinned_object_end) = prev_pinned_object_end {
+        if prev_pinned_object_end > start_address {
+            return (true, prev_pinned_object);
         }
-        current_address += BYTES_IN_WORD;
     }
+
+    if let Some(next_pinned_address) = next_pinned_address {
+        if next_pinned_address < end_address {
+            // SAFETY: We are only creating ObjectReferences from addresses within the MMTk heap
+            let next_pinned_object =
+                unsafe { ObjectReference::from_raw_address_unchecked(next_pinned_address) };
+            return (true, Some(next_pinned_object));
+        }
+    }
+
     (false, None)
 }
 
@@ -171,6 +211,10 @@ struct Transducer {
     /// offset-vector or forwarding addresses
     #[cfg(feature = "object_pinning")]
     in_pinned_object: bool,
+    /// Whether or not the transducer is currently inside a pinned block
+    /// or not.
+    #[cfg(feature = "object_pinning")]
+    pinned_block: bool,
 }
 
 #[cfg(not(feature = "compressor_art_marking"))]
@@ -182,13 +226,42 @@ impl Transducer {
             in_object: false,
             #[cfg(feature = "object_pinning")]
             in_pinned_object: false,
+            #[cfg(feature = "object_pinning")]
+            pinned_block: false,
         }
     }
     pub fn visit_mark_bit<VM: VMBinding>(
         &mut self,
         address: Address,
+        _add_to_forwarding_map: bool,
         stub_table: &RwLock<stubtable::StubTable<VM>>,
     ) {
+        if _add_to_forwarding_map {
+            debug!(
+                "Visiting mark bit at address {}, in_object: {}, last_bit_visited: {}",
+                address, self.in_object, self.last_bit_visited
+            );
+        }
+
+        // Skip if this is the same address as the last one visited. This happens
+        // when we chase the end of an object while calculating the live data that
+        // *starts* in an unpinned block.
+        if self.last_bit_visited == address {
+            if _add_to_forwarding_map {
+                debug!(
+                    "Skipping mark bit at {address} because it is the same as the last bit visited"
+                );
+            }
+            debug_assert!(
+                self.in_object,
+                "If we are skipping a mark bit, we should be in an object. last_bit_visited: {}, address: {}",
+                self.last_bit_visited, address
+            );
+            self.in_object = false;
+            self.in_pinned_object = false;
+            return;
+        }
+
         if self.in_object {
             // The size of an object is the distance between the end and
             // start of the object, and the last word of the object is one
@@ -198,161 +271,13 @@ impl Transducer {
             let first_word = self.last_bit_visited;
             let last_word = address;
             let size = last_word - first_word + BYTES_IN_WORD;
-            let region = CompressorRegion::from_unaligned_address(first_word);
             #[cfg(debug_assertions)]
-            {
-                let first_page = first_word.align_down(BYTES_IN_PAGE);
-                let mut current_page = first_page;
-                let mut spans_pinned = false;
-                while current_page <= last_word {
-                    if is_page_pinned(current_page) {
-                        spans_pinned = true;
-                        break;
-                    }
-                    current_page += BYTES_IN_PAGE;
-                }
-                if spans_pinned {
-                    assert!(
-                        is_object_pinned::<VM>(unsafe {
-                            ObjectReference::from_raw_address_unchecked(first_word)
-                        }),
-                        "Object at {first_word} (size {size}) spans a pinned page {current_page}, but is not pinned!"
-                    );
-                }
-            }
+            let region = CompressorRegion::from_unaligned_address(first_word);
+
             if !self.in_pinned_object {
-                let mut calculated_offset = false;
-                while !calculated_offset {
-                    let (intersects_pinned, pinned_object) =
-                        does_new_address_intersect_pinned_objects::<VM>(
-                            region.start() + self.offset as usize,
-                            size,
-                        );
-                    debug_assert!(
-                        !intersects_pinned || pinned_object.is_some(),
-                        "If the new address intersects pinned objects, we should have found a pinned object."
-                    );
-                    if intersects_pinned {
-                        let mut pinned_object_mut = pinned_object;
-                        let mut intersects_pinned_mut = true;
-                        let mut potential_forwarding_address =
-                            pinned_object_mut.unwrap().to_object_start::<VM>()
-                                + get_object_size(pinned_object_mut.unwrap(), stub_table);
-                        while intersects_pinned_mut {
-                            debug!(
-                                "Object at 0x{first_word:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
-                                pinned_object_mut.unwrap().to_raw_address(), potential_forwarding_address);
-                            let (intersects_pinned, pinned_object) =
-                                does_new_address_intersect_pinned_objects::<VM>(
-                                    potential_forwarding_address,
-                                    size,
-                                );
-                            intersects_pinned_mut = intersects_pinned;
-                            pinned_object_mut = pinned_object;
-                            if intersects_pinned_mut {
-                                potential_forwarding_address =
-                                    pinned_object_mut.unwrap().to_object_start::<VM>()
-                                        + get_object_size(pinned_object_mut.unwrap(), stub_table);
-                            }
-                        }
-                        let offset = potential_forwarding_address - region.start();
-                        debug_assert!(
-                            !is_object_pinned::<VM>(unsafe {
-                                ObjectReference::from_raw_address_unchecked(region.start() + offset)
-                            }),
-                            "The new offset {} should not intersect with another pinned object {}",
-                            offset,
-                            region.start() + offset,
-                        );
-                        self.offset = offset as Offset;
-                    }
-
-                    let (intersects_pinned_page, pinned_page) =
-                        does_new_address_intersect_pinned_pages(
-                            region.start() + self.offset as usize,
-                            size,
-                        );
-                    if intersects_pinned_page {
-                        use crate::plan::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
-                        use crate::util::metadata::MetadataSpec;
-
-                        calculated_offset = false;
-                        let mut pinned_page_mut = pinned_page;
-                        let mut intersects_pinned_page_mut = true;
-                        let mut potential_forwarding_address =
-                            pinned_page_mut.unwrap() + BYTES_IN_PAGE;
-
-                        while intersects_pinned_page_mut {
-                            debug!(
-                                "Object at {first_word} of size {size} intersects with pinned page at {} after moving. We will skip to the end of the pinned page at {}",
-                                pinned_page_mut.unwrap(), potential_forwarding_address);
-                            let (intersects_pinned_page, pinned_page) =
-                                does_new_address_intersect_pinned_pages(
-                                    potential_forwarding_address,
-                                    size,
-                                );
-                            intersects_pinned_page_mut = intersects_pinned_page;
-                            pinned_page_mut = pinned_page;
-                            if intersects_pinned_page_mut {
-                                potential_forwarding_address =
-                                    pinned_page_mut.unwrap() + BYTES_IN_PAGE;
-                            }
-                        }
-
-                        debug_assert!(potential_forwarding_address.is_aligned_to(BYTES_IN_PAGE));
-                        debug_assert!(
-                            !is_page_pinned(potential_forwarding_address),
-                            "The potential forwarding address {} should not be pinned",
-                            potential_forwarding_address,
-                        );
-
-                        self.offset = (potential_forwarding_address - region.start()) as Offset;
-
-                        match VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.as_spec() {
-                            MetadataSpec::OnSide(spec) => {
-                                // SAFETY: No one will be modifying the pinning bits of objects after the marking has been done
-                                let last_pinned_object_addr = unsafe {
-                                    spec.find_prev_non_zero_value::<u8>(
-                                        potential_forwarding_address,
-                                        MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN,
-                                    )
-                                };
-                                if let Some(last_pinned_object_addr) = last_pinned_object_addr {
-                                    // SAFETY: We only set the pin bits for valid object references during marking
-                                    let last_pinned_object = unsafe {
-                                        ObjectReference::from_raw_address_unchecked(
-                                            last_pinned_object_addr,
-                                        )
-                                    };
-                                    let last_pinned_object_end = last_pinned_object
-                                        .to_object_start::<VM>()
-                                        + get_object_size(last_pinned_object, stub_table);
-                                    // XXX(kunals): Very interesting edge case. Object > 4096. The second page is pinned. The first page is unpinned.
-                                    // We skip to the second page, but find that the second page is pinned so we can't use it! Hence why we have a loop
-                                    // to ensure that we don't accidentally end up intersecting a pinned page/object again.
-                                    if last_pinned_object_end > potential_forwarding_address {
-                                        // The last pinned object extends beyond the end of the pinned page, so we need to skip to the end of the pinned object instead of the end of the pinned page
-                                        info!(
-                                            "The last pinned object at {} extends beyond the end of the pinned page {}. We will skip to the end of the pinned object at {} instead of the end of the pinned page at {}",
-                                            last_pinned_object.to_raw_address(), potential_forwarding_address - BYTES_IN_PAGE, last_pinned_object_end, potential_forwarding_address
-                                        );
-                                        self.offset =
-                                            (last_pinned_object_end - region.start()) as Offset;
-                                    }
-                                }
-                            }
-                            MetadataSpec::InHeader(_) => {
-                                panic!("Local pinning bit needs to be in side metadata");
-                            }
-                        }
-                    } else {
-                        calculated_offset = true;
-                    }
-                }
-
                 self.offset += size as Offset;
                 #[cfg(debug_assertions)]
-                if COMPUTING_FORWARDING_INFO.load(Ordering::SeqCst) {
+                if _add_to_forwarding_map {
                     let mut map = FORWARDING_MAP.lock().unwrap();
                     if map.contains_key(&first_word) {
                         debug_assert_eq!(
@@ -370,10 +295,16 @@ impl Transducer {
                         region.start() + self.offset as usize - size,
                         self.offset
                     );
+                    let (intersects_pinned, pinned_object) =
+                        does_new_address_intersect_pinned_objects::<VM>(
+                            region.start() + self.offset as usize - size,
+                            size,
+                        );
                     debug_assert!(
-                        !does_new_address_intersect_pinned_objects::<VM>(region.start() + self.offset as usize - size, size).0,
-                        "Object at {first_word} moved to {} (size {size}) which intersects with a pinned object!",
+                        !intersects_pinned,
+                        "Object at {first_word} moved to {} (size {size}) which intersects with a pinned object {:?}!",
                         region.start() + self.offset as usize - size,
+                        pinned_object.unwrap()
                     );
                     debug_assert!(
                         !does_new_address_intersect_pinned_pages(region.start() + self.offset as usize - size, size).0,
@@ -388,7 +319,7 @@ impl Transducer {
                 }
             } else {
                 #[cfg(debug_assertions)]
-                if COMPUTING_FORWARDING_INFO.load(Ordering::SeqCst) {
+                if _add_to_forwarding_map {
                     debug!("Skip pinned object at 0x{first_word:#x} -> 0x{first_word:#x} (size {size}): {:#x}", self.offset);
                     let mut map = FORWARDING_MAP.lock().unwrap();
                     if map.contains_key(&first_word) {
@@ -403,11 +334,6 @@ impl Transducer {
                         map.insert(first_word, first_word);
                     }
                 }
-                let pinned_obj_offset = (first_word - region.start()) as Offset;
-                if self.offset == pinned_obj_offset {
-                    // We have no gap remaining between the end of the last object and the start of the pinned object
-                    self.offset += size as Offset;
-                }
             }
         }
         self.in_object = !self.in_object;
@@ -415,9 +341,9 @@ impl Transducer {
         if self.in_object {
             // SAFETY: If we're currently within an object, we have just found the starting mark-bit
             // of the next live object. Hence, the address is a valid ObjectReference.
-            self.in_pinned_object = is_object_pinned::<VM>(unsafe {
-                ObjectReference::from_raw_address_unchecked(address)
-            });
+            let object = unsafe { ObjectReference::from_raw_address_unchecked(address) };
+            self.in_pinned_object =
+                is_object_pinned::<VM>(object) || is_object_in_pinned_block::<VM>(object);
         } else {
             self.in_pinned_object = false;
         }
@@ -425,6 +351,26 @@ impl Transducer {
     }
 
     pub fn visit_mark_bit_forwarding<VM: VMBinding>(&mut self, address: Address) {
+        info!(
+            "Visiting mark bit at address {}, in_object: {}, last_bit_visited: {}, offset: 0x{:x}",
+            address, self.in_object, self.last_bit_visited, self.offset
+        );
+
+        // Skip if this is the same address as the last one visited. This happens
+        // when we chase the end of an object while calculating the live data that
+        // *starts* in an unpinned block.
+        if self.last_bit_visited == address {
+            info!("Skipping mark bit at {address} because it is the same as the last bit visited");
+            debug_assert!(
+                self.in_object,
+                "If we are skipping a mark bit, we should be in an object. last_bit_visited: {}, address: {}",
+                self.last_bit_visited, address
+            );
+            self.in_object = false;
+            self.in_pinned_object = false;
+            return;
+        }
+
         if self.in_object {
             // The size of an object is the distance between the end and
             // start of the object, and the last word of the object is one
@@ -434,171 +380,8 @@ impl Transducer {
             let first_word = self.last_bit_visited;
             let last_word = address;
             let size = last_word - first_word + BYTES_IN_WORD;
-            let region = CompressorRegion::from_unaligned_address(first_word);
-            #[cfg(debug_assertions)]
-            {
-                let first_page = first_word.align_down(BYTES_IN_PAGE);
-                let mut current_page = first_page;
-                let mut spans_pinned = false;
-                while current_page <= last_word {
-                    if is_page_pinned(current_page) {
-                        spans_pinned = true;
-                        break;
-                    }
-                    current_page += BYTES_IN_PAGE;
-                }
-                if spans_pinned {
-                    assert!(
-                        is_object_pinned::<VM>(unsafe {
-                            ObjectReference::from_raw_address_unchecked(first_word)
-                        }),
-                        "Object at {first_word} (size {size}) spans a pinned page {current_page}, but is not pinned!"
-                    );
-                }
-            }
             if !self.in_pinned_object {
-                let mut calculated_offset = false;
-                while !calculated_offset {
-                    let (intersects_pinned, pinned_object) =
-                        does_new_address_intersect_pinned_objects::<VM>(
-                            region.start() + self.offset as usize,
-                            size,
-                        );
-                    debug_assert!(
-                        !intersects_pinned || pinned_object.is_some(),
-                        "If the new address intersects pinned objects, we should have found a pinned object."
-                    );
-                    if intersects_pinned {
-                        let mut pinned_object_mut = pinned_object;
-                        let mut intersects_pinned_mut = true;
-                        let mut potential_forwarding_address =
-                            pinned_object_mut.unwrap().to_object_start::<VM>()
-                                + get_object_size_from_mark_bits(
-                                    pinned_object_mut.unwrap().to_object_start::<VM>(),
-                                );
-                        while intersects_pinned_mut {
-                            debug!(
-                                "Object at 0x{first_word:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
-                                pinned_object_mut.unwrap().to_raw_address(), potential_forwarding_address);
-                            let (intersects_pinned, pinned_object) =
-                                does_new_address_intersect_pinned_objects::<VM>(
-                                    potential_forwarding_address,
-                                    size,
-                                );
-                            intersects_pinned_mut = intersects_pinned;
-                            pinned_object_mut = pinned_object;
-                            if intersects_pinned_mut {
-                                potential_forwarding_address =
-                                    pinned_object_mut.unwrap().to_object_start::<VM>()
-                                        + get_object_size_from_mark_bits(
-                                            pinned_object_mut.unwrap().to_object_start::<VM>(),
-                                        );
-                            }
-                        }
-                        let offset = potential_forwarding_address - region.start();
-                        debug_assert!(
-                            !is_object_pinned::<VM>(unsafe {
-                                ObjectReference::from_raw_address_unchecked(region.start() + offset)
-                            }),
-                            "The new offset {} should not intersect with another pinned object {}",
-                            offset,
-                            region.start() + offset,
-                        );
-                        self.offset = offset as Offset;
-                    }
-
-                    let (intersects_pinned_page, pinned_page) =
-                        does_new_address_intersect_pinned_pages(
-                            region.start() + self.offset as usize,
-                            size,
-                        );
-                    if intersects_pinned_page {
-                        use crate::plan::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
-                        use crate::util::metadata::MetadataSpec;
-
-                        calculated_offset = false;
-                        let mut pinned_page_mut = pinned_page;
-                        let mut intersects_pinned_page_mut = true;
-                        let mut potential_forwarding_address =
-                            pinned_page_mut.unwrap() + BYTES_IN_PAGE;
-
-                        while intersects_pinned_page_mut {
-                            debug!(
-                                "Object at {first_word} of size {size} intersects with pinned page at {} after moving. We will skip to the end of the pinned page at {}",
-                                pinned_page_mut.unwrap(), potential_forwarding_address);
-                            let (intersects_pinned_page, pinned_page) =
-                                does_new_address_intersect_pinned_pages(
-                                    potential_forwarding_address,
-                                    size,
-                                );
-                            intersects_pinned_page_mut = intersects_pinned_page;
-                            pinned_page_mut = pinned_page;
-                            if intersects_pinned_page_mut {
-                                potential_forwarding_address =
-                                    pinned_page_mut.unwrap() + BYTES_IN_PAGE;
-                            }
-                        }
-
-                        debug_assert!(potential_forwarding_address.is_aligned_to(BYTES_IN_PAGE));
-                        debug_assert!(
-                            !is_page_pinned(potential_forwarding_address),
-                            "The potential forwarding address {} should not be pinned",
-                            potential_forwarding_address,
-                        );
-
-                        self.offset = (potential_forwarding_address - region.start()) as Offset;
-
-                        match VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.as_spec() {
-                            MetadataSpec::OnSide(spec) => {
-                                // SAFETY: No one will be modifying the pinning bits of objects after the marking has been done
-                                let last_pinned_object_addr = unsafe {
-                                    spec.find_prev_non_zero_value::<u8>(
-                                        potential_forwarding_address,
-                                        MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN,
-                                    )
-                                };
-                                if let Some(last_pinned_object_addr) = last_pinned_object_addr {
-                                    // SAFETY: We only set the pin bits for valid object references during marking
-                                    let last_pinned_object = unsafe {
-                                        ObjectReference::from_raw_address_unchecked(
-                                            last_pinned_object_addr,
-                                        )
-                                    };
-                                    let last_pinned_object_end = last_pinned_object
-                                        .to_object_start::<VM>()
-                                        + get_object_size_from_mark_bits(
-                                            last_pinned_object.to_object_start::<VM>(),
-                                        );
-                                    // XXX(kunals): Very interesting edge case. Object > 4096. The second page is pinned. The first page is unpinned.
-                                    // We skip to the second page, but find that the second page is pinned so we can't use it! Hence why we have a loop
-                                    // to ensure that we don't accidentally end up intersecting a pinned page/object again.
-                                    if last_pinned_object_end > potential_forwarding_address {
-                                        // The last pinned object extends beyond the end of the pinned page, so we need to skip to the end of the pinned object instead of the end of the pinned page
-                                        info!(
-                                            "The last pinned object at {} extends beyond the end of the pinned page {}. We will skip to the end of the pinned object at {} instead of the end of the pinned page at {}",
-                                            last_pinned_object.to_raw_address(), potential_forwarding_address - BYTES_IN_PAGE, last_pinned_object_end, potential_forwarding_address
-                                        );
-                                        self.offset =
-                                            (last_pinned_object_end - region.start()) as Offset;
-                                    }
-                                }
-                            }
-                            MetadataSpec::InHeader(_) => {
-                                panic!("Local pinning bit needs to be in side metadata");
-                            }
-                        }
-                    } else {
-                        calculated_offset = true;
-                    }
-                }
-
                 self.offset += size as Offset;
-            } else {
-                let pinned_obj_offset = (first_word - region.start()) as Offset;
-                if self.offset == pinned_obj_offset {
-                    // We have no gap remaining between the end of the last object and the start of the pinned object
-                    self.offset += size as Offset;
-                }
             }
         }
         self.in_object = !self.in_object;
@@ -606,50 +389,64 @@ impl Transducer {
         if self.in_object {
             // SAFETY: If we're currently within an object, we have just found the starting mark-bit
             // of the next live object. Hence, the address is a valid ObjectReference.
-            self.in_pinned_object = is_object_pinned::<VM>(unsafe {
-                ObjectReference::from_raw_address_unchecked(address)
-            });
+            let object = unsafe { ObjectReference::from_raw_address_unchecked(address) };
+            self.in_pinned_object =
+                is_object_pinned::<VM>(object) || is_object_in_pinned_block::<VM>(object);
         } else {
             self.in_pinned_object = false;
         }
         self.last_bit_visited = address;
     }
 
-    pub fn encode(&self, _current_position: Address) -> Offset {
+    pub fn encode(&self, current_position: Address) -> Offset {
+        debug_assert!(crate::util::conversions::raw_is_aligned(
+            self.offset as usize,
+            crate::util::constants::MIN_OBJECT_SIZE
+        ));
+        debug_assert!(
+            self.offset & OFFSET_METADATA_BITS == 0,
+            "The offset should have at least 3 free bits for encoding metadata."
+        );
+
         if self.in_object {
-            // We don't count the space between the last mark bit and the
-            // current address as live when we stop in the middle of an object.
-            // Instead, we expect the `forward_base` algorithm to use the
-            // mark-bits to go back to find the original address. This is
-            // required because the forwarding/offset-vector calculation
-            // algorithm assumes we have valid object starts.
-            // TODO(kunals): We could, instead, store the offset of the last
-            // mark-bit _from_ the block start and use that to calculate the
-            // starting address. This avoids scanning backwards in the metadata
-            debug_assert!(crate::util::conversions::raw_is_aligned(
-                self.offset as usize,
-                crate::util::constants::MIN_OBJECT_SIZE
-            ));
-            debug_assert!(self.offset & 0b11 == 0, "The offset should have at least 2 free bits for encoding the in_object and in_pinned_object flags.");
             #[allow(unused_mut)]
             let mut offset = self.offset + 1;
+            // We count the space between the last mark bit and
+            // the current address as live when we stop in the
+            // middle of an object. But we only add this delta
+            // when we are not in a pinned block.
+            let delta = (current_position - self.last_bit_visited) as Offset;
             #[cfg(feature = "object_pinning")]
             if self.in_pinned_object {
                 offset += 0b10;
             }
+            #[cfg(feature = "object_pinning")]
+            if self.pinned_block {
+                offset |= PINNED_BLOCK_BIT;
+            } else {
+                offset += delta;
+            }
             offset
         } else {
-            self.offset
+            #[allow(unused_mut)]
+            let mut offset = self.offset;
+            #[cfg(feature = "object_pinning")]
+            if self.pinned_block {
+                offset |= PINNED_BLOCK_BIT;
+            }
+            offset
         }
     }
 
-    pub fn decode(offset: Offset, current_position: Address) -> Self {
+    pub fn decode(offset: Offset, _current_position: Address) -> Self {
         Transducer {
-            offset: offset & !0b11,
-            last_bit_visited: current_position,
-            in_object: (offset & 1) == 1,
+            offset: offset & OFFSET_MASK,
+            last_bit_visited: Address::ZERO,
+            in_object: (offset & 0b1) == 0b1,
             #[cfg(feature = "object_pinning")]
             in_pinned_object: (offset & 0b10) == 0b10,
+            #[cfg(feature = "object_pinning")]
+            pinned_block: (offset & PINNED_BLOCK_BIT) == PINNED_BLOCK_BIT,
         }
     }
 }
@@ -729,6 +526,28 @@ pub(super) fn is_object_marked<VM: VMBinding>(object: ObjectReference, order: Or
 
 pub(super) fn is_address_marked(address: Address, order: Ordering) -> bool {
     MARK_SPEC.load_atomic::<u8>(address, order) != 0
+}
+
+pub(super) fn pin_block(block: Block) -> bool {
+    OFFSET_VECTOR_SPEC
+        .fetch_update_atomic::<Offset, _>(block.start(), Ordering::SeqCst, Ordering::Relaxed, |v| {
+            if v & PINNED_BLOCK_BIT == 0 {
+                Some(v | PINNED_BLOCK_BIT)
+            } else {
+                None
+            }
+        })
+        .is_ok()
+}
+
+pub(super) fn is_block_pinned(block: Block) -> bool {
+    OFFSET_VECTOR_SPEC.load_atomic::<Offset>(block.start(), Ordering::Relaxed) & PINNED_BLOCK_BIT
+        == PINNED_BLOCK_BIT
+}
+
+pub(super) fn is_object_in_pinned_block<VM: VMBinding>(object: ObjectReference) -> bool {
+    let block = Block::from_unaligned_address(object.to_object_start::<VM>());
+    is_block_pinned(block)
 }
 
 impl<VM: VMBinding> ForwardingMetadata<VM> {
@@ -1010,35 +829,579 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     block.start(),
                     block.end(),
                     &mut |addr: Address| {
-                        state.visit_mark_bit::<VM>(addr, &self.stub_table);
+                        state.visit_mark_bit::<VM>(addr, false, &self.stub_table);
                     },
                 );
             }
             state.offset
         }
 
+        #[cfg(all(feature = "object_pinning", debug_assertions))]
+        fn create_forwarding_map(&self, region: CompressorRegion, cursor: Address) {
+            debug!("Creating forwarding map for region {}-{}", region.start(), cursor);
+            let first_block = Block::from_aligned_address(region.start());
+            let last_block = Block::from_aligned_address(cursor);
+
+            let mut block = first_block;
+            let mut prev_block = Address::ZERO;
+            let mut start = block.start();
+            let mut object_start = block.start();
+            let mut found_object = false;
+            let mut free = std::vec![(first_block.start(), last_block.start())];
+            let mut pinned_ranges = std::vec![];
+            let mut pinned_range_start = Address::ZERO;
+            loop {
+                if start >= cursor {
+                    // We've reached the end of the region, so we can break out of the loop
+                    debug_assert!(
+                        !found_object,
+                        "We should not have found an object if we reached the end of the region"
+                    );
+                    break;
+                }
+                // SAFETY: This is called in the Calculate phase, so no one else is modifying the mark bits.
+                let addr = unsafe {
+                    MARK_SPEC.find_next_non_zero_value::<u8>(start, cursor - start)
+                };
+                if let None = addr {
+                    // We've reached the end of the region, so we can break out of the loop
+                    debug_assert!(
+                        !found_object,
+                        "We should not have found an object if we reached the end of the region"
+                    );
+                    break;
+                }
+                // SAFETY: We just checked that addr is not None, so we can safely unwrap it
+                let addr = unsafe { addr.unwrap_unchecked() };
+
+                debug!("Visiting mark bit at address {}", addr);
+
+                block = Block::from_unaligned_address(addr);
+                // Only update the free list if we have moved to a new block.
+                // if block.start() != prev_block {
+                //     if is_block_pinned(block) {
+                //         let hole = free.pop();
+                //         // SAFETY: We should always have a hole
+                //         let mut hole = unsafe { hole.unwrap_unchecked() };
+                //         if hole.0 == block.start() {
+                //             hole.0 = block.end();
+                //             free.push(hole);
+                //         } else {
+                //             let free_after = (block.end(), hole.1);
+                //             hole.1 = block.start();
+                //             if hole.1 <= hole.0 {
+                //                 // If the free range before the pinned block is
+                //                 // empty, we can just remove it from the free list
+                //             } else if hole.1 - hole.0 < MINIMUM_HOLE_SIZE {
+                //                 // If the free range before the pinned block is too
+                //                 // small, we can just remove it from the free list
+                //             } else {
+                //                 free.push(hole);
+                //             }
+                //             free.push(free_after);
+                //         }
+                //     }
+                //     prev_block = block.start();
+                // }
+
+                if !found_object {
+                    object_start = addr;
+                    found_object = true;
+                    if is_block_pinned(block) {
+                        if pinned_range_start == Address::ZERO {
+                            pinned_range_start = block.start();
+                        }
+                    } else {
+                        if pinned_range_start != Address::ZERO {
+                            pinned_ranges.push((pinned_range_start, block.start()));
+                            pinned_range_start = Address::ZERO;
+                        }
+                    }
+                } else {
+                    let object_end = addr;
+                    let object_size = object_end - object_start + BYTES_IN_WORD;
+                    // SAFETY: The mark bits are only set for valid object references, so the address is a valid ObjectReference.
+                    let object = unsafe { ObjectReference::from_raw_address_unchecked(object_start) };
+                    let object_end_block = Block::from_unaligned_address(object_end);
+                    debug!(
+                        "Found {} object at {}-{} (size {}) in block {}",
+                        if is_object_in_pinned_block::<VM>(object) { "pinned" } else { "movable" },
+                        object_start,
+                        object_start + object_size,
+                        object_size,
+                        Block::from_unaligned_address(object_start).start(),
+                    );
+                    // If we have an object that straddles from a pinned block
+                    // into an unpinned block then we need to update the start
+                    // of the last pushed hole in the free list
+                    // if is_block_pinned(block) && !is_block_pinned(object_end_block) {
+                    //     let hole = free.pop();
+                    //     // SAFETY: We should always have a hole
+                    //     let mut hole = unsafe { hole.unwrap_unchecked() };
+                    //     free.push((object_end + BYTES_IN_WORD, hole.1));
+                    // }
+                    if is_block_pinned(block) {
+                        if pinned_range_start == Address::ZERO {
+                            pinned_range_start = block.start();
+                        }
+                    } else {
+                        if pinned_range_start != Address::ZERO {
+                            pinned_ranges.push((pinned_range_start, object_end + BYTES_IN_WORD));
+                            pinned_range_start = Address::ZERO;
+                        }
+                    }
+                    found_object = false;
+                }
+                start = addr + BYTES_IN_WORD;
+            }
+
+            for pinned_range in pinned_ranges.iter() {
+                let hole = free.pop();
+                // SAFETY: We should always have a hole
+                let mut hole = unsafe { hole.unwrap_unchecked() };
+                hole.1 = pinned_range.0;
+                if hole.1 <= hole.0 {
+                    // If the free range before the pinned block is
+                    // empty, we can just remove it from the free list
+                } else if hole.1 - hole.0 < MINIMUM_HOLE_SIZE {
+                    // If the free range before the pinned block is too
+                    // small, we can just remove it from the free list
+                } else {
+                    free.push(hole);
+                }
+                free.push((pinned_range.1, last_block.start()));
+            }
+
+            debug!(
+                "Created forwarding map for region {}-{} with\n    free list: {:?}\n    pinned ranges: {:?}",
+                region.start(),
+                cursor,
+                free,
+                pinned_ranges,
+            );
+
+            drop(pinned_ranges);
+
+            block = first_block;
+            while block < last_block {
+                // SAFETY: This is called in the Calculate phase, so no one else is modifying the mark bits.
+                if let Some(addr) = unsafe { MARK_SPEC.find_next_non_zero_value::<u8>(start, region.end() - start + 1_usize) } {
+                    block = Block::from_unaligned_address(addr);
+                    if !found_object {
+                        object_start = addr;
+                        found_object = true;
+                    } else {
+                        let object_end = addr;
+                        let object_size = object_end - object_start + BYTES_IN_WORD;
+                        // SAFETY: The mark bits are only set for valid object references, so the address is a valid ObjectReference.
+                        let object = unsafe { ObjectReference::from_raw_address_unchecked(object_start) };
+                        debug_assert!(
+                            is_object_marked::<VM>(object, Ordering::Relaxed),
+                            "Object at {} (size {}) should be marked",
+                            object_start,
+                            object_size,
+                        );
+
+                        debug!(
+                            "Found object at {} (size {}) in block {}",
+                            object_start,
+                            object_size,
+                            block.start(),
+                        );
+
+                        if is_object_in_pinned_block::<VM>(object) {
+                            let mut map = FORWARDING_MAP.lock().unwrap();
+                            if map.contains_key(&object_start) {
+                                debug_assert_eq!(
+                                    map[&object_start],
+                                    object_start,
+                                    "Pinned object at {object_start} should have been forwarded to itself. Old: {}, new: {}",
+                                    map[&object_start],
+                                    object_start,
+                                );
+                            } else {
+                                map.insert(object_start, object_start);
+                            }
+                        } else {
+                            debug_assert!(
+                                !is_object_pinned::<VM>(object),
+                                "Object at {} (size {}) should not be pinned",
+                                object_start,
+                                object_size,
+                            );
+
+                            let Some((hole_idx, hole)) = free.iter_mut().find_position(|(start, end)| {
+                                *end - *start >= object_size
+                            }) else {
+                                panic!("No free hole found for object at {} (size {}) in region {}-{} with free list: {:?}", object_start, object_size, region.start(), cursor, free);
+                            };
+
+                            // We have found a hole that is large enough for the live
+                            // data that *starts* in this block. Store the offset in the
+                            // offset vector and update the hole size
+                            let forwarding_address = hole.0;
+                            hole.0 += object_size;
+
+                            if hole.1 - hole.0 < MINIMUM_HOLE_SIZE {
+                                // If the hole is too small, remove it from the free list
+                                free.remove(hole_idx);
+                            }
+
+                            let mut map = FORWARDING_MAP.lock().unwrap();
+                            if map.contains_key(&object_start) {
+                                debug_assert_eq!(
+                                    map[&object_start],
+                                    forwarding_address,
+                                    "If the object has already been forwarded, it should have the same forwarding address as before. Old: 0x{:x}, new: 0x{:x}",
+                                    map[&object_start],
+                                    forwarding_address,
+                                );
+                            } else {
+                                map.insert(object_start, forwarding_address);
+                            }
+
+                            let (intersects_pinned, pinned_object) =
+                                does_new_address_intersect_pinned_objects::<VM>(
+                                    forwarding_address,
+                                    object_size,
+                                );
+                            debug_assert!(
+                                !intersects_pinned,
+                                "Object at {object_start} moved to {} (size {object_size}) which intersects with a pinned object {:?}!",
+                                forwarding_address,
+                                pinned_object.unwrap(),
+                            );
+                            debug_assert!(
+                                !does_new_address_intersect_pinned_pages(forwarding_address, object_size).0,
+                                "Object at {object_start} moved to {} (size {object_size}) which intersects a pinned page!",
+                                forwarding_address,
+                            );
+                            debug_assert!(
+                                object_start >= forwarding_address,
+                                "Object {object_start} moved to {} (size {object_size}) which is after its original location, potentially overwriting live data!",
+                                forwarding_address,
+                            );
+                        }
+
+                        start = addr + BYTES_IN_WORD;
+                        found_object = false;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
         fn calculate_offset_vector_with_pinning(&self, region: CompressorRegion, cursor: Address) -> Offset {
             use crate::util::linear_scan::RegionIterator;
+
+            // #[cfg(debug_assertions)]
+            // self.create_forwarding_map(region, cursor);
+
             let mut state = Transducer::new();
             let first_block = Block::from_aligned_address(region.start());
             let last_block = Block::from_aligned_address(cursor);
-            for block in RegionIterator::<Block>::new(first_block, last_block) {
-                OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
+
+            let mut last_offset: Offset = 0;
+            let mut free = std::vec![(first_block.start(), last_block.start())];
+            let mut block = first_block;
+            // while block < last_block {
+            for b in RegionIterator::<Block>::new(first_block, last_block) {
+                if b.start() < block.start() {
+                    OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
+                        b.start(),
+                        last_offset,
+                        Ordering::Relaxed,
+                    );
+                    continue;
+                }
+                debug!(
+                    "Calculating offset for block {}; free list: {:?}",
                     block.start(),
-                    state.encode(block.start()),
-                    Ordering::Relaxed,
+                    free,
                 );
-                trace!(
-                    "Offset vector for block {}: {:#x}, in_object: {}, in_pinned_object: {}, last_bit_visited: {}",
-                    block.start(), state.offset, state.in_object, state.in_pinned_object, state.last_bit_visited);
-                MARK_SPEC.scan_non_zero_values::<u8>(
-                    block.start(),
-                    block.end(),
-                    &mut |addr: Address| {
-                        state.visit_mark_bit::<VM>(addr, &self.stub_table);
-                    },
-                );
+                // We have found a pinned block, so we need to update the free list
+                if is_block_pinned(block) {
+                    state.pinned_block = true;
+                    debug!("Found pinned block at {}", block.start());
+                    let hole = free.pop();
+                    debug_assert!(
+                        hole.is_some(),
+                        "We should have a free range to pop for block {}",
+                        block.start(),
+                    );
+                    // SAFETY: We should always have a hole
+                    let mut hole = unsafe { hole.unwrap_unchecked() };
+                    // If the pinned block is at the start of a free range, we
+                    // can just move the start of the free range to the end of
+                    // the pinned block
+                    if hole.0 == block.start() {
+                        debug_assert!(
+                            hole.1 >= block.end(),
+                            "Pinned block {} should not be after the free range {}-{}",
+                            block.start(),
+                            hole.0,
+                            hole.1,
+                        );
+                        // Move the start of the free range to the end of the
+                        // pinned block
+                        hole.0 = block.end();
+                        if hole.0 <= hole.1 {
+                            // If the free range is not empty, we can push it back
+                            free.push(hole);
+                        }
+                    } else {
+                        // If the pinned block is in the middle of a free range,
+                        // we need to split the free range into two ranges, one
+                        // before the pinned block and one after it
+                        let free_after = (block.end(), hole.1);
+                        hole.1 = block.start();
+
+                        debug_assert!(
+                            free_after.0 <= free_after.1,
+                            "Free range {}-{} should be valid",
+                            free_after.0,
+                            free_after.1,
+                        );
+                        debug_assert!(
+                            free_after.1 == last_block.start()
+                        );
+
+                        if hole.1 <= hole.0 {
+                            // If the free range before the pinned block is
+                            // empty, we can just remove it from the free list
+                        } else if hole.1 - hole.0 < MINIMUM_HOLE_SIZE {
+                            // If the free range before the pinned block is too
+                            // small, we can just remove it from the free list
+                        } else {
+                            free.push(hole);
+                        }
+
+                        free.push(free_after);
+                    }
+
+                    // XXX(kunals): This is wrong.
+                    // We don't need to scan the mark bits in a pinned block as
+                    // we don't move any objects inside it
+                    state.offset = (block.start() - region.start()) as Offset;
+                    last_offset = state.encode(state.last_bit_visited);
+                    OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
+                        block.start(),
+                        last_offset,
+                        Ordering::Relaxed,
+                    );
+
+                    // Visit mark bits because we need to figure out if a pinned
+                    // object straddles into an unpinned block.
+                    MARK_SPEC.scan_non_zero_values::<u8>(
+                        block.start(),
+                        block.end(),
+                        &mut |addr: Address| {
+                            state.visit_mark_bit::<VM>(addr, true, &self.stub_table);
+                        },
+                    );
+                    if state.in_object {
+                        debug!(
+                            "Found object {} that straddles pinned block {}",
+                            state.last_bit_visited,
+                            block.start()
+                        );
+                        // If we are in an object, we need to find the next mark
+                        // bit so that we can add the object to the forwarding map
+                        let object_start = state.last_bit_visited;
+                        // SAFETY: This is called in the Calculate phase, so no
+                        // one else is modifying the mark bits.
+                        let object_end = unsafe {
+                            MARK_SPEC.find_next_non_zero_value::<u8>(
+                                object_start + BYTES_IN_WORD,
+                                region.end() - object_start - BYTES_IN_WORD,
+                            )
+                            .expect("Failed to find next non-zero bit")
+                        };
+                        let mut new_state = state.clone();
+                        new_state.visit_mark_bit(object_end, true, &self.stub_table);
+                        // TODO(kunals): It's not that we need to check the end block, but we need to check if
+                        // the object *ever* crosses any unpinned block. If it does, those blocks are actually
+                        // pinned!
+                        let object_end_block = Block::from_unaligned_address(object_end);
+                        debug!(
+                            "Found object {}-{} (size: {}) that straddles a pinned block {}",
+                            object_start,
+                            object_end + BYTES_IN_WORD,
+                            object_end - object_start + BYTES_IN_WORD,
+                            block.start(),
+                        );
+                        // We have found an object that straddles a pinned
+                        // block, so the free range after the pinned block
+                        // should start after the end of this object. Note that
+                        // since this object could end up straddling multiple
+                        // blocks, it is not sufficient to just check the last
+                        // block to see if that is pinned or not. Hence just
+                        // unconditionally update the free range.
+                        let hole = free.pop();
+                        debug_assert!(
+                            hole.is_some(),
+                            "We should have a free range to pop for block {}",
+                            block.start(),
+                        );
+                        // SAFETY: We should always have a hole
+                        let mut hole = unsafe { hole.unwrap_unchecked() };
+                        hole.0 = object_end + BYTES_IN_WORD;
+                        free.push(hole);
+                        block = object_end_block;
+                    } else {
+                        block = block.next();
+                    }
+                } else {
+                    state.offset = 0;
+                    state.pinned_block = false;
+                    let curr_block = block;
+                    let mut orig_state = state.clone();
+
+                    // FIXME(kunals): What happens when the first marked bit in
+                    // a block is in the middle of a *pinned object*? We don't
+                    // visit mark bits in pinned blocks, so the transducer state
+                    // will be incorrect! Do we need to consult the crossing map
+                    // here as well?
+                    MARK_SPEC.scan_non_zero_values::<u8>(
+                        block.start(),
+                        block.end(),
+                        &mut |addr: Address| {
+                            state.visit_mark_bit::<VM>(addr, false, &self.stub_table);
+                        },
+                    );
+                    if state.in_object {
+                        debug!(
+                            "Found object {} that straddles block {}",
+                            state.last_bit_visited,
+                            block.start()
+                        );
+                        // If we are in an object, we need to find the next mark
+                        // bit in order to calculate the size of the object.
+                        // We then add that size to the offset and set in_object
+                        // to false.
+                        let object_start = state.last_bit_visited;
+                        // SAFETY: This is called in the Calculate phase, so no
+                        // one else is modifying the mark bits.
+                        let object_end = unsafe {
+                            MARK_SPEC.find_next_non_zero_value::<u8>(
+                                object_start + BYTES_IN_WORD,
+                                region.end() - object_start - BYTES_IN_WORD + 1_usize,
+                            )
+                            .expect("Failed to find next non-zero bit")
+                        };
+
+                        let mut new_state = state.clone();
+                        new_state.visit_mark_bit(object_end, false, &self.stub_table);
+
+                        #[cfg(debug_assertions)]
+                        {
+                            let object_size = VM::VMObjectModel::get_current_size(
+                                ObjectReference::from_raw_address(object_start).unwrap()
+                            );
+                            debug!(
+                                "Straddling object {} (size: {}) starting in block {}",
+                                object_start,
+                                object_size,
+                                block.start(),
+                            );
+                            debug_assert_eq!(
+                                object_size,
+                                (object_end - object_start + BYTES_IN_WORD) as usize,
+                            );
+                        }
+                        state.offset = new_state.offset;
+                        state.last_bit_visited = object_end;
+                        // state.in_object = false;
+                        // state.in_pinned_object = false;
+                        block = Block::from_unaligned_address(object_end);
+                    } else {
+                        block = block.next();
+                    }
+
+                    let live_data = state.offset as usize;
+                    if live_data == 0 {
+                        debug!("Skipping completely dead block {}", curr_block.start());
+                        continue;
+                    }
+
+                    let Some((hole_idx, hole)) = free.iter_mut().find_position(|(hole_start, hole_end)| {
+                        *hole_end - *hole_start >= live_data
+                    }) else {
+                        panic!("No suitable hole found for live data of size {}", live_data);
+                    };
+
+                    debug!(
+                        "Found hole {}-{} for live data of size {}; block {}",
+                        hole.0,
+                        hole.1,
+                        live_data,
+                        curr_block.start()
+                    );
+
+                    // We have found a hole that is large enough for the live
+                    // data that *starts* in this block. Store the offset in the
+                    // offset vector and update the hole size
+                    state.offset = (hole.0 - region.start()) as Offset;
+                    debug!(
+                        "Storing offset 0x{:x} for block {} (hole {}-{}), in_object: {}, in_pinned_object: {}, last_bit_visited: {}, pinned_block: {}",
+                        state.offset,
+                        curr_block.start(),
+                        hole.0,
+                        hole.1,
+                        orig_state.in_object,
+                        orig_state.in_pinned_object,
+                        state.last_bit_visited,
+                        state.pinned_block,
+                    );
+                    orig_state.offset = state.offset;
+                    last_offset = orig_state.encode(orig_state.last_bit_visited);
+                    OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
+                        curr_block.start(),
+                        last_offset,
+                        Ordering::Relaxed,
+                    );
+                    hole.0 += live_data;
+
+                    if hole.1 - hole.0 < MINIMUM_HOLE_SIZE {
+                        // If the hole is too small, remove it from the free list
+                        free.remove(hole_idx);
+                    }
+
+                    #[cfg(debug_assertions)]
+                    {
+                        let tmp_state = state.clone();
+                        state = orig_state;
+                        MARK_SPEC.scan_non_zero_values::<u8>(
+                            curr_block.start(),
+                            curr_block.end(),
+                            &mut |addr: Address| {
+                                state.visit_mark_bit::<VM>(addr, true, &self.stub_table);
+                            },
+                        );
+                        if state.in_object {
+                            // If we are in an object, we need to find the next mark
+                            // bit in order to calculate the size of the object.
+                            // We then add that size to the offset and set in_object
+                            // to false.
+                            let object_start = state.last_bit_visited;
+                            // SAFETY: This is called in the Calculate phase, so no
+                            // one else is modifying the mark bits.
+                            let object_end = unsafe {
+                                MARK_SPEC.find_next_non_zero_value::<u8>(
+                                    object_start + BYTES_IN_WORD,
+                                    region.end() - object_start - BYTES_IN_WORD + 1_usize,
+                                )
+                                .expect("Failed to find next non-zero bit")
+                            };
+                            state.visit_mark_bit(object_end, true, &self.stub_table);
+                            debug_assert!(!state.in_object);
+                        }
+                        state = tmp_state;
+                    }
+                }
             }
+            debug!("Region: {}-{} free-list: {:?}", region.start(), cursor, free);
             trace!("Finished calculating offset vector for region {}: {:#x}\n", region.start(), state.offset);
             state.offset
         }
@@ -1066,7 +1429,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         let object = unsafe { ObjectReference::from_raw_address_unchecked(address) };
         if !self.is_forwarding_region(region) {
             address
-        } else if is_object_pinned::<VM>(object) {
+        } else if is_object_pinned::<VM>(object) || is_object_in_pinned_block::<VM>(object) {
             address
         } else {
             // This could be less of a mess, and with more compile-time checks,
@@ -1111,195 +1474,80 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     } else {
         fn forward_base(&self, address: Address) -> Offset {
             let block = Block::from_unaligned_address(address);
+            let mut search_start = block.start();
             let mut state = Transducer::decode(
                 OFFSET_VECTOR_SPEC.load_atomic::<Offset>(block.start(), Ordering::Relaxed),
                 block.start(),
             );
-            if state.in_object {
-                let region = CompressorRegion::from_unaligned_address(block.start());
-                // SAFETY: We can safely find the previous non-zero bit since we are in an object, and thus there
-                // must be a previous mark bit which we have visited. No one else can be modifying the mark bits
-                // right now anyway since we're in the Forward phase
-                let object_start = unsafe {
-                    let search_start = block.start() - BYTES_IN_WORD;
-                    MARK_SPEC.find_prev_non_zero_value::<u8>(search_start, search_start - region.start() + 1usize)
-                        .expect("Failed to find previous non-zero bit")
-                };
-                state.last_bit_visited = object_start;
-            }
+            info!(
+                "Forwarding object at {address} in block {} with offset 0x{:x}, in_object {}",
+                block.start(), state.offset, state.in_object,
+            );
             // The transducer in this implementation computes the distance of
             // an object from the start of a region; whereas Total-Live-Data in the
             // paper computes the distance of the object from the start of the block.
-            MARK_SPEC.scan_non_zero_values::<u8>(block.start(), address, &mut |addr: Address| {
-                state.visit_mark_bit_forwarding::<VM>(addr)
-            });
-            // SAFETY: We are creating an ObjectReference from a valid object since we call this
-            // function only for objects
-            // let from_obj = unsafe { ObjectReference::from_raw_address_unchecked(address) };
+            // XXX(kunals): We need to store the offset vector for all blocks to
+            // prevent blocks from reading stale offset values
+            if state.in_object {
+                let end_addr = unsafe {
+                    MARK_SPEC.find_next_non_zero_value::<u8>(block.start(), address - block.start() + 1_usize)
+                        .expect("Failed to find next non-zero bit")
+                };
+                debug_assert!(
+                    is_address_marked(end_addr, Ordering::Relaxed),
+                    "The next non-zero mark bit should be marked in the bitmap; end_addr: {}",
+                    end_addr,
+                );
+                debug_assert!(
+                    end_addr < address,
+                    "The next non-zero mark bit should be before the address to forward; end_addr: {}, address: {}",
+                    end_addr,
+                    address,
+                );
+                debug_assert_eq!(
+                    block, Block::from_unaligned_address(end_addr)
+                );
+                search_start = end_addr + BYTES_IN_WORD;
+                state.last_bit_visited = end_addr;
+                state.in_object = false;
+                state.in_pinned_object = false;
+                info!(
+                    "Finishing off the object that straddles the block; last_bit_visited: {}, offset: 0x{:x}",
+                    state.last_bit_visited, state.offset,
+                );
+            }
+            MARK_SPEC.scan_non_zero_values::<u8>(
+                search_start,
+                address,
+                &mut |addr: Address| {
+                    state.visit_mark_bit_forwarding::<VM>(addr);
+                },
+            );
+            debug_assert!(
+                !state.in_object,
+                "We should not be in an object after visiting all mark bits up to the address {} to forward; state: offset 0x{:x}, last_bit_visited: {}, in_pinned_object: {}, pinned_block: {}",
+                address,
+                state.offset,
+                state.last_bit_visited,
+                state.in_pinned_object,
+                state.pinned_block,
+            );
             let region = CompressorRegion::from_unaligned_address(address);
             debug_assert!(
                 is_address_marked(address, Ordering::Relaxed),
                 "The address to forward should be marked in the bitmap."
             );
-            let size = get_object_size_from_mark_bits(address);
-            let mut calculated_offset = false;
-            while !calculated_offset {
-                let (intersects_pinned, pinned_object) =
-                    does_new_address_intersect_pinned_objects::<VM>(
-                        region.start() + state.offset as usize,
-                        size,
-                    );
-                debug_assert!(
-                    !intersects_pinned || pinned_object.is_some(),
-                    "Forwarding: if the new address intersects pinned objects, we should have found a pinned object."
-                );
-                if intersects_pinned {
-                    let mut pinned_object_mut = pinned_object;
-                    let mut intersects_pinned_mut = true;
-                    debug_assert!(
-                        is_object_pinned::<VM>(pinned_object_mut.unwrap())
-                    );
-                    let mut potential_forwarding_address =
-                        pinned_object_mut.unwrap().to_object_start::<VM>()
-                            + get_object_size_from_mark_bits(pinned_object_mut.unwrap().to_object_start::<VM>());
-                    while intersects_pinned_mut {
-                        debug!(
-                            "Forwarding: object at 0x{address:#x} of size {size} intersects with pinned object at 0x{:x} after moving. We will skip to the end of the pinned object at 0x{:#x}",
-                            pinned_object_mut.unwrap().to_raw_address(), potential_forwarding_address);
-                        let (intersects_pinned, pinned_object) =
-                            does_new_address_intersect_pinned_objects::<VM>(
-                                potential_forwarding_address,
-                                size,
-                            );
-                        intersects_pinned_mut = intersects_pinned;
-                        pinned_object_mut = pinned_object;
-                        if intersects_pinned_mut {
-                            potential_forwarding_address = pinned_object_mut
-                                .unwrap()
-                                .to_object_start::<VM>()
-                                + get_object_size_from_mark_bits(pinned_object_mut.unwrap().to_object_start::<VM>());
-                        }
-                    }
-                    let offset = potential_forwarding_address - region.start();
-                    debug_assert!(
-                        !is_object_pinned::<VM>(unsafe {
-                            ObjectReference::from_raw_address_unchecked(region.start() + offset)
-                        }),
-                        "Forwarding: the new offset {} should not intersect with another pinned object {}",
-                        offset,
-                        region.start() + offset,
-                    );
-                    state.offset = offset as Offset;
-                }
-
-                let (intersects_pinned_page, pinned_page) = does_new_address_intersect_pinned_pages(
-                    region.start() + state.offset as usize,
-                    size,
-                );
-                if intersects_pinned_page {
-                    use crate::plan::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
-                    use crate::util::metadata::MetadataSpec;
-
-                    calculated_offset = false;
-                    let mut pinned_page_mut = pinned_page;
-                    let mut intersects_pinned_page_mut = true;
-                    let mut potential_forwarding_address = pinned_page_mut.unwrap() + BYTES_IN_PAGE;
-
-                    while intersects_pinned_page_mut {
-                        debug!(
-                            "Forwarding: object at {address} of size {size} intersects with pinned page at {} after moving. We will skip to the end of the pinned page at {}",
-                            pinned_page_mut.unwrap(), potential_forwarding_address);
-                        let (intersects_pinned_page, pinned_page) =
-                            does_new_address_intersect_pinned_pages(
-                                potential_forwarding_address,
-                                size,
-                            );
-                        intersects_pinned_page_mut = intersects_pinned_page;
-                        pinned_page_mut = pinned_page;
-                        if intersects_pinned_page_mut {
-                            potential_forwarding_address = pinned_page_mut.unwrap() + BYTES_IN_PAGE;
-                        }
-                    }
-
-                    debug_assert!(potential_forwarding_address.is_aligned_to(BYTES_IN_PAGE));
-                    debug_assert!(
-                        !is_page_pinned(potential_forwarding_address),
-                        "The potential forwarding address {} should not be pinned",
-                        potential_forwarding_address,
-                    );
-
-                    state.offset = (potential_forwarding_address - region.start()) as Offset;
-
-                    match VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.as_spec() {
-                        MetadataSpec::OnSide(spec) => {
-                            // SAFETY: No one will be modifying the pinning bits of objects after the marking has been done
-                            let last_pinned_object_addr = unsafe {
-                                spec.find_prev_non_zero_value::<u8>(
-                                    potential_forwarding_address,
-                                    MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN,
-                                )
-                            };
-                            if let Some(last_pinned_object_addr) = last_pinned_object_addr {
-                                // SAFETY: We only set the pin bits for valid object references during marking
-                                let last_pinned_object = unsafe {
-                                    ObjectReference::from_raw_address_unchecked(
-                                        last_pinned_object_addr,
-                                    )
-                                };
-                                let last_pinned_object_end = last_pinned_object
-                                    .to_object_start::<VM>()
-                                    + get_object_size_from_mark_bits(last_pinned_object_addr);
-                                if last_pinned_object_end > potential_forwarding_address {
-                                    // The last pinned object extends beyond the end of the pinned page, so we need to skip to the end of the pinned object instead of the end of the pinned page
-                                    info!(
-                                        "The last pinned object at {} extends beyond the end of the pinned page {}. We will skip to the end of the pinned object at {} instead of the end of the pinned page at {}",
-                                        last_pinned_object.to_raw_address(), potential_forwarding_address - BYTES_IN_PAGE, last_pinned_object_end, potential_forwarding_address
-                                    );
-                                    state.offset =
-                                        (last_pinned_object_end - region.start()) as Offset;
-                                }
-                            }
-                        }
-                        MetadataSpec::InHeader(_) => {
-                            panic!("Local pinning bit needs to be in side metadata");
-                        }
-                    }
-                } else {
-                    calculated_offset = true;
-                }
-            }
-
-            debug!("Forwarding object at 0x{address:#x} -> 0x{:#x} (size {size}): {:#x}\n", region.start() + state.offset as usize, state.offset);
+            debug!("Forwarding object at {address} -> {}: {:#x}\n", region.start() + state.offset as usize, state.offset);
             #[cfg(debug_assertions)]
             {
                 let map = FORWARDING_MAP.lock().unwrap();
-                let mut block_state = Transducer::decode(
-                    OFFSET_VECTOR_SPEC.load_atomic::<Offset>(block.start(), Ordering::Relaxed),
-                    block.start(),
-                );
-                if block_state.in_object {
-                    let region = CompressorRegion::from_unaligned_address(block.start());
-                    // SAFETY: We can safely find the previous non-zero bit since we are in an object, and thus there
-                    // must be a previous mark bit which we have visited. No one else can be modifying the mark bits
-                    // right now anyway since we're in the Forward phase
-                    let object_start = unsafe {
-                        let search_start = block.start() - BYTES_IN_WORD;
-                        MARK_SPEC.find_prev_non_zero_value::<u8>(search_start, search_start - region.start() + 1usize)
-                            .expect("Failed to find previous non-zero bit")
-                    };
-                    block_state.last_bit_visited = object_start;
-                }
                 debug_assert_eq!(
                     region.start() + state.offset as usize,
                     map[&address],
-                    "The forwarding address should match the one in the forwarding map. Expected: 0x{:x}, actual: 0x{:x}\n    block start: 0x{:x}, offset: {:#x} in_object: {}, in_pinned_object: {}, last_bit_visited: 0x{:x}",
+                    "The forwarding address should match the one in the forwarding map. Expected: {}, actual: {}; block start: {}",
                     map[&address],
                     region.start() + state.offset as usize,
                     block.start(),
-                    block_state.offset,
-                    block_state.in_object,
-                    block_state.in_pinned_object,
-                    block_state.last_bit_visited,
                 );
             }
             state.offset
@@ -1458,7 +1706,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 block.start(),
                 block.end(),
                 &mut |addr: Address| {
-                    state.visit_mark_bit::<VM>(addr, &self.stub_table);
+                    state.visit_mark_bit::<VM>(addr, true, &self.stub_table);
                     if state.in_object {
                         let o = ObjectReference::from_raw_address(addr).unwrap();
                         VM::VMObjectModel::finalise_threading_list(o);
@@ -1471,7 +1719,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 block.start(),
                 block.end(),
                 &mut |addr: Address| {
-                    second_state.visit_mark_bit::<VM>(addr, &self.stub_table);
+                    second_state.visit_mark_bit::<VM>(addr, true, &self.stub_table);
                     if second_state.in_object {
                         let o = ObjectReference::from_raw_address(addr).unwrap();
                         move_object(o);

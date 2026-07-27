@@ -5,6 +5,8 @@ use crate::policy::compressor::forwarding;
 use crate::policy::compressor::forwarding::does_new_address_intersect_pinned_pages;
 #[cfg(all(feature = "object_pinning", debug_assertions))]
 use crate::policy::compressor::forwarding::is_page_pinned;
+#[cfg(feature = "object_pinning")]
+use crate::policy::compressor::forwarding::Block;
 #[cfg(all(feature = "object_pinning", debug_assertions))]
 use crate::policy::compressor::forwarding::{
     does_new_address_intersect_pinned_objects, COMPUTING_FORWARDING_INFO, FORWARDING_MAP,
@@ -23,6 +25,8 @@ use crate::util::copy::CopySemantics;
 use crate::util::heap::regionpageresource::AllocatedRegion;
 use crate::util::heap::{PageResource, RegionPageResource};
 use crate::util::linear_scan::Region;
+#[cfg(feature = "object_pinning")]
+use crate::util::linear_scan::RegionIterator;
 use crate::util::metadata::extract_side_metadata;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
@@ -503,8 +507,20 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 let (intersects_pinned_page, _) =
                     does_new_address_intersect_pinned_pages(curr, obj_size);
 
+                let block = forwarding::Block::from_unaligned_address(curr);
                 if intersects_pinned_page {
                     self.forwarding.stub_table.write().unwrap().add_stub(obj);
+                    for b in RegionIterator::<Block>::new(
+                        block,
+                        Block::from_unaligned_address(curr + obj_size),
+                    ) {
+                        if forwarding::pin_block(b) {
+                            info!(
+                                "Pinning new block {:?} because of pinned object {:?}",
+                                b, obj
+                            );
+                        }
+                    }
                 }
 
                 // Skip to end of object
@@ -594,6 +610,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         pages_pinned += 1;
                         if !need_to_cache {
                             forwarding::PINNED_PAGE_SPEC.store_atomic(page, 1_u8, Ordering::SeqCst);
+                            let block_start = forwarding::Block::from_aligned_address(page);
+                            let block_end =
+                                forwarding::Block::from_aligned_address(page + BYTES_IN_PAGE);
+                            for block in RegionIterator::<Block>::new(block_start, block_end) {
+                                forwarding::pin_block(block);
+                            }
                         } else {
                             self.cached_pinned_pages.write().unwrap().insert(page);
                         }
@@ -629,6 +651,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 while page < end {
                     if cached_pinned_pages.contains(&page) {
                         forwarding::PINNED_PAGE_SPEC.store_atomic(page, 1_u8, Ordering::SeqCst);
+                        let block_start = forwarding::Block::from_aligned_address(page);
+                        let block_end =
+                            forwarding::Block::from_aligned_address(page + BYTES_IN_PAGE);
+                        for block in RegionIterator::<Block>::new(block_start, block_end) {
+                            forwarding::pin_block(block);
+                        }
                         info!("Pinning cached page {}", page);
                     }
                     page += BYTES_IN_PAGE;
@@ -874,7 +902,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         // marked, and we compute the live data and thus the forwarding
                         // addresses based on those sizes. The forwarding addresses would be
                         // incorrect if the sizes of objects were to change.
-                        let copied_size = if self.is_pinned(obj) {
+                        let copied_size = if self.is_pinned(obj) || forwarding::is_object_in_pinned_block::<VM>(obj) {
                             forwarding::get_object_size_from_mark_bits(obj.to_object_start::<VM>())
                         } else {
                             VM::VMObjectModel::get_size_when_copied(obj)
@@ -887,7 +915,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         );
                         #[cfg(debug_assertions)]
                         {
-                            if !self.is_pinned(obj) {
+                            if !(self.is_pinned(obj) || forwarding::is_object_in_pinned_block::<VM>(obj)) {
                                 let (intersects_pinned, pinned_object) = does_new_address_intersect_pinned_objects::<VM>(new_object.to_raw_address(), copied_size);
                                 debug_assert!(
                                     !intersects_pinned,
@@ -920,9 +948,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         self.update_references::<CAN_CLMUL>(worker, new_object);
                     });
                 debug_assert!(to <= r.cursor());
+                let perfect_compaction_end = r.region.start() + total_live_bytes;
                 info!(
-                    "Compacted region [{}, {}) -> {to} with {objects} objects; saved {} bytes (copied {} bytes; live {} bytes)",
-                    r.region.start(), r.cursor(), r.cursor() - to, total_copied_bytes, total_live_bytes,
+                    "Compacted region [{}, {}) -> {to} with {objects} objects; saved {} bytes ({:.2}% savings) (copied {} bytes; live {} bytes)",
+                    r.region.start(), r.cursor(), r.cursor() - to,
+                    (r.cursor() - to) as f64 / (r.cursor() - perfect_compaction_end) as f64 * 100.0, total_copied_bytes, total_live_bytes,
                 );
                 self.pr.reset_cursor(r, to);
             } else {
@@ -984,14 +1014,18 @@ impl<VM: VMBinding> AfterCalculateOffsetVector<VM> {
 
 impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
+        info!("Finished calculating offset vector for all regions");
         {
             let mut stub_table = self.compressor_space.forwarding.stub_table.write().unwrap();
             stub_table.prune_stubs();
         }
+        info!("Finished pruning stub table");
         #[cfg(debug_assertions)]
         {
             let map = FORWARDING_MAP.lock().unwrap();
             map.iter().for_each(|(from_obj, to_obj)| {
+                use crate::policy::compressor::forwarding::is_object_in_pinned_block;
+
                 let from_obj = ObjectReference::from_raw_address(*from_obj).unwrap();
                 let to_obj = ObjectReference::from_raw_address(*to_obj).unwrap();
                 #[cfg(feature = "vo_bit")]
@@ -1000,7 +1034,7 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
                     "{:?}: VO bit not set",
                     from_obj,
                 );
-                if self.compressor_space.is_object_pinned(from_obj) {
+                if self.compressor_space.is_object_pinned(from_obj) || is_object_in_pinned_block::<VM>(from_obj) {
                     debug_assert_eq!(
                         from_obj, to_obj,
                         "Pinned object {:?} was forwarded to {:?}!",
@@ -1008,6 +1042,11 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
                     );
                 } else {
                     let size = VM::VMObjectModel::get_size_when_copied(from_obj);
+                    debug_assert!(
+                        from_obj.to_object_start::<VM>() >= to_obj.to_object_start::<VM>(),
+                        "Object {:?} was forwarded to {:?} which is after it, potentially overwriting data!",
+                        from_obj, to_obj
+                    );
                     let (intersects_pinned, pinned_object) =
                         does_new_address_intersect_pinned_objects::<VM>(
                             to_obj.to_raw_address(),
@@ -1042,6 +1081,7 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
             });
 
             COMPUTING_FORWARDING_INFO.store(false, Ordering::SeqCst);
+            info!("Finished checking forwarding map for correctness");
         }
     }
 }
