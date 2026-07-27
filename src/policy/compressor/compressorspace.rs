@@ -510,16 +510,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 let block = forwarding::Block::from_unaligned_address(curr);
                 if intersects_pinned_page {
                     self.forwarding.stub_table.write().unwrap().add_stub(obj);
-                    for b in RegionIterator::<Block>::new(
-                        block,
-                        Block::from_unaligned_address(curr + obj_size),
-                    ) {
-                        if forwarding::pin_block(b) {
-                            info!(
-                                "Pinning new block {:?} because of pinned object {:?}",
-                                b, obj
-                            );
-                        }
+                    if forwarding::pin_block(block) {
+                        info!(
+                            "Pinning new block {:?} because of pinned object {:?}",
+                            block, obj
+                        );
                     }
                 }
 
