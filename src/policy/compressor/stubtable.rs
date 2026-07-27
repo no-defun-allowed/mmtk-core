@@ -179,16 +179,31 @@ impl<VM: VMBinding> StubTable<VM> {
     /// [`Self::prune_stubs`] compacts the arena.
     pub fn remove_stub(&mut self, object: ObjectReference) {
         debug_assert!(self.has_stub(object));
+        debug_assert!(
+            !forwarding::is_object_marked::<VM>(object, Ordering::Relaxed),
+            "Trying to remove marked object {:?} from stub table!",
+            object
+        );
         let is_leaf = self.is_leaf_stub(object);
         if is_leaf {
             let size = self.leaf_map.remove(&object).unwrap();
             self.num_leaf_stubs -= 1;
             self.total_object_size -= size as usize;
+            debug!(
+                "Removing leaf stub for object {:?} (size: {})",
+                object, size,
+            );
         } else {
             let stub = self.stub_map.remove(&object).unwrap();
             self.num_stubs -= 1;
             self.num_references -= stub.len as usize;
             self.total_object_size -= stub.get_size();
+            debug!(
+                "Removing non-leaf stub for object {:?} (size: {}; references: {})",
+                object,
+                stub.get_size(),
+                stub.len,
+            );
         }
     }
 
@@ -262,6 +277,7 @@ impl<VM: VMBinding> StubTable<VM> {
         debug_assert!(self.has_stub(object));
         if self.is_leaf_stub(object) {
             if CompressorSpace::<VM>::test_and_mark(object) {
+                debug!("Marking leaf stub object {:?}", object);
                 let size = self.leaf_map.get(&object).copied().unwrap() as usize;
                 forwarding.mark_rest_of_object_known_size(object, size);
                 forwarding::pin_object::<VM>(object);
@@ -293,6 +309,7 @@ impl<VM: VMBinding> StubTable<VM> {
         // children as well
         let stub = self.stub_map.get(&object).unwrap();
         if CompressorSpace::<VM>::test_and_mark(object) {
+            debug!("Marking non-leaf stub object {:?}", object);
             let size = stub.get_size();
             forwarding.mark_rest_of_object_known_size(object, size);
             forwarding::pin_object::<VM>(object);
@@ -317,11 +334,15 @@ impl<VM: VMBinding> StubTable<VM> {
                 object
             );
 
-            let compressor = worker
-                .mmtk
-                .get_plan()
-                .downcast_ref::<crate::plan::compressor::Compressor<VM>>()
-                .unwrap();
+            // SAFETY: The stub table is only used by the CompressorSpace in the
+            // Compressor plan, so it is safe to downcast here
+            let compressor = unsafe {
+                worker
+                    .mmtk
+                    .get_plan()
+                    .downcast_ref::<crate::plan::compressor::Compressor<VM>>()
+                    .unwrap_unchecked()
+            };
             for (_, reference) in self.references_of(stub) {
                 debug!(
                     "Marking reference {:?} from stub object {:?}",
