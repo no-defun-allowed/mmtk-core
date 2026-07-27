@@ -995,7 +995,7 @@ impl SideMetadataSpec {
         if self.uses_contiguous_side_metadata() {
             // Contiguous side metadata
             let result = self.find_prev_non_zero_value_fast::<T>(data_addr, search_limit_bytes);
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, feature = "extreme_assertions"))]
             {
                 // Double check if the implementation is correct
                 let result2 =
@@ -1147,7 +1147,7 @@ impl SideMetadataSpec {
         if self.uses_contiguous_side_metadata() {
             // Contiguous side metadata
             let result = self.find_next_non_zero_value_fast::<T>(data_addr, search_limit_bytes);
-            #[cfg(debug_assertions)]
+            #[cfg(all(debug_assertions, feature = "extreme_assertions"))]
             {
                 // Double check if the implementation is correct
                 let result2 =
