@@ -351,7 +351,7 @@ impl Transducer {
     }
 
     pub fn visit_mark_bit_forwarding<VM: VMBinding>(&mut self, address: Address) {
-        info!(
+        debug!(
             "Visiting mark bit at address {}, in_object: {}, last_bit_visited: {}, offset: 0x{:x}",
             address, self.in_object, self.last_bit_visited, self.offset
         );
@@ -360,7 +360,7 @@ impl Transducer {
         // when we chase the end of an object while calculating the live data that
         // *starts* in an unpinned block.
         if self.last_bit_visited == address {
-            info!("Skipping mark bit at {address} because it is the same as the last bit visited");
+            debug!("Skipping mark bit at {address} because it is the same as the last bit visited");
             debug_assert!(
                 self.in_object,
                 "If we are skipping a mark bit, we should be in an object. last_bit_visited: {}, address: {}",
@@ -1479,7 +1479,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 OFFSET_VECTOR_SPEC.load_atomic::<Offset>(block.start(), Ordering::Relaxed),
                 block.start(),
             );
-            info!(
+            debug!(
                 "Forwarding object at {address} in block {} with offset 0x{:x}, in_object {}",
                 block.start(), state.offset, state.in_object,
             );
@@ -1511,7 +1511,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 state.last_bit_visited = end_addr;
                 state.in_object = false;
                 state.in_pinned_object = false;
-                info!(
+                debug!(
                     "Finishing off the object that straddles the block; last_bit_visited: {}, offset: 0x{:x}",
                     state.last_bit_visited, state.offset,
                 );
