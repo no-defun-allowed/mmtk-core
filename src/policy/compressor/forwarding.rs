@@ -19,7 +19,6 @@ use atomic::Ordering;
 use itertools::Itertools;
 #[cfg(debug_assertions)]
 use std::collections::HashMap;
-use std::debug_assert;
 use std::marker::PhantomData;
 use std::sync::atomic::AtomicBool;
 #[cfg(debug_assertions)]
@@ -848,8 +847,8 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             let mut start = block.start();
             let mut object_start = block.start();
             let mut found_object = false;
-            let mut free = std::vec![(first_block.start(), last_block.start())];
-            let mut pinned_ranges = std::vec![];
+            let mut free = vec![(first_block.start(), last_block.start())];
+            let mut pinned_ranges = vec![];
             let mut pinned_range_start = Address::ZERO;
             loop {
                 if start >= cursor {
@@ -1104,7 +1103,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             let last_block = Block::from_aligned_address(cursor);
 
             let mut last_offset: Offset = 0;
-            let mut free = std::vec![(first_block.start(), last_block.start())];
+            let mut free = vec![(first_block.start(), last_block.start())];
             let mut block = first_block;
             // while block < last_block {
             for b in RegionIterator::<Block>::new(first_block, last_block) {
