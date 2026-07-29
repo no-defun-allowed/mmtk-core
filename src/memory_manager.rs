@@ -987,3 +987,19 @@ pub fn add_work_packets<VM: VMBinding>(
 ) {
     mmtk.scheduler.work_buckets[bucket].bulk_add(packets)
 }
+
+/// Return a checksum of the memory layout of the allocators. This is used to
+/// detect if the memory layout of the allocators has changed, which may cause
+/// issues with the VM bindings.
+pub fn compute_allocator_mem_layout_checksum<VM: VMBinding>() -> usize {
+    std::mem::size_of::<crate::util::alloc::ImmixAllocator<VM>>()
+        ^ std::mem::size_of::<crate::util::alloc::BumpAllocator<VM>>()
+        ^ std::mem::size_of::<crate::util::alloc::LargeObjectAllocator<VM>>()
+}
+
+/// Return a checksum of the memory layout of the mutator. This is used to
+/// detect if the memory layout of the mutator has changed, which may cause
+/// issues with the VM bindings.
+pub fn compute_mutator_mem_layout_checksum<VM: VMBinding>() -> usize {
+    std::mem::size_of::<Mutator<VM>>()
+}
