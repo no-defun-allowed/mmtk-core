@@ -21,7 +21,7 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::debug_assert;
 use std::marker::PhantomData;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 #[cfg(debug_assertions)]
 use std::sync::Mutex;
 #[cfg(feature = "object_pinning")]
@@ -490,6 +490,7 @@ pub struct ForwardingMetadata<VM: VMBinding> {
     pub stub_table: RwLock<stubtable::StubTable<VM>>,
     #[cfg(feature = "object_pinning")]
     pub pinning_mode: PinningMode,
+    size_classes: [AtomicUsize; 32],
 }
 
 #[cfg(feature = "object_pinning")]
@@ -573,6 +574,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             stub_table: RwLock::new(stubtable::StubTable::new()),
             #[cfg(feature = "object_pinning")]
             pinning_mode: _pinning_mode,
+            size_classes: [const { AtomicUsize::new(0) }; 32],
         }
     }
 
@@ -1106,6 +1108,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             let mut last_offset: Offset = 0;
             let mut free = std::vec![(first_block.start(), last_block.start())];
             let mut block = first_block;
+            let mut live_datas = vec![];
             // while block < last_block {
             for b in RegionIterator::<Block>::new(first_block, last_block) {
                 if b.start() < block.start() {
@@ -1321,6 +1324,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     }
 
                     let live_data = state.offset as usize;
+                    live_datas.push(live_data);
                     if live_data == 0 {
                         debug!("Skipping completely dead block {}", curr_block.start());
                         continue;
@@ -1402,7 +1406,13 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     }
                 }
             }
-            debug!("Region: {}-{} free-list: {:?}", region.start(), cursor, free);
+            info!("Region: {}-{} free-list: {:?}", region.start(), cursor, free);
+            for (s, e) in free {
+                if e > s {
+                    self.size_classes[(e - s).ilog2() as usize].fetch_add(e - s, Ordering::Relaxed);
+                }
+            }
+            info!("Costs: {:x?}", live_datas);
             trace!("Finished calculating offset vector for region {}: {:#x}\n", region.start(), state.offset);
             state.offset
         }
@@ -1412,6 +1422,12 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         self.calculated.store(false, Ordering::Relaxed);
         #[cfg(debug_assertions)]
         FORWARDING_MAP.lock().unwrap().clear();
+        info!("hole sizes: {:?}",
+               self.size_classes
+               .iter()
+               .enumerate()
+               .map(|(i, v)| (1usize << i, v.load(Ordering::Relaxed)))
+               .collect::<Vec<_>>());
     }
 
     pub fn is_forwarding_region(&self, region: CompressorRegion) -> bool {
