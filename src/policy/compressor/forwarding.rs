@@ -722,27 +722,27 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         }
     }
 
-    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) -> FreeList {
+    pub fn calculate_offset_vector(&self, region: CompressorRegion) -> FreeList {
         use crate::util::constants::LOG_BITS_IN_WORD;
         const_assert!(Block::LOG_BYTES - MARK_SPEC.log_bytes_in_region >= LOG_BITS_IN_WORD);
         #[cfg(debug_assertions)]
         COMPUTING_FORWARDING_INFO.store(true, Ordering::SeqCst);
         cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
-            let free_list = singleton_free_list(region, self.calculate_offset_vector_art(region, cursor));
+            let free_list = singleton_free_list(region, self.calculate_offset_vector_art(region));
         } else {
             let free_list = if self.supports_clmul {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
                     // SAFETY: We checked the processor supports the
                     // necessary instructions.
-                    singleton_free_list(self.calculate_offset_vector_clmul(region, cursor))
+                    singleton_free_list(region, self.calculate_offset_vector_clmul(region))
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 { unreachable!("Shouldn't have self.supports_clmul = true on non-x86_64") }
             } else if self.pinning_mode != PinningMode::NoPinning {
-                self.calculate_offset_vector_with_pinning(region, cursor)
+                self.calculate_offset_vector_with_pinning(region)
             } else {
-                singleton_free_list(self.calculate_offset_vector_base(region, cursor))
+                singleton_free_list(region, self.calculate_offset_vector_base(region))
             };
         }}
         self.calculated.store(true, Ordering::Relaxed);
@@ -764,11 +764,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     }
 
     cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
-        fn calculate_offset_vector_art(&self, region: CompressorRegion, cursor: Address) -> Offset {
+        fn calculate_offset_vector_art(&self, region: CompressorRegion) -> Offset {
             let mut offset: Offset = 0;
             MARK_SPEC.scan_words(
                 region.start(),
-                cursor.align_up(Block::BYTES),
+                region.end(),
                 &mut |word, addr, bits| match bits {
                     Bits::Range { start, end } => {
                         unreachable!("Blocks should be bitmap-word aligned, but we got a misaligned {word}[{start}:{end}] instead")
@@ -792,7 +792,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     } else {
         #[cfg(target_arch = "x86_64")]
         #[target_feature(enable = "pclmulqdq,popcnt")]
-        fn calculate_offset_vector_clmul(&self, region: CompressorRegion, cursor: Address) -> Offset {
+        fn calculate_offset_vector_clmul(&self, region: CompressorRegion) -> Offset {
             // We need a local function to use #[target_feature], which in turn
             // allows rustc to inline `clmul_step` into this function, as the two
             // functions have matching #[target_feature]s.
@@ -812,7 +812,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             let mut carry: i64 = 0;
             MARK_SPEC.scan_words(
                 region.start(),
-                cursor.align_up(Block::BYTES),
+                region.end(),
                 &mut |word, addr, bits| match bits {
                     Bits::Range { start, end } => {
                         panic!("should be word aligned, got {word}[{start}:{end}] instead")
@@ -823,11 +823,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             offset
         }
 
-        fn calculate_offset_vector_base(&self, region: CompressorRegion, cursor: Address) -> Offset {
+        fn calculate_offset_vector_base(&self, region: CompressorRegion) -> Offset {
             use crate::util::linear_scan::RegionIterator;
             let mut state = Transducer::new();
             let first_block = Block::from_aligned_address(region.start());
-            let last_block = Block::from_aligned_address(cursor);
+            let last_block = Block::from_aligned_address(region.end());
             for block in RegionIterator::<Block>::new(first_block, last_block) {
                 OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
                     block.start(),
@@ -846,21 +846,22 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         }
 
         #[cfg(all(feature = "object_pinning", debug_assertions))]
-        fn create_forwarding_map(&self, region: CompressorRegion, cursor: Address) {
-            debug!("Creating forwarding map for region {}-{}", region.start(), cursor);
+        fn create_forwarding_map(&self, region: CompressorRegion) {
+            debug!("Creating forwarding map for region {}-{}", region.start(), region.end());
             let first_block = Block::from_aligned_address(region.start());
-            let last_block = Block::from_aligned_address(cursor);
+            let last_block = Block::from_aligned_address(region.end());
 
             let mut block = first_block;
             let mut prev_block = Address::ZERO;
             let mut start = block.start();
+            let end = region.end();
             let mut object_start = block.start();
             let mut found_object = false;
             let mut free = std::vec![(first_block.start(), last_block.start())];
             let mut pinned_ranges = std::vec![];
             let mut pinned_range_start = Address::ZERO;
             loop {
-                if start >= cursor {
+                if start >= end {
                     // We've reached the end of the region, so we can break out of the loop
                     debug_assert!(
                         !found_object,
@@ -870,7 +871,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                 }
                 // SAFETY: This is called in the Calculate phase, so no one else is modifying the mark bits.
                 let addr = unsafe {
-                    MARK_SPEC.find_next_non_zero_value::<u8>(start, cursor - start)
+                    MARK_SPEC.find_next_non_zero_value::<u8>(start, end - start)
                 };
                 if let None = addr {
                     // We've reached the end of the region, so we can break out of the loop
@@ -984,7 +985,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             debug!(
                 "Created forwarding map for region {}-{} with\n    free list: {:?}\n    pinned ranges: {:?}",
                 region.start(),
-                cursor,
+                region.end(),
                 free,
                 pinned_ranges,
             );
@@ -1042,7 +1043,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                             let Some((hole_idx, hole)) = free.iter_mut().find_position(|(start, end)| {
                                 *end - *start >= object_size
                             }) else {
-                                panic!("No free hole found for object at {} (size {}) in region {}-{} with free list: {:?}", object_start, object_size, region.start(), cursor, free);
+                                panic!("No free hole found for object at {} (size {}) in region {}-{} with free list: {:?}", object_start, object_size, region.start(), region.end(), free);
                             };
 
                             // We have found a hole that is large enough for the live
@@ -1101,7 +1102,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             }
         }
 
-        fn calculate_offset_vector_with_pinning(&self, region: CompressorRegion, cursor: Address) -> Offset {
+        fn calculate_offset_vector_with_pinning(&self, region: CompressorRegion) -> FreeList {
             use crate::util::linear_scan::RegionIterator;
 
             // #[cfg(debug_assertions)]
@@ -1109,7 +1110,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
 
             let mut state = Transducer::new();
             let first_block = Block::from_aligned_address(region.start());
-            let last_block = Block::from_aligned_address(cursor);
+            let last_block = Block::from_aligned_address(region.end());
 
             let mut last_offset: Offset = 0;
             let mut free = std::vec![(first_block.start(), last_block.start())];
@@ -1412,15 +1413,15 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     }
                 }
             }
-            info!("Region: {}-{} free-list: {:?}", region.start(), cursor, free);
-            for (s, e) in free {
-                if e > s {
-                    self.size_classes[(e - s).ilog2() as usize].fetch_add(e - s, Ordering::Relaxed);
+            info!("Region: {}-{} free-list: {:?}", region.start(), region.end(), free);
+            for (s, e) in free.iter() {
+                if *e > *s {
+                    self.size_classes[(*e - *s).ilog2() as usize].fetch_add(*e - *s, Ordering::Relaxed);
                 }
             }
             info!("Costs: {:x?}", live_datas);
             trace!("Finished calculating offset vector for region {}: {:#x}\n", region.start(), state.offset);
-            state.offset
+            free
         }
     }}
 
@@ -1693,7 +1694,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     pub fn calculate_and_walk_offset_vector(
         &self,
         _start: Address,
-        _cursor: Address,
+        _end: Address,
         _fix_threaded_pointers: &impl Fn(ObjectReference),
         _claim_block: &impl Fn(Block),
         _move_object: &mut impl FnMut(ObjectReference),
@@ -1704,14 +1705,14 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
     pub fn calculate_and_walk_offset_vector(
         &self,
         start: Address,
-        cursor: Address,
+        end: Address,
         fix_threaded_pointers: &impl Fn(ObjectReference),
         claim_block: &impl Fn(Block),
         move_object: &mut impl FnMut(ObjectReference),
     ) {
         use crate::util::linear_scan::RegionIterator;
         let first_block = Block::from_aligned_address(start);
-        let last_block = Block::from_aligned_address(cursor);
+        let last_block = Block::from_aligned_address(end);
         self.calculated.store(true, Ordering::Relaxed);
 
         let mut state = Transducer::new();

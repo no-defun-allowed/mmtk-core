@@ -413,7 +413,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             // individually pin live objects in these pages later.
             if needs_page_pinning {
                 let mature_fraction =
-                    0
+                    0.0
                     /* XXX: (total_allocated - total_nursery) as f64 / total_allocated as f64 */;
                 self.pin_pages(mature_fraction);
                 self.add_scan_pinned_pages_tasks::<Context>();
@@ -597,7 +597,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let mut page = r.region.start();
-                let end = r.region.end()
+                let end = r.region.end();
                 while page < end {
                     let mature = false /* XXX: page <= r.prev_cursor() */;
                     if rng.should_pin(mature) {
@@ -728,14 +728,13 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     pub fn add_offset_vector_tasks(&'static self) {
-        let mut regions = vec![];
-        self.pr.enumerate_regions(&mut |r| {
-            regions.push(r.region);
-        });
-        let offset_vector_packets: Vec<Box<dyn GCWork<VM>>> = regions
+        use itertools::Itertools;
+        let region_count = self.pr.with_regions(&mut |r| r.len());
+        let offset_vector_packets: Vec<Box<dyn GCWork<VM>>> = (0..region_count)
             .chunks(OFFSET_VECTOR_PACKET_BYTES / forwarding::CompressorRegion::BYTES)
+            .into_iter()
             .map(|c| {
-                Box::new(CalculateOffsetVector::<VM>::new(self, c.to_vec())) as Box<dyn GCWork<VM>>
+                Box::new(CalculateOffsetVector::<VM>::new(self, c.collect::<Vec<usize>>())) as Box<dyn GCWork<VM>>
             })
             .collect();
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
@@ -746,10 +745,13 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 
     pub fn calculate_offset_vector_for_region(
         &self,
-        region: forwarding::CompressorRegion,
+        index: usize,
     ) {
-        let free_list = self.forwarding.calculate_offset_vector(region);
-        self.pr.reset_free_list(region, &free_list);
+        self.pr.with_regions(&mut |regions| {
+            let region = &regions[index];
+            let free_list = self.forwarding.calculate_offset_vector(region.region);
+            self.pr.reset_free_list(region, &free_list);
+        });
     }
 
     pub fn forward<const CAN_CLMUL: bool>(
@@ -1159,14 +1161,14 @@ impl<VM: VMBinding> GCWork<VM> for AfterScanPinnedPages<VM> {
 /// Calculate the offset vector for a region.
 pub struct CalculateOffsetVector<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
-    regions: Vec<(forwarding::CompressorRegion, Address)>,
+    indices: Vec<usize>,
 }
 
 impl<VM: VMBinding> GCWork<VM> for CalculateOffsetVector<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        for region in self.regions.iter() {
+        for index in self.indices.iter() {
             self.compressor_space
-                .calculate_offset_vector_for_region(*region);
+                .calculate_offset_vector_for_region(*index);
         }
     }
 }
@@ -1190,11 +1192,11 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
 impl<VM: VMBinding> CalculateOffsetVector<VM> {
     pub fn new(
         compressor_space: &'static CompressorSpace<VM>,
-        regions: Vec<(forwarding::CompressorRegion, Address)>,
+        indices: Vec<usize>,
     ) -> Self {
         Self {
             compressor_space,
-            regions,
+            indices,
         }
     }
 }

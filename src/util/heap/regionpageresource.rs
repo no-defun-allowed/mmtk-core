@@ -8,21 +8,19 @@ use crate::util::object_enum::ObjectEnumerator;
 use crate::util::Address;
 use crate::util::VMThread;
 use crate::vm::VMBinding;
-use atomic::Atomic;
 use std::ops::Range;
-use std::sync::atomic::Ordering;
 use std::sync::{Mutex, RwLock};
 
-/// A region in a [`RegionPageResource`] and its allocation cursor.
+/// A region in a [`RegionPageResource`] and its free list.
 pub struct AllocatedRegion<R: Region> {
     pub region: R,
-    free_list: Mutex<Range<Address>>>,
+    free_list: Mutex<Vec<Range<Address>>>,
 }
 
 impl<R: Region> AllocatedRegion<R> {
-    fn used_bytes(&self) -> usize {
+    pub fn used_bytes(&self) -> usize {
         let free_list = self.free_list.lock().unwrap();
-        R::BYTES - free_list.iter().map(|r| r.end - r.start).sum()
+        R::BYTES - free_list.iter().map(|r| r.end - r.start).sum::<usize>()
     }
 }
 
@@ -110,10 +108,10 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         // First try to reuse a region.
         while b.next_region < b.all_regions.len() {
             let cursor = b.next_region;
-            if let Option::Some(address) =
-                self.allocate_from_region(&mut b.all_regions[cursor], bytes)
-            {
-                self.commit_pages(reserved_pages, required_pages, tls);
+            let (addr, pages_wasted) = self.allocate_from_region(&mut b.all_regions[cursor], bytes);
+            self.commit_pages(pages_wasted, pages_wasted, tls);
+            if let Some(address) = addr {
+                self.commit_pages(reserved_pages, required_pages, tls); 
                 return succeed(address, false);
             }
             b.next_region += 1;
@@ -134,7 +132,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         let cursor = b.next_region;
         succeed(
             self.allocate_from_region(&mut b.all_regions[cursor], bytes)
-                .unwrap(),
+                .0.unwrap(),
             new_chunk,
         )
     }
@@ -143,25 +141,35 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         &self,
         alloc: &mut AllocatedRegion<R>,
         bytes: usize,
-    ) -> Option<Address> {
-        let free = alloc.cursor();
-        if free + bytes > alloc.region.end() {
-            Option::None
-        } else {
-            alloc.set_cursor(free + bytes);
-            Option::Some(free)
+    ) -> (Option<Address>, usize) {
+        let mut bytes_wasted = 0;
+        let mut free_list = alloc.free_list.lock().unwrap();
+        loop {
+            match free_list.pop() {
+                None => return (None, bytes_wasted / BYTES_IN_PAGE),
+                Some(range) => {
+                    if range.end - range.start >= bytes {
+                        free_list.push((range.start + bytes)..(range.end));
+                        return (Some(range.start), bytes_wasted / BYTES_IN_PAGE);
+                    } else {
+                        bytes_wasted += range.end - range.start;
+                    }
+                }
+            }
         }
     }
 
-    pub fn reset_cursor(&self, new_free_list: &[(Address, Address)]) {
-        let free_list = self.free_list.lock().unwrap();
-        let old_free_bytes = free_list.iter().map(|(s, e)| e - s).sum();
-        // Get whole pages out of the free list.
+    pub fn reset_free_list(&self, region: &AllocatedRegion<R>, new_free_list: &[(Address, Address)]) {
+        let mut free_list = region.free_list.lock().unwrap();
+        let old_free_bytes = free_list.iter().map(|r| r.end - r.start).sum::<usize>();
+        // Get whole pages out of the free list. We reverse so that popping
+        // the vector later will give us the first range on the free list first.
         let new_free_list = new_free_list.iter()
             .map(|(s, e)| (s.align_up(BYTES_IN_PAGE))..(e.align_down(BYTES_IN_PAGE)))
             .filter(|r| !r.is_empty())
+            .rev()
             .collect::<Vec<_>>();
-        let new_free_bytes = new_free_list.iter().map(|r| r.end - r.start).sum();
+        let new_free_bytes = new_free_list.iter().map(|r| r.end - r.start).sum::<usize>();
         let freed_pages = (new_free_bytes - old_free_bytes) / BYTES_IN_PAGE;
         self.common().accounting.release(freed_pages);
         *free_list = new_free_list;
@@ -176,7 +184,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
     pub fn enumerate(&self, enumerator: &mut dyn ObjectEnumerator) {
         let sync = self.sync.read().unwrap();
         for alloc in sync.all_regions.iter() {
-            enumerator.visit_address_range(alloc.region.start(), alloc.cursor());
+            enumerator.visit_address_range(alloc.region.start(), alloc.region.end());
         }
     }
 
