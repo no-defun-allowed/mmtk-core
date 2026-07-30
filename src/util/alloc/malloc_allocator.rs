@@ -6,6 +6,7 @@ use crate::util::alloc::Allocator;
 use crate::util::opaque_pointer::*;
 use crate::util::Address;
 use crate::vm::VMBinding;
+use crate::AllocationSemantics;
 
 use super::allocator::AllocatorContext;
 
@@ -29,8 +30,21 @@ impl<VM: VMBinding> Allocator<VM> for MallocAllocator<VM> {
         &self.context
     }
 
-    fn alloc(&mut self, size: usize, align: usize, offset: usize) -> Address {
-        self.alloc_slow(size, align, offset)
+    fn alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address {
+        assert!(matches!(
+            semantics,
+            AllocationSemantics::Default
+                | AllocationSemantics::NonMoving
+                | AllocationSemantics::PrimitiveArray
+                | AllocationSemantics::ReferenceArray
+        ));
+        self.alloc_slow(size, align, offset, semantics)
     }
 
     fn get_tls(&self) -> VMThread {
@@ -41,7 +55,13 @@ impl<VM: VMBinding> Allocator<VM> for MallocAllocator<VM> {
         false
     }
 
-    fn alloc_slow_once(&mut self, size: usize, align: usize, offset: usize) -> Address {
+    fn alloc_slow_once(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        _semantics: AllocationSemantics,
+    ) -> Address {
         self.space.alloc(self.tls, size, align, offset)
     }
 }

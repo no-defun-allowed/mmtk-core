@@ -338,7 +338,8 @@ impl<VM: VMBinding> PolicyCopyContext for CopySpaceCopyContext<VM> {
         align: usize,
         offset: usize,
     ) -> Address {
-        self.copy_allocator.alloc(bytes, align, offset)
+        self.copy_allocator
+            .alloc(bytes, align, offset, crate::AllocationSemantics::Default)
     }
 
     fn post_copy(&mut self, obj: ObjectReference, _bytes: usize) {

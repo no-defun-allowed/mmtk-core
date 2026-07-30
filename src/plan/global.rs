@@ -973,4 +973,12 @@ pub enum AllocationSemantics {
     LargeCode = 5,
     /// Non moving objects will not be moved by GC.
     NonMoving = 6,
+    /// Array of primitive types. This is used for arrays of primitive types,
+    /// i.e. objects with no outgoing references. Note that objects > LOS
+    /// threshold should be allocated with the `Los` semantic.
+    PrimitiveArray = 7,
+    /// Array of reference types. This is used for arrays of reference types,
+    /// i.e. entirely consisting of references. Note that objects > LOS
+    /// threshold should be allocated with the `Los` semantic.
+    ReferenceArray = 8,
 }

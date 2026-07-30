@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::util::Address;
+use crate::AllocationSemantics;
 
 use crate::util::alloc::Allocator;
 
@@ -98,14 +99,26 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
         BLOCK_SIZE
     }
 
-    fn alloc(&mut self, size: usize, align: usize, offset: usize) -> Address {
+    fn alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address {
         trace!("alloc");
+        assert!(matches!(
+            semantics,
+            AllocationSemantics::Default
+                | AllocationSemantics::PrimitiveArray
+                | AllocationSemantics::ReferenceArray
+        ));
         let result = align_allocation_no_fill::<VM>(self.bump_pointer.cursor, align, offset);
         let new_cursor = result + size;
 
         if new_cursor > self.bump_pointer.limit {
             trace!("Thread local buffer used up, go to alloc slow path");
-            self.alloc_slow(size, align, offset)
+            self.alloc_slow(size, align, offset, semantics)
         } else {
             fill_alignment_gap::<VM>(self.bump_pointer.cursor, result);
             self.bump_pointer.cursor = new_cursor;
@@ -120,9 +133,15 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
         }
     }
 
-    fn alloc_slow_once(&mut self, size: usize, align: usize, offset: usize) -> Address {
+    fn alloc_slow_once(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address {
         trace!("alloc_slow");
-        self.acquire_block(size, align, offset, false)
+        self.acquire_block(size, align, offset, semantics, false)
     }
 
     /// Slow path for allocation if precise stress testing has been enabled.
@@ -138,10 +157,11 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
         size: usize,
         align: usize,
         offset: usize,
+        semantics: AllocationSemantics,
         need_poll: bool,
     ) -> Address {
         if need_poll {
-            return self.acquire_block(size, align, offset, true);
+            return self.acquire_block(size, align, offset, semantics, true);
         }
 
         trace!("alloc_slow stress_test");
@@ -152,7 +172,7 @@ impl<VM: VMBinding> Allocator<VM> for BumpAllocator<VM> {
         // check in the fastpath (alloc()) fail. The real limit is recovered by
         // adding it to the current cursor.
         if new_cursor > self.bump_pointer.cursor + self.bump_pointer.limit.as_usize() {
-            self.acquire_block(size, align, offset, true)
+            self.acquire_block(size, align, offset, semantics, true)
         } else {
             fill_alignment_gap::<VM>(self.bump_pointer.cursor, result);
             self.bump_pointer.limit -= new_cursor - self.bump_pointer.cursor;
@@ -192,6 +212,7 @@ impl<VM: VMBinding> BumpAllocator<VM> {
         size: usize,
         align: usize,
         offset: usize,
+        semantics: AllocationSemantics,
         stress_test: bool,
     ) -> Address {
         if self.handle_obvious_oom_request(self.tls, size) {
@@ -215,7 +236,7 @@ impl<VM: VMBinding> BumpAllocator<VM> {
             );
             if !stress_test {
                 self.set_limit(acquired_start, acquired_start + block_size);
-                self.alloc(size, align, offset)
+                self.alloc(size, align, offset, semantics)
             } else {
                 // For a stress test, we artificially make the fastpath fail by
                 // manipulating the limit as below.
@@ -225,7 +246,7 @@ impl<VM: VMBinding> BumpAllocator<VM> {
                 // Note that we have just acquired a new block so we know that we don't have to go
                 // through the entire allocation sequence again, we can directly call the slow path
                 // allocation.
-                self.alloc_slow_once_precise_stress(size, align, offset, false)
+                self.alloc_slow_once_precise_stress(size, align, offset, semantics, false)
             }
         }
     }
