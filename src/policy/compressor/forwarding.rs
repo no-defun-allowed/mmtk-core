@@ -84,7 +84,7 @@ pub(crate) const OFFSET_MASK: u32 = !OFFSET_METADATA_BITS;
 pub(super) const MINIMUM_HOLE_SIZE: usize = 1;
 
 pub(crate) type FreeList = Vec<(Address, Address)>;
-fn singleton_free_list(r: CompressorRegion, cursor: Offset) -> FreeList {
+pub(crate) fn singleton_free_list(r: CompressorRegion, cursor: Offset) -> FreeList {
     vec![(r.start() + cursor as usize, r.end())]
 }
 
