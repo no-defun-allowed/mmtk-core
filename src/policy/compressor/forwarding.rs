@@ -83,6 +83,11 @@ pub(crate) const OFFSET_MASK: u32 = !OFFSET_METADATA_BITS;
 /// The minimum size of a hole that we will consider for allocation.
 pub(super) const MINIMUM_HOLE_SIZE: usize = 1;
 
+pub(crate) type FreeList = Vec<(Address, Address)>;
+fn singleton_free_list(r: CompressorRegion, cursor: Offset) -> FreeList {
+    vec![(r.start() + cursor as usize, r.end())]
+}
+
 #[cfg(feature = "object_pinning")]
 pub(super) fn does_new_address_intersect_pinned_objects<VM: VMBinding>(
     start: Address,
@@ -717,31 +722,32 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         }
     }
 
-    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) {
+    pub fn calculate_offset_vector(&self, region: CompressorRegion, cursor: Address) -> FreeList {
         use crate::util::constants::LOG_BITS_IN_WORD;
         const_assert!(Block::LOG_BYTES - MARK_SPEC.log_bytes_in_region >= LOG_BITS_IN_WORD);
         #[cfg(debug_assertions)]
         COMPUTING_FORWARDING_INFO.store(true, Ordering::SeqCst);
         cfg_if::cfg_if! { if #[cfg(feature = "compressor_art_marking")] {
-            let used = self.calculate_offset_vector_art(region, cursor);
+            let free_list = singleton_free_list(region, self.calculate_offset_vector_art(region, cursor));
         } else {
-            let used = if self.supports_clmul {
+            let free_list = if self.supports_clmul {
                 #[cfg(target_arch = "x86_64")]
                 unsafe {
                     // SAFETY: We checked the processor supports the
                     // necessary instructions.
-                    self.calculate_offset_vector_clmul(region, cursor)
+                    singleton_free_list(self.calculate_offset_vector_clmul(region, cursor))
                 }
                 #[cfg(not(target_arch = "x86_64"))]
                 { unreachable!("Shouldn't have self.supports_clmul = true on non-x86_64") }
             } else if self.pinning_mode != PinningMode::NoPinning {
                 self.calculate_offset_vector_with_pinning(region, cursor)
             } else {
-                self.calculate_offset_vector_base(region, cursor)
+                singleton_free_list(self.calculate_offset_vector_base(region, cursor))
             };
         }}
         self.calculated.store(true, Ordering::Relaxed);
-        self.select_region(region, used);
+        //self.select_region(region, used);
+        free_list
     }
 
     pub fn select_region(&self, region: CompressorRegion, used: Offset) {

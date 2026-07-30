@@ -399,8 +399,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         forwarding::PINNED_PAGE_SPEC
                             .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
                     }
+                    /*
+                    XXX:
                     total_nursery += r.cursor() - r.prev_cursor();
                     total_allocated += r.cursor() - r.region.start();
+                    */
                 }
             });
 
@@ -410,7 +413,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             // individually pin live objects in these pages later.
             if needs_page_pinning {
                 let mature_fraction =
-                    (total_allocated - total_nursery) as f64 / total_allocated as f64;
+                    0
+                    /* XXX: (total_allocated - total_nursery) as f64 / total_allocated as f64 */;
                 self.pin_pages(mature_fraction);
                 self.add_scan_pinned_pages_tasks::<Context>();
             }
@@ -431,7 +435,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         forwarding::CompressorRegion,
                     >| {
                         let mut page = r.region.start();
-                        let end = r.cursor();
+                        let end = r.region.end();
                         while page < end {
                             use crate::policy::compressor::forwarding::is_page_pinned;
                             if is_page_pinned(page) {
@@ -486,7 +490,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 packets.push(Box::new(ScanPinnedPages::<VM, Context>::new(
                     space,
                     r.region,
-                    r.cursor(),
                 )) as Box<dyn GCWork<VM>>);
             });
         self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace].bulk_add(packets);
@@ -494,10 +497,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .set_sentinel(Box::new(AfterScanPinnedPages::new(space)));
     }
 
-    fn scan_pinned_pages(&self, region: forwarding::CompressorRegion, cursor: Address) {
+    fn scan_pinned_pages(&self, region: forwarding::CompressorRegion) {
         let start = region.start();
         let mut curr = start;
-        let end = cursor;
+        let end = region.end();
         while curr < end {
             // SAFETY: No one will modify the VO-bits when we are scanning pinned pages
             if unsafe { vo_bit::is_vo_addr(curr) } {
@@ -594,13 +597,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let mut page = r.region.start();
-                let end = if pin_till_end {
-                    r.region.end()
-                } else {
-                    r.cursor()
-                };
+                let end = r.region.end()
                 while page < end {
-                    let mature = page <= r.prev_cursor();
+                    let mature = false /* XXX: page <= r.prev_cursor() */;
                     if rng.should_pin(mature) {
                         pages_pinned += 1;
                         if !need_to_cache {
@@ -641,7 +640,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let mut page = r.region.start();
-                let end = r.cursor();
+                let end = r.region.end();
                 let cached_pinned_pages = self.cached_pinned_pages.read().unwrap();
                 while page < end {
                     if cached_pinned_pages.contains(&page) {
@@ -731,7 +730,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     pub fn add_offset_vector_tasks(&'static self) {
         let mut regions = vec![];
         self.pr.enumerate_regions(&mut |r| {
-            regions.push((r.region, r.cursor()));
+            regions.push(r.region);
         });
         let offset_vector_packets: Vec<Box<dyn GCWork<VM>>> = regions
             .chunks(OFFSET_VECTOR_PACKET_BYTES / forwarding::CompressorRegion::BYTES)
@@ -748,9 +747,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     pub fn calculate_offset_vector_for_region(
         &self,
         region: forwarding::CompressorRegion,
-        cursor: Address,
     ) {
-        self.forwarding.calculate_offset_vector(region, cursor);
+        let free_list = self.forwarding.calculate_offset_vector(region);
+        self.pr.reset_free_list(region, &free_list);
     }
 
     pub fn forward<const CAN_CLMUL: bool>(
@@ -870,7 +869,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             let r = &regions[index];
             let start = r.region.start();
             debug!("\nCompacting region {}", start);
-            let end = r.cursor();
+            let end = r.region.end();
             #[cfg(feature = "vo_bit")]
             {
                 #[cfg(debug_assertions)]
@@ -942,14 +941,15 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         to = to.max(new_object.to_object_start::<VM>() + copied_size);
                         self.update_references::<CAN_CLMUL>(worker, new_object);
                     });
-                debug_assert!(to <= r.cursor());
                 let perfect_compaction_end = r.region.start() + total_live_bytes;
+                /*
+                XXX:
                 info!(
                     "Compacted region [{}, {}) -> {to} with {objects} objects; saved {} bytes ({:.2}% savings) (copied {} bytes; live {} bytes)",
                     r.region.start(), r.cursor(), r.cursor() - to,
                     (r.cursor() - to) as f64 / (r.cursor() - perfect_compaction_end) as f64 * 100.0, total_copied_bytes, total_live_bytes,
                 );
-                self.pr.reset_cursor(r, to);
+                */
             } else {
                 self.forwarding.scan_marked_objects(start, end, &mut |obj: ObjectReference| {
                     self.update_references::<CAN_CLMUL>(worker, obj);
@@ -1086,7 +1086,6 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
 pub struct ScanPinnedPages<VM: VMBinding, Context: GCWorkContext<VM = VM>> {
     compressor_space: &'static CompressorSpace<VM>,
     region: forwarding::CompressorRegion,
-    cursor: Address,
     phantom: std::marker::PhantomData<Context>,
 }
 
@@ -1095,12 +1094,10 @@ impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> ScanPinnedPages<VM, Context
     pub fn new(
         compressor_space: &'static CompressorSpace<VM>,
         region: forwarding::CompressorRegion,
-        cursor: Address,
     ) -> Self {
         Self {
             compressor_space,
             region,
-            cursor,
             phantom: std::marker::PhantomData,
         }
     }
@@ -1110,7 +1107,7 @@ impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> ScanPinnedPages<VM, Context
 impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> GCWork<VM> for ScanPinnedPages<VM, Context> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         self.compressor_space
-            .scan_pinned_pages(self.region, self.cursor);
+            .scan_pinned_pages(self.region);
     }
 }
 
@@ -1167,9 +1164,9 @@ pub struct CalculateOffsetVector<VM: VMBinding> {
 
 impl<VM: VMBinding> GCWork<VM> for CalculateOffsetVector<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        for (region, cursor) in self.regions.iter() {
+        for region in self.regions.iter() {
             self.compressor_space
-                .calculate_offset_vector_for_region(*region, *cursor);
+                .calculate_offset_vector_for_region(*region);
         }
     }
 }
@@ -1181,7 +1178,7 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
             .map(|c| {
                 c.iter().map(|r| {
                     let scale = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-                    let used = r.cursor() - r.region.start();
+                    let used = r.used_bytes();
                     let index = (used * (scale.len() - 1)) / forwarding::CompressorRegion::BYTES;
                     scale[index]
                 })

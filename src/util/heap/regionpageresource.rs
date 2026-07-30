@@ -9,31 +9,20 @@ use crate::util::Address;
 use crate::util::VMThread;
 use crate::vm::VMBinding;
 use atomic::Atomic;
+use std::ops::Range;
 use std::sync::atomic::Ordering;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 /// A region in a [`RegionPageResource`] and its allocation cursor.
 pub struct AllocatedRegion<R: Region> {
     pub region: R,
-    cursor: Atomic<Address>,
-    prev_cursor: Atomic<Address>,
+    free_list: Mutex<Range<Address>>>,
 }
 
 impl<R: Region> AllocatedRegion<R> {
-    pub fn cursor(&self) -> Address {
-        self.cursor.load(Ordering::Relaxed)
-    }
-
-    fn set_cursor(&self, a: Address) {
-        self.cursor.store(a, Ordering::Relaxed);
-    }
-
-    pub fn prev_cursor(&self) -> Address {
-        self.prev_cursor.load(Ordering::Relaxed)
-    }
-
-    fn set_prev_cursor(&self, a: Address) {
-        self.prev_cursor.store(a, Ordering::Relaxed);
+    fn used_bytes(&self) -> usize {
+        let free_list = self.free_list.lock().unwrap();
+        R::BYTES - free_list.iter().map(|r| r.end - r.start).sum()
     }
 }
 
@@ -140,8 +129,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         )?;
         b.all_regions.push(AllocatedRegion {
             region: R::from_aligned_address(start),
-            cursor: Atomic::<Address>::new(start),
-            prev_cursor: Atomic::<Address>::new(start),
+            free_list: Mutex::new(vec![start..(start + R::BYTES)]),
         });
         let cursor = b.next_region;
         succeed(
@@ -165,16 +153,18 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         }
     }
 
-    /// Reset the allocation cursor for one region.
-    pub fn reset_cursor(&self, alloc: &AllocatedRegion<R>, address: Address) {
-        let old = alloc.cursor();
-        let new = address.align_up(BYTES_IN_PAGE);
-        let pages = (old - new) / BYTES_IN_PAGE;
-        self.common().accounting.release(pages);
-        alloc.set_cursor(new);
-        // After compaction, the previous cursor should be set to the new cursor,
-        // so that we can distinguish between mature and nursery objects.
-        alloc.set_prev_cursor(new);
+    pub fn reset_cursor(&self, new_free_list: &[(Address, Address)]) {
+        let free_list = self.free_list.lock().unwrap();
+        let old_free_bytes = free_list.iter().map(|(s, e)| e - s).sum();
+        // Get whole pages out of the free list.
+        let new_free_list = new_free_list.iter()
+            .map(|(s, e)| (s.align_up(BYTES_IN_PAGE))..(e.align_down(BYTES_IN_PAGE)))
+            .filter(|r| !r.is_empty())
+            .collect::<Vec<_>>();
+        let new_free_bytes = new_free_list.iter().map(|r| r.end - r.start).sum();
+        let freed_pages = (new_free_bytes - old_free_bytes) / BYTES_IN_PAGE;
+        self.common().accounting.release(freed_pages);
+        *free_list = new_free_list;
     }
 
     /// Reset the allocator state after a collection, so that the allocator will
