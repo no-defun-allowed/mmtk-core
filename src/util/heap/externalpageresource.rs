@@ -8,6 +8,7 @@ use crate::util::heap::pageresource::CommonPageResource;
 use crate::util::heap::space_descriptor::SpaceDescriptor;
 use crate::util::opaque_pointer::*;
 use crate::vm::VMBinding;
+use crate::AllocationSemantics;
 
 use std::marker::PhantomData;
 use std::sync::{Mutex, MutexGuard};
@@ -52,6 +53,7 @@ impl<VM: VMBinding> PageResource<VM> for ExternalPageResource<VM> {
         _space_descriptor: SpaceDescriptor,
         _reserved_pages: usize,
         _required_pages: usize,
+        _semantics: AllocationSemantics,
         _tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
         panic!("Cannot allocate from ExternalPageResource")

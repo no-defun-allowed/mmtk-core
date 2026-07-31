@@ -9,7 +9,7 @@ use crate::util::heap::space_descriptor::SpaceDescriptor;
 use crate::util::linear_scan::Region;
 use crate::util::opaque_pointer::*;
 use crate::util::rust_util::zeroed_alloc::new_zeroed_vec;
-use crate::vm::*;
+use crate::{vm::*, AllocationSemantics};
 use atomic::Ordering;
 use spin::RwLock;
 use std::cell::UnsafeCell;
@@ -47,6 +47,7 @@ impl<VM: VMBinding, B: Region> PageResource<VM> for BlockPageResource<VM, B> {
         space_descriptor: SpaceDescriptor,
         reserved_pages: usize,
         required_pages: usize,
+        _semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
         self.alloc_pages_fast(space_descriptor, reserved_pages, required_pages, tls)

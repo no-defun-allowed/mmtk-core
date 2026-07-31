@@ -60,6 +60,11 @@ pub struct AllocationOptions {
     ///
     /// If `fasle`, the allocation will return null immediately when out of memory.
     pub allow_oom_call: bool,
+
+    /// The allocation semantics for this allocation site. Note that this can
+    /// usually be ignored, since only some Spaces care about the allocation
+    /// semantics.
+    pub semantics: AllocationSemantics,
 }
 
 /// The default value for `AllocationOptions` has the same semantics as calling [`Allocator::alloc`]
@@ -70,6 +75,7 @@ impl Default for AllocationOptions {
             allow_overcommit: false,
             at_safepoint: true,
             allow_oom_call: true,
+            semantics: AllocationSemantics::Default,
         }
     }
 }

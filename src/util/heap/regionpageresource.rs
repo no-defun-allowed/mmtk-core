@@ -8,6 +8,7 @@ use crate::util::object_enum::ObjectEnumerator;
 use crate::util::Address;
 use crate::util::VMThread;
 use crate::vm::VMBinding;
+use crate::AllocationSemantics;
 use atomic::Atomic;
 use std::sync::atomic::Ordering;
 use std::sync::RwLock;
@@ -69,11 +70,18 @@ impl<VM: VMBinding, R: Region + 'static> PageResource<VM> for RegionPageResource
         space_descriptor: SpaceDescriptor,
         reserved_pages: usize,
         required_pages: usize,
+        semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
         assert!(reserved_pages <= Self::REGION_PAGES);
         assert!(required_pages <= reserved_pages);
-        self.alloc(space_descriptor, reserved_pages, required_pages, tls)
+        self.alloc(
+            space_descriptor,
+            reserved_pages,
+            required_pages,
+            semantics,
+            tls,
+        )
     }
 
     fn get_available_physical_pages(&self) -> usize {
@@ -107,6 +115,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         space_descriptor: SpaceDescriptor,
         reserved_pages: usize,
         required_pages: usize,
+        semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
         let mut b = self.sync.write().unwrap();
@@ -136,6 +145,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             space_descriptor,
             Self::REGION_PAGES,
             Self::REGION_PAGES,
+            semantics,
             tls,
         )?;
         b.all_regions.push(AllocatedRegion {

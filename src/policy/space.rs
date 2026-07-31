@@ -8,6 +8,7 @@ use crate::util::metadata::side_metadata::{
 use crate::util::object_enum::ObjectEnumerator;
 use crate::util::Address;
 use crate::util::ObjectReference;
+use crate::AllocationSemantics;
 
 use crate::util::heap::layout::vm_layout::{vm_layout, LOG_BYTES_IN_CHUNK};
 use crate::util::heap::{PageResource, VMRequest};
@@ -91,7 +92,13 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
         // reason (if we decided not to, or if we tried and failed), this function shall return a
         // null address.
         if should_get_pages {
-            if let Some(addr) = self.get_new_pages_and_initialize(tls, pages, pr, pages_reserved) {
+            if let Some(addr) = self.get_new_pages_and_initialize(
+                tls,
+                pages,
+                pr,
+                pages_reserved,
+                alloc_options.semantics,
+            ) {
                 addr
             } else {
                 self.not_acquiring(tls, alloc_options, pr, pages_reserved, true);
@@ -117,6 +124,7 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
         pages: usize,
         pr: &dyn PageResource<VM>,
         pages_reserved: usize,
+        semantics: AllocationSemantics,
     ) -> Option<Address> {
         // We need this lock: Othrewise, it is possible that one thread acquires pages in a new chunk, but not yet
         // set SFT for it (in grow_space()), and another thread acquires pages in the same chunk, which is not
@@ -126,7 +134,7 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
         // See: https://github.com/mmtk/mmtk-core/issues/610
         let lock = self.common().acquire_lock.lock().unwrap();
 
-        let Ok(res) = pr.get_new_pages(self.common().descriptor, pages_reserved, pages, tls) else {
+        let Ok(res) = pr.get_new_pages(self.common().descriptor, pages_reserved, pages, semantics, tls) else {
             return None;
         };
 
