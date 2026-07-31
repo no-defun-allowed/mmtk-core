@@ -17,6 +17,9 @@ mod bumpallocator;
 pub use bumpallocator::BumpAllocator;
 pub use bumpallocator::BumpPointer;
 
+mod compressor_allocator;
+pub use compressor_allocator::CompressorAllocator;
+
 mod large_object_allocator;
 pub use large_object_allocator::LargeObjectAllocator;
 

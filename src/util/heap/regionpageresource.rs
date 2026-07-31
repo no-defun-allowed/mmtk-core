@@ -18,6 +18,7 @@ pub struct AllocatedRegion<R: Region> {
     pub region: R,
     cursor: Atomic<Address>,
     prev_cursor: Atomic<Address>,
+    semantics: AllocationSemantics,
 }
 
 impl<R: Region> AllocatedRegion<R> {
@@ -128,15 +129,20 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         };
         let bytes = reserved_pages * BYTES_IN_PAGE;
         // First try to reuse a region.
-        while b.next_region < b.all_regions.len() {
-            let cursor = b.next_region;
+        // XXX(kunals): We always scan from the first region. Since the list of
+        // regions contains all the flavors of allocation semantics, we need to
+        // check if there's a previous region that can help satisfy this
+        // allocation request.
+        let mut idx = 0;
+        while idx < b.all_regions.len() {
+            let cursor = idx;
             if let Option::Some(address) =
-                self.allocate_from_region(&mut b.all_regions[cursor], bytes)
+                self.allocate_from_region(&mut b.all_regions[cursor], bytes, semantics)
             {
                 self.commit_pages(reserved_pages, required_pages, tls);
                 return succeed(address, false);
             }
-            b.next_region += 1;
+            idx += 1;
         }
         // Else allocate a new region.
         let PRAllocResult {
@@ -152,10 +158,11 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             region: R::from_aligned_address(start),
             cursor: Atomic::<Address>::new(start),
             prev_cursor: Atomic::<Address>::new(start),
+            semantics,
         });
-        let cursor = b.next_region;
+        let cursor = b.all_regions.len() - 1;
         succeed(
-            self.allocate_from_region(&mut b.all_regions[cursor], bytes)
+            self.allocate_from_region(&mut b.all_regions[cursor], bytes, semantics)
                 .unwrap(),
             new_chunk,
         )
@@ -165,7 +172,11 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         &self,
         alloc: &mut AllocatedRegion<R>,
         bytes: usize,
+        semantics: AllocationSemantics,
     ) -> Option<Address> {
+        if semantics != alloc.semantics {
+            return Option::None;
+        }
         let free = alloc.cursor();
         if free + bytes > alloc.region.end() {
             Option::None
