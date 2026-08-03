@@ -122,7 +122,10 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             b.next_region += 1;
         }
         // Else allocate a new chunk to carve regions from.
-        let chunk_start = self.flpr.allocate_one_chunk_no_commit(space_descriptor)?.start;
+        let chunk_start = self
+            .flpr
+            .allocate_one_chunk_no_commit(space_descriptor)?
+            .start;
         assert!(chunk_start.is_aligned_to(BYTES_IN_CHUNK));
         assert!(R::BYTES < BYTES_IN_CHUNK); // XXX: where to do this properly?
         for i in 0..(BYTES_IN_CHUNK / R::BYTES) {

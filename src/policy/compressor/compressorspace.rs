@@ -9,10 +9,10 @@ use crate::util::heap::regionpageresource::AllocatedRegion;
 use crate::util::heap::{PageResource, RegionPageResource};
 use crate::util::linear_scan::Region;
 use crate::util::metadata::extract_side_metadata;
+use crate::util::metadata::log_bit::UnlogBitsOperation;
 #[cfg(feature = "vo_bit")]
 use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
-use crate::util::metadata::log_bit::UnlogBitsOperation;
 use crate::util::object_enum::ObjectEnumerator;
 use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
@@ -257,7 +257,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 log_bits_op.execute::<VM>(r.region.start(), forwarding::CompressorRegion::BYTES);
             });
-
     }
 
     pub fn trace_mark_object<Q: ObjectQueue>(

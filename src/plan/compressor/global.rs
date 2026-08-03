@@ -15,8 +15,8 @@ use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::heap::gc_trigger::SpaceStats;
 #[allow(unused_imports)]
 use crate::util::heap::VMRequest;
-use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::metadata::log_bit::UnlogBitsOperation;
+use crate::util::metadata::side_metadata::SideMetadataContext;
 use crate::util::opaque_pointer::*;
 use crate::util::remset::RemSet;
 use crate::util::ObjectReference;
