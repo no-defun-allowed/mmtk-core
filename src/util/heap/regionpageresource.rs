@@ -110,7 +110,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         while b.next_region < b.all_regions.len() {
             let cursor = b.next_region;
             let (addr, pages_wasted) = self.allocate_from_region(&mut b.all_regions[cursor], bytes);
-            self.commit_pages(pages_wasted, pages_wasted, tls);
+            self.common().accounting.reserve_and_commit(pages_wasted);
             if let Some(address) = addr {
                 self.commit_pages(reserved_pages, required_pages, tls);
                 return succeed(address, false);
