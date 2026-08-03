@@ -18,7 +18,7 @@ pub struct AllocatedRegion<R: Region> {
     pub region: R,
     cursor: Atomic<Address>,
     prev_cursor: Atomic<Address>,
-    semantics: AllocationSemantics,
+    pub semantics: AllocationSemantics,
 }
 
 impl<R: Region> AllocatedRegion<R> {

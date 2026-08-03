@@ -699,7 +699,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                                 }
                             }
                             info!(
-                                "Pinning page {}: {}",
+                                "Pinning {:?} page {}: {}",
+                                r.semantics,
                                 page,
                                 if mature { "mature" } else { "nursery" }
                             );

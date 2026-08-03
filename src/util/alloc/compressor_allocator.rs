@@ -221,6 +221,8 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
             bytes_to_pages_up(block_size),
             self.get_context().get_alloc_options(),
         );
+        self.get_context()
+            .set_alloc_options(crate::util::alloc::AllocationOptions::default());
         if acquired_start.is_zero() {
             trace!("Failed to acquire a new block");
             acquired_start

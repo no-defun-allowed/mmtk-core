@@ -418,6 +418,10 @@ impl<VM: VMBinding> Mutator<VM> {
                     offset_of!(Allocators<VM>, markcompact)
                         + size_of::<MarkCompactAllocator<VM>>() * index as usize
                 }
+                AllocatorSelector::Compressor(index) => {
+                    offset_of!(Allocators<VM>, compressor)
+                        + size_of::<CompressorAllocator<VM>>() * index as usize
+                }
                 AllocatorSelector::None => panic!("Expect a valid AllocatorSelector, found None"),
             }
     }
@@ -524,6 +528,7 @@ pub(crate) struct ReservedAllocators {
     pub n_malloc: u8,
     pub n_immix: u8,
     pub n_mark_compact: u8,
+    pub n_compressor: u8,
     pub n_free_list: u8,
 }
 
@@ -534,6 +539,7 @@ impl ReservedAllocators {
         n_malloc: 0,
         n_immix: 0,
         n_mark_compact: 0,
+        n_compressor: 0,
         n_free_list: 0,
     };
     /// check if the number of each allocator is okay. Panics if any allocator exceeds the max number.
@@ -558,6 +564,10 @@ impl ReservedAllocators {
         assert!(
             self.n_mark_compact as usize <= MAX_MARK_COMPACT_ALLOCATORS,
             "Allocator mapping declared more mark compact allocators than the max allowed."
+        );
+        assert!(
+            self.n_compressor as usize <= MAX_COMPRESSOR_ALLOCATORS,
+            "Allocator mapping declared more compressor allocators than the max allowed."
         );
         assert!(
             self.n_free_list as usize <= MAX_FREE_LIST_ALLOCATORS,

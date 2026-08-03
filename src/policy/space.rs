@@ -134,7 +134,13 @@ pub trait Space<VM: VMBinding>: 'static + SFT + Sync + Downcast {
         // See: https://github.com/mmtk/mmtk-core/issues/610
         let lock = self.common().acquire_lock.lock().unwrap();
 
-        let Ok(res) = pr.get_new_pages(self.common().descriptor, pages_reserved, pages, semantics, tls) else {
+        let Ok(res) = pr.get_new_pages(
+            self.common().descriptor,
+            pages_reserved,
+            pages,
+            semantics,
+            tls,
+        ) else {
             return None;
         };
 

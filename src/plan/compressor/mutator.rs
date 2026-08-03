@@ -8,28 +8,28 @@ use crate::plan::mutator_context::{
 };
 use crate::plan::AllocationSemantics;
 use crate::util::alloc::allocators::AllocatorSelector;
-use crate::util::alloc::BumpAllocator;
+use crate::util::alloc::CompressorAllocator;
 use crate::util::{VMMutatorThread, VMWorkerThread};
 use crate::vm::VMBinding;
 use crate::MMTK;
 use enum_map::{enum_map, EnumMap};
 
 const RESERVED_ALLOCATORS: ReservedAllocators = ReservedAllocators {
-    n_bump_pointer: 1,
+    n_compressor: 1,
     ..ReservedAllocators::DEFAULT
 };
 
 lazy_static! {
     /// When compressor_single_space is enabled, force all allocations to go to the default allocator and space.
     static ref ALLOCATOR_MAPPING_SINGLE_SPACE: EnumMap<AllocationSemantics, AllocatorSelector> = enum_map! {
-        _ => AllocatorSelector::BumpPointer(0),
+        _ => AllocatorSelector::Compressor(0),
     };
     pub static ref ALLOCATOR_MAPPING: EnumMap<AllocationSemantics, AllocatorSelector> = {
         if cfg!(feature = "compressor_single_space") {
             *ALLOCATOR_MAPPING_SINGLE_SPACE
         } else {
             let mut map = create_allocator_mapping(RESERVED_ALLOCATORS, true);
-            map[AllocationSemantics::Default] = AllocatorSelector::BumpPointer(0);
+            map[AllocationSemantics::Default] = AllocatorSelector::Compressor(0);
             map
         }
     };
@@ -48,7 +48,7 @@ pub fn create_compressor_mutator<VM: VMBinding>(
                 !cfg!(feature = "compressor_single_space"),
                 plan,
             );
-            vec.push((AllocatorSelector::BumpPointer(0), &plan.compressor_space));
+            vec.push((AllocatorSelector::Compressor(0), &plan.compressor_space));
             vec
         }),
         prepare_func: &common_prepare_func,
@@ -61,13 +61,13 @@ pub fn create_compressor_mutator<VM: VMBinding>(
 
 pub fn compressor_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWorkerThread) {
     // reset the thread-local allocation bump pointer
-    let bump_allocator = unsafe {
+    let allocator = unsafe {
         mutator
             .allocators
             .get_allocator_mut(mutator.config.allocator_mapping[AllocationSemantics::Default])
     }
-    .downcast_mut::<BumpAllocator<VM>>()
+    .downcast_mut::<CompressorAllocator<VM>>()
     .unwrap();
-    bump_allocator.reset();
+    allocator.reset();
     common_release_func(mutator, tls);
 }
