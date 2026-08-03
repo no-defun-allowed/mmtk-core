@@ -1,8 +1,9 @@
 use crate::util::constants::BYTES_IN_PAGE;
+use crate::util::heap::layout::vm_layout::BYTES_IN_CHUNK;
 use crate::util::heap::layout::VMMap;
 use crate::util::heap::pageresource::{CommonPageResource, PRAllocFail, PRAllocResult};
 use crate::util::heap::space_descriptor::SpaceDescriptor;
-use crate::util::heap::{MonotonePageResource, PageResource};
+use crate::util::heap::{FreeListPageResource, PageResource};
 use crate::util::linear_scan::Region;
 use crate::util::object_enum::ObjectEnumerator;
 use crate::util::Address;
@@ -38,21 +39,21 @@ struct Sync<R: Region> {
 /// scan linearly over all regions to allocate, and do not revisit regions
 /// before a garbage collection cycle.
 pub struct RegionPageResource<VM: VMBinding, R: Region> {
-    mpr: MonotonePageResource<VM>,
+    flpr: FreeListPageResource<VM>,
     sync: RwLock<Sync<R>>,
 }
 
 impl<VM: VMBinding, R: Region + 'static> PageResource<VM> for RegionPageResource<VM, R> {
     fn common(&self) -> &CommonPageResource {
-        self.mpr.common()
+        self.flpr.common()
     }
 
     fn common_mut(&mut self) -> &mut CommonPageResource {
-        self.mpr.common_mut()
+        self.flpr.common_mut()
     }
 
     fn update_discontiguous_start(&mut self, start: Address) {
-        self.mpr.update_discontiguous_start(start)
+        self.flpr.update_discontiguous_start(start)
     }
 
     fn alloc_pages(
@@ -68,7 +69,7 @@ impl<VM: VMBinding, R: Region + 'static> PageResource<VM> for RegionPageResource
     }
 
     fn get_available_physical_pages(&self) -> usize {
-        self.mpr.get_available_physical_pages()
+        self.flpr.get_available_physical_pages()
     }
 }
 
@@ -76,16 +77,16 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
     const REGION_PAGES: usize = R::BYTES / BYTES_IN_PAGE;
 
     pub fn new_contiguous(start: Address, bytes: usize, vm_map: &'static dyn VMMap) -> Self {
-        Self::new(MonotonePageResource::new_contiguous(start, bytes, vm_map))
+        Self::new(FreeListPageResource::new_contiguous(start, bytes, vm_map))
     }
 
     pub fn new_discontiguous(vm_map: &'static dyn VMMap) -> Self {
-        Self::new(MonotonePageResource::new_discontiguous(vm_map))
+        Self::new(FreeListPageResource::new_discontiguous(vm_map))
     }
 
-    fn new(mpr: MonotonePageResource<VM>) -> Self {
+    fn new(flpr: FreeListPageResource<VM>) -> Self {
         Self {
-            mpr,
+            flpr,
             sync: RwLock::new(Sync {
                 all_regions: vec![],
                 next_region: 0,
@@ -120,24 +121,25 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             }
             b.next_region += 1;
         }
-        // Else allocate a new region.
-        let PRAllocResult {
-            start, new_chunk, ..
-        } = self.mpr.alloc_pages(
-            space_descriptor,
-            Self::REGION_PAGES,
-            Self::REGION_PAGES,
-            tls,
-        )?;
-        b.all_regions.push(AllocatedRegion {
-            region: R::from_aligned_address(start),
-            cursor: Atomic::<Address>::new(start),
-        });
+        // Else allocate a new chunk to carve regions from.
+        let chunk_start = self.flpr.allocate_one_chunk_no_commit(space_descriptor)?.start;
+        assert!(chunk_start.is_aligned_to(BYTES_IN_CHUNK));
+        assert!(R::BYTES < BYTES_IN_CHUNK); // XXX: where to do this properly?
+        for i in 0..(BYTES_IN_CHUNK / R::BYTES) {
+            let region_start = chunk_start + R::BYTES * i;
+            b.all_regions.push(AllocatedRegion {
+                region: R::from_aligned_address(region_start),
+                cursor: Atomic::new(region_start),
+            });
+        }
+        // This allocation from the first new region has to succeed, and can't waste space
+        // as it's at the very start of the region.
+        self.commit_pages(reserved_pages, required_pages, tls);
         let cursor = b.next_region;
         succeed(
             self.allocate_from_region(&mut b.all_regions[cursor], bytes)
-                .unwrap(),
-            new_chunk,
+                .expect("allocation should fit in a new region"),
+            true,
         )
     }
 
