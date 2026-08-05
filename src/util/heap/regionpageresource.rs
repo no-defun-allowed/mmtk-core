@@ -167,7 +167,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         // Get whole pages out of the free list. We reverse so that popping
         // the vector later will give us the first range on the free list first.
         let new_free_list = new_free_list.iter()
-            .map(|(s, e)| (s.align_up(BYTES_IN_PAGE))..(e.align_down(BYTES_IN_PAGE)))
+            .map(|(s, e)| *s..*e)
             .filter(|r| !r.is_empty())
             .rev()
             .collect::<Vec<_>>();

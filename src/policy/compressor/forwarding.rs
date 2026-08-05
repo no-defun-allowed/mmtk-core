@@ -1413,13 +1413,11 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
                     }
                 }
             }
-            info!("Region: {}-{} free-list: {:?}", region.start(), region.end(), free);
             for (s, e) in free.iter() {
                 if *e > *s {
                     self.size_classes[(*e - *s).ilog2() as usize].fetch_add(*e - *s, Ordering::Relaxed);
                 }
             }
-            info!("Costs: {:x?}", live_datas);
             trace!("Finished calculating offset vector for region {}: {:#x}\n", region.start(), state.offset);
             free
         }
