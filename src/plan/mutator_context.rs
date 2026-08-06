@@ -193,13 +193,20 @@ impl<VM: VMBinding> MutatorContext<VM> for Mutator<VM> {
         offset: usize,
         allocator: AllocationSemantics,
     ) -> Address {
+        use AllocationSemantics::*;
+        let semantics = allocator;
+        let allocator = if matches!(allocator, PrimitiveArray | ReferenceArray) {
+            Default
+        } else {
+            allocator
+        };
         let allocator = unsafe {
             self.allocators
                 .get_allocator_mut(self.config.allocator_mapping[allocator])
         };
         // The value should be default/unset at the beginning of an allocation request.
         debug_assert!(allocator.get_context().get_alloc_options().is_default());
-        allocator.alloc(size, align, offset)
+        allocator.alloc(size, align, offset, semantics)
     }
 
     fn alloc_with_options(
@@ -210,13 +217,20 @@ impl<VM: VMBinding> MutatorContext<VM> for Mutator<VM> {
         allocator: AllocationSemantics,
         options: AllocationOptions,
     ) -> Address {
+        use AllocationSemantics::*;
+        let semantics = allocator;
+        let allocator = if matches!(allocator, PrimitiveArray | ReferenceArray) {
+            Default
+        } else {
+            allocator
+        };
         let allocator = unsafe {
             self.allocators
                 .get_allocator_mut(self.config.allocator_mapping[allocator])
         };
         // The value should be default/unset at the beginning of an allocation request.
         debug_assert!(allocator.get_context().get_alloc_options().is_default());
-        allocator.alloc_with_options(size, align, offset, options)
+        allocator.alloc_with_options(size, align, offset, semantics, options)
     }
 
     fn alloc_slow(
@@ -226,13 +240,20 @@ impl<VM: VMBinding> MutatorContext<VM> for Mutator<VM> {
         offset: usize,
         allocator: AllocationSemantics,
     ) -> Address {
+        use AllocationSemantics::*;
+        let semantics = allocator;
+        let allocator = if matches!(allocator, PrimitiveArray | ReferenceArray) {
+            Default
+        } else {
+            allocator
+        };
         let allocator = unsafe {
             self.allocators
                 .get_allocator_mut(self.config.allocator_mapping[allocator])
         };
         // The value should be default/unset at the beginning of an allocation request.
         debug_assert!(allocator.get_context().get_alloc_options().is_default());
-        allocator.alloc_slow(size, align, offset)
+        allocator.alloc_slow(size, align, offset, semantics)
     }
 
     fn alloc_slow_with_options(
@@ -243,17 +264,30 @@ impl<VM: VMBinding> MutatorContext<VM> for Mutator<VM> {
         allocator: AllocationSemantics,
         options: AllocationOptions,
     ) -> Address {
+        use AllocationSemantics::*;
+        let semantics = allocator;
+        let allocator = if matches!(allocator, PrimitiveArray | ReferenceArray) {
+            Default
+        } else {
+            allocator
+        };
         let allocator = unsafe {
             self.allocators
                 .get_allocator_mut(self.config.allocator_mapping[allocator])
         };
         // The value should be default/unset at the beginning of an allocation request.
         debug_assert!(allocator.get_context().get_alloc_options().is_default());
-        allocator.alloc_slow_with_options(size, align, offset, options)
+        allocator.alloc_slow_with_options(size, align, offset, semantics, options)
     }
 
     // Note that this method is slow, and we expect VM bindings that care about performance to implement allocation fastpath sequence in their bindings.
     fn post_alloc(&mut self, refer: ObjectReference, bytes: usize, allocator: AllocationSemantics) {
+        use AllocationSemantics::*;
+        let allocator = if matches!(allocator, PrimitiveArray | ReferenceArray) {
+            Default
+        } else {
+            allocator
+        };
         unsafe {
             self.allocators
                 .get_allocator_mut(self.config.allocator_mapping[allocator])
@@ -384,6 +418,10 @@ impl<VM: VMBinding> Mutator<VM> {
                     offset_of!(Allocators<VM>, markcompact)
                         + size_of::<MarkCompactAllocator<VM>>() * index as usize
                 }
+                AllocatorSelector::Compressor(index) => {
+                    offset_of!(Allocators<VM>, compressor)
+                        + size_of::<CompressorAllocator<VM>>() * index as usize
+                }
                 AllocatorSelector::None => panic!("Expect a valid AllocatorSelector, found None"),
             }
     }
@@ -490,6 +528,7 @@ pub(crate) struct ReservedAllocators {
     pub n_malloc: u8,
     pub n_immix: u8,
     pub n_mark_compact: u8,
+    pub n_compressor: u8,
     pub n_free_list: u8,
 }
 
@@ -500,6 +539,7 @@ impl ReservedAllocators {
         n_malloc: 0,
         n_immix: 0,
         n_mark_compact: 0,
+        n_compressor: 0,
         n_free_list: 0,
     };
     /// check if the number of each allocator is okay. Panics if any allocator exceeds the max number.
@@ -524,6 +564,10 @@ impl ReservedAllocators {
         assert!(
             self.n_mark_compact as usize <= MAX_MARK_COMPACT_ALLOCATORS,
             "Allocator mapping declared more mark compact allocators than the max allowed."
+        );
+        assert!(
+            self.n_compressor as usize <= MAX_COMPRESSOR_ALLOCATORS,
+            "Allocator mapping declared more compressor allocators than the max allowed."
         );
         assert!(
             self.n_free_list as usize <= MAX_FREE_LIST_ALLOCATORS,

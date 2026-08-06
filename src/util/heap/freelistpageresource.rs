@@ -17,7 +17,7 @@ use crate::util::heap::space_descriptor::SpaceDescriptor;
 use crate::util::opaque_pointer::*;
 use crate::util::os::*;
 use crate::util::raw_memory_freelist::RawMemoryFreeList;
-use crate::vm::*;
+use crate::{vm::*, AllocationSemantics};
 use std::marker::PhantomData;
 
 const UNINITIALIZED_WATER_MARK: i32 = -1;
@@ -82,6 +82,7 @@ impl<VM: VMBinding> PageResource<VM> for FreeListPageResource<VM> {
         space_descriptor: SpaceDescriptor,
         reserved_pages: usize,
         required_pages: usize,
+        _semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
         let mut sync = self.sync.lock().unwrap();

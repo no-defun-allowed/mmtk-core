@@ -2,6 +2,7 @@ use crate::util::address::Address;
 use crate::util::conversions;
 use crate::util::freelist::FreeList;
 use crate::util::opaque_pointer::*;
+use crate::AllocationSemantics;
 use std::sync::Mutex;
 
 use super::layout::VMMap;
@@ -18,9 +19,16 @@ pub trait PageResource<VM: VMBinding>: 'static {
         space_descriptor: SpaceDescriptor,
         reserved_pages: usize,
         required_pages: usize,
+        semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
-        self.alloc_pages(space_descriptor, reserved_pages, required_pages, tls)
+        self.alloc_pages(
+            space_descriptor,
+            reserved_pages,
+            required_pages,
+            semantics,
+            tls,
+        )
     }
 
     // XXX: In the original code reserve_pages & clear_request explicitly
@@ -56,6 +64,7 @@ pub trait PageResource<VM: VMBinding>: 'static {
         space_descriptor: SpaceDescriptor,
         reserved_pages: usize,
         required_pages: usize,
+        semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail>;
 

@@ -9,7 +9,7 @@ use crate::policy::marksweepspace::native_ms::MarkSweepSpace;
 use crate::policy::space::Space;
 use crate::util::alloc::LargeObjectAllocator;
 use crate::util::alloc::MallocAllocator;
-use crate::util::alloc::{Allocator, BumpAllocator, ImmixAllocator};
+use crate::util::alloc::{Allocator, BumpAllocator, CompressorAllocator, ImmixAllocator};
 use crate::util::VMMutatorThread;
 use crate::vm::VMBinding;
 use crate::Mutator;
@@ -25,6 +25,7 @@ pub(crate) const MAX_MALLOC_ALLOCATORS: usize = 1;
 pub(crate) const MAX_IMMIX_ALLOCATORS: usize = 2;
 pub(crate) const MAX_FREE_LIST_ALLOCATORS: usize = 2;
 pub(crate) const MAX_MARK_COMPACT_ALLOCATORS: usize = 1;
+pub(crate) const MAX_COMPRESSOR_ALLOCATORS: usize = 1;
 
 // The allocators set owned by each mutator. We provide a fixed number of allocators for each allocator type in the mutator,
 // and each plan will select part of the allocators to use.
@@ -38,6 +39,7 @@ pub struct Allocators<VM: VMBinding> {
     pub immix: [MaybeUninit<ImmixAllocator<VM>>; MAX_IMMIX_ALLOCATORS],
     pub free_list: [MaybeUninit<FreeListAllocator<VM>>; MAX_FREE_LIST_ALLOCATORS],
     pub markcompact: [MaybeUninit<MarkCompactAllocator<VM>>; MAX_MARK_COMPACT_ALLOCATORS],
+    pub compressor: [MaybeUninit<CompressorAllocator<VM>>; MAX_COMPRESSOR_ALLOCATORS],
 }
 
 impl<VM: VMBinding> Allocators<VM> {
@@ -56,6 +58,9 @@ impl<VM: VMBinding> Allocators<VM> {
             AllocatorSelector::FreeList(index) => self.free_list[index as usize].assume_init_ref(),
             AllocatorSelector::MarkCompact(index) => {
                 self.markcompact[index as usize].assume_init_ref()
+            }
+            AllocatorSelector::Compressor(index) => {
+                self.compressor[index as usize].assume_init_ref()
             }
             AllocatorSelector::None => panic!("Allocator mapping is not initialized"),
         }
@@ -86,6 +91,9 @@ impl<VM: VMBinding> Allocators<VM> {
             AllocatorSelector::MarkCompact(index) => {
                 self.markcompact[index as usize].assume_init_mut()
             }
+            AllocatorSelector::Compressor(index) => {
+                self.compressor[index as usize].assume_init_mut()
+            }
             AllocatorSelector::None => panic!("Allocator mapping is not initialized"),
         }
     }
@@ -111,6 +119,7 @@ impl<VM: VMBinding> Allocators<VM> {
             immix: unsafe { MaybeUninit::uninit().assume_init() },
             free_list: unsafe { MaybeUninit::uninit().assume_init() },
             markcompact: unsafe { MaybeUninit::uninit().assume_init() },
+            compressor: unsafe { MaybeUninit::uninit().assume_init() },
         };
         let context = Arc::new(AllocatorContext::new(mmtk));
 
@@ -159,6 +168,15 @@ impl<VM: VMBinding> Allocators<VM> {
                         context.clone(),
                     ));
                 }
+                AllocatorSelector::Compressor(index) => {
+                    ret.compressor[index as usize].write(CompressorAllocator::new(
+                        mutator_tls.0,
+                        space
+                            .downcast_ref::<crate::policy::compressor::CompressorSpace<VM>>()
+                            .unwrap(),
+                        context.clone(),
+                    ));
+                }
                 AllocatorSelector::None => panic!("Allocator mapping is not initialized"),
             }
         }
@@ -195,6 +213,8 @@ pub enum AllocatorSelector {
     MarkCompact(u8),
     /// Represents a [`crate::util::alloc::free_list_allocator::FreeListAllocator`].
     FreeList(u8),
+    /// Represents a [`crate::util::alloc::compressor_allocator::CompressorAllocator`].
+    Compressor(u8),
     /// No allocator found.
     #[default]
     None,

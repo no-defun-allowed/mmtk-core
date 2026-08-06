@@ -23,13 +23,13 @@ use crate::util::object_enum::ObjectEnumerator;
 use crate::util::object_forwarding;
 use crate::util::{copy::*, epilogue, object_enum};
 use crate::util::{Address, ObjectReference};
-use crate::vm::*;
 use crate::{
     plan::ObjectQueue,
     scheduler::{GCWork, GCWorkScheduler, GCWorker, WorkBucketStage},
     util::opaque_pointer::{VMThread, VMWorkerThread},
     MMTK,
 };
+use crate::{vm::*, AllocationSemantics};
 use atomic::Ordering;
 use std::sync::{atomic::AtomicU8, atomic::AtomicUsize, Arc};
 
@@ -1096,7 +1096,8 @@ impl<VM: VMBinding> PolicyCopyContext for ImmixCopyContext<VM> {
         align: usize,
         offset: usize,
     ) -> Address {
-        self.allocator.alloc(bytes, align, offset)
+        self.allocator
+            .alloc(bytes, align, offset, AllocationSemantics::Default)
     }
     fn post_copy(&mut self, obj: ObjectReference, bytes: usize) {
         self.get_space().post_copy(obj, bytes)
@@ -1146,9 +1147,11 @@ impl<VM: VMBinding> PolicyCopyContext for ImmixHybridCopyContext<VM> {
         offset: usize,
     ) -> Address {
         if self.get_space().in_defrag() {
-            self.defrag_allocator.alloc(bytes, align, offset)
+            self.defrag_allocator
+                .alloc(bytes, align, offset, AllocationSemantics::Default)
         } else {
-            self.copy_allocator.alloc(bytes, align, offset)
+            self.copy_allocator
+                .alloc(bytes, align, offset, AllocationSemantics::Default)
         }
     }
     fn post_copy(&mut self, obj: ObjectReference, bytes: usize) {

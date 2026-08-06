@@ -3,6 +3,7 @@ use crate::policy::space::required_chunks;
 use crate::util::address::Address;
 use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::conversions::*;
+use crate::AllocationSemantics;
 use std::ops::Range;
 use std::sync::{Mutex, MutexGuard};
 
@@ -71,6 +72,7 @@ impl<VM: VMBinding> PageResource<VM> for MonotonePageResource<VM> {
         space_descriptor: SpaceDescriptor,
         reserved_pages: usize,
         required_pages: usize,
+        _semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
         debug!(

@@ -4,7 +4,7 @@ use crate::util::address::Address;
 use crate::util::analysis::AnalysisManager;
 use crate::util::heap::gc_trigger::GCTrigger;
 use crate::util::options::Options;
-use crate::MMTK;
+use crate::{AllocationSemantics, MMTK};
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,6 +60,11 @@ pub struct AllocationOptions {
     ///
     /// If `fasle`, the allocation will return null immediately when out of memory.
     pub allow_oom_call: bool,
+
+    /// The allocation semantics for this allocation site. Note that this can
+    /// usually be ignored, since only some Spaces care about the allocation
+    /// semantics.
+    pub semantics: AllocationSemantics,
 }
 
 /// The default value for `AllocationOptions` has the same semantics as calling [`Allocator::alloc`]
@@ -70,6 +75,7 @@ impl Default for AllocationOptions {
             allow_overcommit: false,
             at_safepoint: true,
             allow_oom_call: true,
+            semantics: AllocationSemantics::Default,
         }
     }
 }
@@ -363,7 +369,14 @@ pub trait Allocator<VM: VMBinding>: Downcast {
     /// * `size`: the allocation size in bytes.
     /// * `align`: the required alignment in bytes.
     /// * `offset` the required offset in bytes.
-    fn alloc(&mut self, size: usize, align: usize, offset: usize) -> Address;
+    /// * `semantics`: the allocation semantics.
+    fn alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address;
 
     /// An allocation attempt. The allocation options may specify different behaviors for this allocation request.
     ///
@@ -371,16 +384,18 @@ pub trait Allocator<VM: VMBinding>: Downcast {
     /// * `size`: the allocation size in bytes.
     /// * `align`: the required alignment in bytes.
     /// * `offset` the required offset in bytes.
+    /// * `semantics`: the allocation semantics.
     /// * `options`: the allocation options to change the default allocation behavior for this request.
     fn alloc_with_options(
         &mut self,
         size: usize,
         align: usize,
         offset: usize,
+        semantics: AllocationSemantics,
         alloc_options: AllocationOptions,
     ) -> Address {
         self.get_context().set_alloc_options(alloc_options);
-        let ret = self.alloc(size, align, offset);
+        let ret = self.alloc(size, align, offset, semantics);
         self.get_context().clear_alloc_options();
         ret
     }
@@ -392,9 +407,16 @@ pub trait Allocator<VM: VMBinding>: Downcast {
     /// * `size`: the allocation size in bytes.
     /// * `align`: the required alignment in bytes.
     /// * `offset` the required offset in bytes.
+    /// * `semantics`: the allocation semantics.
     #[inline(never)]
-    fn alloc_slow(&mut self, size: usize, align: usize, offset: usize) -> Address {
-        self.alloc_slow_inline(size, align, offset)
+    fn alloc_slow(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address {
+        self.alloc_slow_inline(size, align, offset, semantics)
     }
 
     /// Slowpath allocation attempt. Mostly the same as [`Allocator::alloc_slow`], except that the allocation options
@@ -407,16 +429,19 @@ pub trait Allocator<VM: VMBinding>: Downcast {
     /// * `size`: the allocation size in bytes.
     /// * `align`: the required alignment in bytes.
     /// * `offset` the required offset in bytes.
+    /// * `semantics`: the allocation semantics.
+    /// * `options`: the allocation options to change the default allocation behavior for this request.
     fn alloc_slow_with_options(
         &mut self,
         size: usize,
         align: usize,
         offset: usize,
+        semantics: AllocationSemantics,
         alloc_options: AllocationOptions,
     ) -> Address {
         // The function is not used internally. We won't set no_gc_on_fail redundantly.
         self.get_context().set_alloc_options(alloc_options);
-        let ret = self.alloc_slow(size, align, offset);
+        let ret = self.alloc_slow(size, align, offset, semantics);
         self.get_context().clear_alloc_options();
         ret
     }
@@ -437,7 +462,14 @@ pub trait Allocator<VM: VMBinding>: Downcast {
     /// * `size`: the allocation size in bytes.
     /// * `align`: the required alignment in bytes.
     /// * `offset` the required offset in bytes.
-    fn alloc_slow_inline(&mut self, size: usize, align: usize, offset: usize) -> Address {
+    /// * `semantics`: the allocation semantics.
+    fn alloc_slow_inline(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address {
         let tls = self.get_tls();
         let is_mutator = VM::VMActivePlan::is_mutator(tls);
         let stress_test = self.get_context().options.is_stress_test_gc_enabled();
@@ -460,11 +492,11 @@ pub trait Allocator<VM: VMBinding>: Downcast {
                 // so they would avoid try any thread local allocation, and directly call
                 // global acquire and do a poll.
                 let need_poll = is_mutator && self.get_context().gc_trigger.should_do_stress_gc();
-                self.alloc_slow_once_precise_stress(size, align, offset, need_poll)
+                self.alloc_slow_once_precise_stress(size, align, offset, semantics, need_poll)
             } else {
                 // If we are not doing precise stress GC, just call the normal alloc_slow_once().
                 // Normal stress test only checks for stress GC in the slowpath.
-                self.alloc_slow_once_traced(size, align, offset)
+                self.alloc_slow_once_traced(size, align, offset, semantics)
             };
 
             if !is_mutator {
@@ -607,7 +639,14 @@ pub trait Allocator<VM: VMBinding>: Downcast {
     /// * `size`: the allocation size in bytes.
     /// * `align`: the required alignment in bytes.
     /// * `offset` the required offset in bytes.
-    fn alloc_slow_once(&mut self, size: usize, align: usize, offset: usize) -> Address;
+    /// * `semantics`: the allocation semantics.
+    fn alloc_slow_once(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address;
 
     /// A wrapper method for [`alloc_slow_once`](Allocator::alloc_slow_once) to insert USDT tracepoints.
     ///
@@ -615,11 +654,18 @@ pub trait Allocator<VM: VMBinding>: Downcast {
     /// * `size`: the allocation size in bytes.
     /// * `align`: the required alignment in bytes.
     /// * `offset` the required offset in bytes.
-    fn alloc_slow_once_traced(&mut self, size: usize, align: usize, offset: usize) -> Address {
+    /// * `semantics`: the allocation semantics.
+    fn alloc_slow_once_traced(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address {
         probe!(mmtk, alloc_slow_once_start);
         // probe! expands to an empty block on unsupported platforms
         #[allow(clippy::let_and_return)]
-        let ret = self.alloc_slow_once(size, align, offset);
+        let ret = self.alloc_slow_once(size, align, offset, semantics);
         probe!(mmtk, alloc_slow_once_end);
         ret
     }
@@ -657,6 +703,7 @@ pub trait Allocator<VM: VMBinding>: Downcast {
         size: usize,
         align: usize,
         offset: usize,
+        semantics: AllocationSemantics,
         need_poll: bool,
     ) -> Address {
         // If an allocator does thread local allocation but does not override this method to
@@ -664,7 +711,7 @@ pub trait Allocator<VM: VMBinding>: Downcast {
         if self.does_thread_local_allocation() && need_poll {
             warn!("{} does not support stress GC (An allocator that does thread local allocation needs to implement allow_slow_once_stress_test()).", std::any::type_name::<Self>());
         }
-        self.alloc_slow_once_traced(size, align, offset)
+        self.alloc_slow_once_traced(size, align, offset, semantics)
     }
 
     /// The [`crate::plan::Mutator`] that includes this allocator is going to be destroyed. Some allocators

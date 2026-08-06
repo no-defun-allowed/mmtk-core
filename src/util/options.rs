@@ -1082,6 +1082,8 @@ options! {
     compressor_pinning_mode: PinningMode            [always_valid] = PinningMode::NoPinning,
     /// Bias for how much more likely is a mature page to be pinned than a nursery one.
     compressor_mature_pinning_bias: f64             [|v: &f64| *v >= 1.0] = 1.0,
+    /// Check if a page is a candidate for pinning before actually pinning it.
+    compressor_check_candidate_before_pinning: bool [always_valid] = false,
     /// Print the Compressor stub table stats to a file.
     compressor_print_stub_table_stats: bool         [always_valid] = false,
     /// The file name to store the Compressor stub table metadata.

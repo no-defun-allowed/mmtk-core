@@ -399,11 +399,71 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         forwarding::PINNED_PAGE_SPEC
                             .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
                     }
-                    /*
-                    XXX:
-                    total_nursery += r.cursor() - r.prev_cursor();
-                    total_allocated += r.cursor() - r.region.start();
-                    */
+                    if *self
+                        .common()
+                        .options
+                        .compressor_check_candidate_before_pinning
+                    {
+                        let mut page = r.region.start();
+                        let end = r.region.end();
+                        while page < end {
+                            use crate::util::metadata::vo_bit::find_object_from_internal_pointer;
+
+                            // Does an object live on this page?
+                            let mut pinning_candidate = find_object_from_internal_pointer::<VM>(
+                                page + BYTES_IN_PAGE - 1,
+                                BYTES_IN_PAGE,
+                            )
+                            .is_some();
+
+                            if !pinning_candidate {
+                                use crate::plan::MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN;
+
+                                // Does an object span into this page?
+                                let potential_spanning_object =
+                                    find_object_from_internal_pointer::<VM>(
+                                        page,
+                                        MAX_NON_LOS_ALLOC_BYTES_COPYING_PLAN,
+                                    );
+
+                                if let Some(potential_spanning_object) = potential_spanning_object {
+                                    let size = VM::VMObjectModel::get_current_size(
+                                        potential_spanning_object,
+                                    );
+                                    pinning_candidate =
+                                        potential_spanning_object.to_object_start::<VM>() + size
+                                            > page;
+                                }
+                            }
+
+                            if pinning_candidate {
+                                let is_mature = false; /* XXX(hayleyp): page <= r.prev_cursor() */
+                                trace!(
+                                    "Page {} is a {} pinning candidate",
+                                    page,
+                                    if is_mature { "mature" } else { "nursery" }
+                                );
+                                if !is_mature {
+                                    total_nursery += BYTES_IN_PAGE;
+                                }
+                                total_allocated += BYTES_IN_PAGE;
+                                // Set the pinning bit for this page. We use this bit to figure out pinning
+                                // candidates in `Self::pin_random_pages`. We don't want to pin pages that
+                                // are not pinning candidates
+                                forwarding::PINNED_PAGE_SPEC.store_atomic(
+                                    page,
+                                    1_u8,
+                                    Ordering::SeqCst,
+                                );
+                            }
+                            page += BYTES_IN_PAGE;
+                        }
+                    } else {
+                        /* XXX(hayleyp)
+                        total_nursery += r.cursor() - r.prev_cursor();
+                        total_allocated += r.cursor() - r.region.start();
+                        */
+                    }
                 }
             });
 
@@ -594,30 +654,62 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             *self.common().options.compressor_mature_pinning_bias,
             mature_fraction,
         );
+        let check_pinning_candidates = *self
+            .common()
+            .options
+            .compressor_check_candidate_before_pinning;
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let mut page = r.region.start();
                 let end = r.region.end();
                 while page < end {
-                    let mature = false /* XXX: page <= r.prev_cursor() */;
-                    if rng.should_pin(mature) {
-                        pages_pinned += 1;
-                        if !need_to_cache {
-                            forwarding::PINNED_PAGE_SPEC.store_atomic(page, 1_u8, Ordering::SeqCst);
-                            let block_start = forwarding::Block::from_aligned_address(page);
-                            let block_end =
-                                forwarding::Block::from_aligned_address(page + BYTES_IN_PAGE);
-                            for block in RegionIterator::<Block>::new(block_start, block_end) {
-                                forwarding::pin_block(block);
+                    let is_pinning_candidate = if check_pinning_candidates {
+                        forwarding::PINNED_PAGE_SPEC.load_atomic::<u8>(page, Ordering::SeqCst)
+                            == 1_u8
+                    } else {
+                        true
+                    };
+                    let mature = false /* XXX(hayleyp): page <= r.prev_cursor() */;
+                    if is_pinning_candidate {
+                        if rng.should_pin(mature) {
+                            pages_pinned += 1;
+                            if !need_to_cache {
+                                forwarding::PINNED_PAGE_SPEC.store_atomic(
+                                    page,
+                                    1_u8,
+                                    Ordering::SeqCst,
+                                );
+                                let block_start = forwarding::Block::from_aligned_address(page);
+                                let block_end =
+                                    forwarding::Block::from_aligned_address(page + BYTES_IN_PAGE);
+                                for block in RegionIterator::<Block>::new(block_start, block_end) {
+                                    forwarding::pin_block(block);
+                                }
+                            } else {
+                                self.cached_pinned_pages.write().unwrap().insert(page);
+                                if check_pinning_candidates {
+                                    forwarding::PINNED_PAGE_SPEC.store_atomic(
+                                        page,
+                                        0_u8,
+                                        Ordering::SeqCst,
+                                    );
+                                }
                             }
+                            info!(
+                                "Pinning {:?} page {}: {}",
+                                r.semantics,
+                                page,
+                                if mature { "mature" } else { "nursery" }
+                            );
                         } else {
-                            self.cached_pinned_pages.write().unwrap().insert(page);
+                            if check_pinning_candidates {
+                                forwarding::PINNED_PAGE_SPEC.store_atomic(
+                                    page,
+                                    0_u8,
+                                    Ordering::SeqCst,
+                                );
+                            }
                         }
-                        info!(
-                            "Pinning page {}: {}",
-                            page,
-                            if mature { "mature" } else { "nursery" }
-                        );
                     }
                     page += BYTES_IN_PAGE;
                     total_pages += 1;

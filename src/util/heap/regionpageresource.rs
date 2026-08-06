@@ -11,11 +11,13 @@ use crate::util::VMThread;
 use crate::vm::VMBinding;
 use std::ops::Range;
 use std::sync::{Mutex, RwLock};
+use crate::AllocationSemantics;
 
 /// A region in a [`RegionPageResource`] and its free list.
 pub struct AllocatedRegion<R: Region> {
     pub region: R,
     free_list: Mutex<Vec<Range<Address>>>,
+    pub semantics: AllocationSemantics,
 }
 
 impl<R: Region> AllocatedRegion<R> {
@@ -57,11 +59,18 @@ impl<VM: VMBinding, R: Region + 'static> PageResource<VM> for RegionPageResource
         space_descriptor: SpaceDescriptor,
         reserved_pages: usize,
         required_pages: usize,
+        semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
         assert!(reserved_pages <= Self::REGION_PAGES);
         assert!(required_pages <= reserved_pages);
-        self.alloc(space_descriptor, reserved_pages, required_pages, tls)
+        self.alloc(
+            space_descriptor,
+            reserved_pages,
+            required_pages,
+            semantics,
+            tls,
+        )
     }
 
     fn get_available_physical_pages(&self) -> usize {
@@ -95,6 +104,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         space_descriptor: SpaceDescriptor,
         reserved_pages: usize,
         required_pages: usize,
+        semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
         let mut b = self.sync.write().unwrap();
@@ -107,18 +117,23 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         };
         let bytes = reserved_pages * BYTES_IN_PAGE;
         // First try to reuse a region.
-        while b.next_region < b.all_regions.len() {
-            let cursor = b.next_region;
-            let (addr, pages_wasted) = self.allocate_from_region(&mut b.all_regions[cursor], bytes);
+        // XXX(kunals): We always scan from the first region. Since the list of
+        // regions contains all the flavors of allocation semantics, we need to
+        // check if there's a previous region that can help satisfy this
+        // allocation request.
+        let mut idx = 0;
+        while idx < b.all_regions.len() {
+            let (addr, pages_wasted) = self.allocate_from_region(&mut b.all_regions[idx], bytes, semantics);
             self.common().accounting.reserve_and_commit(pages_wasted);
             if let Some(address) = addr {
                 self.commit_pages(reserved_pages, required_pages, tls);
                 return succeed(address, false);
             }
-            b.next_region += 1;
+            idx += 1;
         }
         // Else allocate a new chunk to carve regions from.
         let chunk_start = self.flpr.allocate_one_chunk_no_commit(space_descriptor)?.start;
+        let idx = b.all_regions.len();
         assert!(chunk_start.is_aligned_to(BYTES_IN_CHUNK));
         assert!(R::BYTES < BYTES_IN_CHUNK); // XXX: where to do this properly?
         for i in 0..(BYTES_IN_CHUNK / R::BYTES) {
@@ -126,14 +141,14 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             b.all_regions.push(AllocatedRegion {
                 region: R::from_aligned_address(region_start),
                 free_list: Mutex::new(vec![region_start..(region_start + R::BYTES)]),
+                semantics,
             });
         }
         // This allocation from the first new region has to succeed, and can't waste space
         // as it's at the very start of the region.
         self.commit_pages(reserved_pages, required_pages, tls);
-        let cursor = b.next_region;
         succeed(
-            self.allocate_from_region(&mut b.all_regions[cursor], bytes)
+            self.allocate_from_region(&mut b.all_regions[idx], bytes, semantics)
                 .0.expect("allocation should fit in new region"),
             true,
         )
@@ -143,7 +158,11 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         &self,
         alloc: &mut AllocatedRegion<R>,
         bytes: usize,
+        semantics: AllocationSemantics,
     ) -> (Option<Address>, usize) {
+        if semantics != alloc.semantics {
+            return (None, 0);
+        }
         let mut bytes_wasted = 0;
         let mut free_list = alloc.free_list.lock().unwrap();
         loop {

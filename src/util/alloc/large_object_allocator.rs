@@ -6,6 +6,7 @@ use crate::util::alloc::{allocator, Allocator};
 use crate::util::opaque_pointer::*;
 use crate::util::Address;
 use crate::vm::VMBinding;
+use crate::AllocationSemantics;
 
 use super::allocator::AllocatorContext;
 
@@ -38,8 +39,18 @@ impl<VM: VMBinding> Allocator<VM> for LargeObjectAllocator<VM> {
         false
     }
 
-    fn alloc(&mut self, size: usize, align: usize, offset: usize) -> Address {
-        let cell: Address = self.alloc_slow(size, align, offset);
+    fn alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address {
+        assert!(matches!(
+            semantics,
+            AllocationSemantics::Los | AllocationSemantics::LargeCode
+        ));
+        let cell: Address = self.alloc_slow(size, align, offset, semantics);
         // We may get a null ptr from alloc due to the VM being OOM
         if !cell.is_zero() {
             allocator::align_allocation::<VM>(cell, align, offset)
@@ -48,7 +59,13 @@ impl<VM: VMBinding> Allocator<VM> for LargeObjectAllocator<VM> {
         }
     }
 
-    fn alloc_slow_once(&mut self, size: usize, align: usize, _offset: usize) -> Address {
+    fn alloc_slow_once(
+        &mut self,
+        size: usize,
+        align: usize,
+        _offset: usize,
+        _semantics: AllocationSemantics,
+    ) -> Address {
         let maxbytes = allocator::get_maximum_aligned_size::<VM>(size, align);
         let pages = crate::util::conversions::bytes_to_pages_up(maxbytes);
 

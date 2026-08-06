@@ -7,6 +7,7 @@ use crate::util::alloc::Allocator;
 use crate::util::opaque_pointer::*;
 use crate::util::Address;
 use crate::vm::VMBinding;
+use crate::AllocationSemantics;
 
 /// A thin wrapper(specific implementation) of bump allocator
 /// reserve extra bytes when allocating
@@ -50,10 +51,25 @@ impl<VM: VMBinding> Allocator<VM> for MarkCompactAllocator<VM> {
         self.bump_allocator.get_thread_local_buffer_granularity()
     }
 
-    fn alloc(&mut self, size: usize, align: usize, offset: usize) -> Address {
-        let rtn = self
-            .bump_allocator
-            .alloc(size + Self::HEADER_RESERVED_IN_BYTES, align, offset);
+    fn alloc(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address {
+        assert!(matches!(
+            semantics,
+            AllocationSemantics::Default
+                | AllocationSemantics::PrimitiveArray
+                | AllocationSemantics::ReferenceArray
+        ));
+        let rtn = self.bump_allocator.alloc(
+            size + Self::HEADER_RESERVED_IN_BYTES,
+            align,
+            offset,
+            semantics,
+        );
         // Check if the result is valid and return the actual object start address
         // Note that `rtn` can be null in the case of OOM
         if !rtn.is_zero() {
@@ -63,9 +79,16 @@ impl<VM: VMBinding> Allocator<VM> for MarkCompactAllocator<VM> {
         }
     }
 
-    fn alloc_slow_once(&mut self, size: usize, align: usize, offset: usize) -> Address {
+    fn alloc_slow_once(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        semantics: AllocationSemantics,
+    ) -> Address {
         trace!("alloc_slow");
-        self.bump_allocator.alloc_slow_once(size, align, offset)
+        self.bump_allocator
+            .alloc_slow_once(size, align, offset, semantics)
     }
 
     /// Slow path for allocation if precise stress testing has been enabled.
@@ -81,10 +104,11 @@ impl<VM: VMBinding> Allocator<VM> for MarkCompactAllocator<VM> {
         size: usize,
         align: usize,
         offset: usize,
+        semantics: AllocationSemantics,
         need_poll: bool,
     ) -> Address {
         self.bump_allocator
-            .alloc_slow_once_precise_stress(size, align, offset, need_poll)
+            .alloc_slow_once_precise_stress(size, align, offset, semantics, need_poll)
     }
 }
 
