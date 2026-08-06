@@ -9,6 +9,7 @@ use crate::util::object_enum::ObjectEnumerator;
 use crate::util::Address;
 use crate::util::VMThread;
 use crate::vm::VMBinding;
+use enum_map::EnumMap;
 use std::ops::Range;
 use std::sync::{Mutex, RwLock};
 use crate::AllocationSemantics;
@@ -17,7 +18,9 @@ use crate::AllocationSemantics;
 pub struct AllocatedRegion<R: Region> {
     pub region: R,
     free_list: Mutex<Vec<Range<Address>>>,
-    pub semantics: AllocationSemantics,
+    // Regions we just allocated from a chunk
+    // aren't assigned any semantics.
+    pub semantics: Option<AllocationSemantics>,
 }
 
 impl<R: Region> AllocatedRegion<R> {
@@ -29,7 +32,7 @@ impl<R: Region> AllocatedRegion<R> {
 
 struct Sync<R: Region> {
     all_regions: Vec<AllocatedRegion<R>>,
-    next_region: usize,
+    next_regions: EnumMap<AllocationSemantics, usize>,
 }
 
 /// A [`PageResource`] which allocates pages from a region-structured heap.
@@ -94,7 +97,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             flpr,
             sync: RwLock::new(Sync {
                 all_regions: vec![],
-                next_region: 0,
+                next_regions: EnumMap::from_fn(|_| 0),
             }),
         }
     }
@@ -117,23 +120,20 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         };
         let bytes = reserved_pages * BYTES_IN_PAGE;
         // First try to reuse a region.
-        // XXX(kunals): We always scan from the first region. Since the list of
-        // regions contains all the flavors of allocation semantics, we need to
-        // check if there's a previous region that can help satisfy this
-        // allocation request.
-        let mut idx = 0;
+        let mut idx = b.next_regions[semantics];
         while idx < b.all_regions.len() {
             let (addr, pages_wasted) = self.allocate_from_region(&mut b.all_regions[idx], bytes, semantics);
             self.common().accounting.reserve_and_commit(pages_wasted);
             if let Some(address) = addr {
                 self.commit_pages(reserved_pages, required_pages, tls);
+                b.next_regions[semantics] = idx;
                 return succeed(address, false);
             }
             idx += 1;
         }
+        b.next_regions[semantics] = idx;
         // Else allocate a new chunk to carve regions from.
         let chunk_start = self.flpr.allocate_one_chunk_no_commit(space_descriptor)?.start;
-        let idx = b.all_regions.len();
         assert!(chunk_start.is_aligned_to(BYTES_IN_CHUNK));
         assert!(R::BYTES < BYTES_IN_CHUNK); // XXX: where to do this properly?
         for i in 0..(BYTES_IN_CHUNK / R::BYTES) {
@@ -141,7 +141,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             b.all_regions.push(AllocatedRegion {
                 region: R::from_aligned_address(region_start),
                 free_list: Mutex::new(vec![region_start..(region_start + R::BYTES)]),
-                semantics,
+                semantics: None,
             });
         }
         // This allocation from the first new region has to succeed, and can't waste space
@@ -160,9 +160,16 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         bytes: usize,
         semantics: AllocationSemantics,
     ) -> (Option<Address>, usize) {
-        if semantics != alloc.semantics {
-            return (None, 0);
+        // Viable regions either have the right semantics,
+        // or haven't assigned semantics yet.
+        if let Some(s) = alloc.semantics {
+            if semantics != s {
+                return (None, 0);
+            }
         }
+        // If the region hasn't been assigned any semantics yet,
+        // due to being newly allocated, assign it now.
+        alloc.semantics = Some(semantics);
         let mut bytes_wasted = 0;
         let mut free_list = alloc.free_list.lock().unwrap();
         loop {
@@ -202,7 +209,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
     /// Reset the allocator state after a collection, so that the allocator will
     /// revisit regions which the garbage collector has compacted.
     pub fn reset_allocator(&self) {
-        self.sync.write().unwrap().next_region = 0;
+        self.sync.write().unwrap().next_regions = EnumMap::from_fn(|_| 0);
     }
 
     pub fn enumerate(&self, enumerator: &mut dyn ObjectEnumerator) {
