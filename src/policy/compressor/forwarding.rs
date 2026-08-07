@@ -6,7 +6,9 @@ use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::Region;
 use crate::util::metadata::side_metadata::ranges::Bits;
 #[cfg(feature = "object_pinning")]
-use crate::util::metadata::side_metadata::spec_defs::COMPRESSOR_PAGE_PINNED;
+use crate::util::metadata::side_metadata::spec_defs::{
+    COMPRESSOR_PAGE_MATURE, COMPRESSOR_PAGE_PINNED,
+};
 use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
 };
@@ -484,6 +486,8 @@ pub(crate) const OFFSET_VECTOR_SPEC: SideMetadataSpec = COMPRESSOR_OFFSET_VECTOR
 pub(crate) const SELECTED_SPEC: SideMetadataSpec = COMPRESSOR_SELECTED;
 #[cfg(feature = "object_pinning")]
 pub(crate) const PINNED_PAGE_SPEC: SideMetadataSpec = COMPRESSOR_PAGE_PINNED;
+#[cfg(feature = "object_pinning")]
+pub(crate) const MATURE_PAGE_SPEC: SideMetadataSpec = COMPRESSOR_PAGE_MATURE;
 
 pub struct ForwardingMetadata<VM: VMBinding> {
     compact_limit: CompactLimit,
@@ -495,6 +499,16 @@ pub struct ForwardingMetadata<VM: VMBinding> {
     #[cfg(feature = "object_pinning")]
     pub pinning_mode: PinningMode,
     size_classes: [AtomicUsize; 32],
+}
+
+#[cfg(feature = "object_pinning")]
+pub(super) fn is_page_mature(address: Address) -> bool {
+    debug_assert!(
+        address.is_aligned_to(BYTES_IN_PAGE),
+        "Address {} should be aligned to page size when checking for page maturity.",
+        address,
+    );
+    MATURE_PAGE_SPEC.load_atomic::<u8>(address, Ordering::Relaxed) != 0
 }
 
 #[cfg(feature = "object_pinning")]

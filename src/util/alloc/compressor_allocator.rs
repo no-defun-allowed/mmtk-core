@@ -232,6 +232,8 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
                 block_size,
                 acquired_start
             );
+            #[cfg(feature = "object_pinning")]
+            self.space.touch_pages(acquired_start, block_size);
             if !stress_test {
                 self.set_limit(acquired_start, acquired_start + block_size, semantics);
                 self.alloc(size, align, offset, semantics)

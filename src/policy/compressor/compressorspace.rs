@@ -316,6 +316,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             *VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC,
             #[cfg(feature = "object_pinning")]
             MetadataSpec::OnSide(forwarding::PINNED_PAGE_SPEC),
+            #[cfg(feature = "object_pinning")]
+            MetadataSpec::OnSide(forwarding::MATURE_PAGE_SPEC),
         ]);
         let is_discontiguous = args.vmrequest.is_discontiguous();
         let scheduler = args.scheduler.clone();
@@ -437,7 +439,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                             }
 
                             if pinning_candidate {
-                                let is_mature = false; /* XXX(hayleyp): page <= r.prev_cursor() */
+                                let is_mature = forwarding::is_page_mature(page);
                                 trace!(
                                     "Page {} is a {} pinning candidate",
                                     page,
@@ -601,6 +603,22 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .read()
             .unwrap()
             .regenerate_objects();
+        // Promote all pages to mature
+        #[cfg(feature = "object_pinning")]
+        self.pr.with_regions(&mut |regions| {
+            for r in regions {
+                forwarding::MATURE_PAGE_SPEC.bset_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
+            }
+        });
+    }
+
+    #[cfg(feature = "object_pinning")]
+    pub fn touch_pages(&self, start: Address, size: usize) {
+        let pages = size / BYTES_IN_PAGE;
+        for n in 0..pages {
+            let page = start + BYTES_IN_PAGE * n;
+            forwarding::MATURE_PAGE_SPEC.store_atomic::<u8>(page, 0, Ordering::Relaxed);
+        }
     }
 
     #[cfg(feature = "object_pinning")]
@@ -669,7 +687,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     } else {
                         true
                     };
-                    let mature = false /* XXX(hayleyp): page <= r.prev_cursor() */;
+                    let mature = forwarding::is_page_mature(page);
                     if is_pinning_candidate {
                         if rng.should_pin(mature) {
                             pages_pinned += 1;
