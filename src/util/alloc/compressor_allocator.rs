@@ -11,8 +11,8 @@ use crate::util::conversions::bytes_to_pages_up;
 use crate::util::opaque_pointer::*;
 use crate::vm::VMBinding;
 
-/// Size of a thread-local allocation buffer. Currently it is set to 32 KB.
-const BLOCK_SIZE: usize = 8 << crate::util::constants::LOG_BYTES_IN_PAGE;
+/// Size of a thread-local allocation buffer. Currently it is set to 4 KB.
+const BLOCK_SIZE: usize = 1 << crate::util::constants::LOG_BYTES_IN_PAGE;
 const BLOCK_MASK: usize = BLOCK_SIZE - 1;
 
 #[repr(C)]
