@@ -180,6 +180,8 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
                         free_list.push((range.start + bytes)..(range.end));
                         return (Some(range.start), bytes_wasted / BYTES_IN_PAGE);
                     } else {
+                        // TODO(kunals): Maybe we should keep the hole in the
+                        // free list in case we can allocate from it later.
                         bytes_wasted += range.end - range.start;
                     }
                 }
@@ -198,6 +200,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             .rev()
             .collect::<Vec<_>>();
         info!("free list: {new_free_list:?}");
+        // TODO(kunals): If a region is completely free, we should reset its semantics to None
         let new_free_bytes = new_free_list.iter().map(|r| r.end - r.start).sum::<usize>();
         if new_free_bytes > old_free_bytes {
             let freed_pages = (new_free_bytes - old_free_bytes) / BYTES_IN_PAGE;
