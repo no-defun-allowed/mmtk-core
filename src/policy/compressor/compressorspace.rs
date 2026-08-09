@@ -316,6 +316,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             *VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC,
             #[cfg(feature = "object_pinning")]
             MetadataSpec::OnSide(forwarding::PINNED_PAGE_SPEC),
+            #[cfg(feature = "object_pinning")]
+            MetadataSpec::OnSide(forwarding::MATURE_PAGE_SPEC),
         ]);
         let is_discontiguous = args.vmrequest.is_discontiguous();
         let scheduler = args.scheduler.clone();
@@ -419,7 +421,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         .compressor_check_candidate_before_pinning
                     {
                         let mut page = r.region.start();
-                        let end = r.cursor();
+                        let end = r.region.end();
                         while page < end {
                             use crate::util::metadata::vo_bit::find_object_from_internal_pointer;
 
@@ -451,7 +453,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                             }
 
                             if pinning_candidate {
-                                let is_mature = page <= r.prev_cursor();
+                                let is_mature = forwarding::is_page_mature(page);
                                 trace!(
                                     "Page {} is a {} pinning candidate",
                                     page,
@@ -470,12 +472,13 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                                     Ordering::SeqCst,
                                 );
                             }
-
                             page += BYTES_IN_PAGE;
                         }
                     } else {
+                        /* XXX(hayleyp)
                         total_nursery += r.cursor() - r.prev_cursor();
                         total_allocated += r.cursor() - r.region.start();
+                        */
                     }
                 }
             });
@@ -516,7 +519,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             // individually pin live objects in these pages later.
             if needs_page_pinning {
                 let mature_fraction =
-                    (total_allocated - total_nursery) as f64 / total_allocated as f64;
+                    0.0
+                    /* XXX: (total_allocated - total_nursery) as f64 / total_allocated as f64 */;
                 self.pin_pages(mature_fraction);
                 self.add_scan_pinned_pages_tasks::<Context>();
             }
@@ -537,7 +541,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         forwarding::CompressorRegion,
                     >| {
                         let mut page = r.region.start();
-                        let end = r.cursor();
+                        let end = r.region.end();
                         while page < end {
                             use crate::policy::compressor::forwarding::is_page_pinned;
                             if is_page_pinned(page) {
@@ -592,7 +596,6 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 packets.push(Box::new(ScanPinnedPages::<VM, Context>::new(
                     space,
                     r.region,
-                    r.cursor(),
                 )) as Box<dyn GCWork<VM>>);
             });
         self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace].bulk_add(packets);
@@ -600,10 +603,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .set_sentinel(Box::new(AfterScanPinnedPages::new(space)));
     }
 
-    fn scan_pinned_pages(&self, region: forwarding::CompressorRegion, cursor: Address) {
+    fn scan_pinned_pages(&self, region: forwarding::CompressorRegion) {
         let start = region.start();
         let mut curr = start;
-        let end = cursor;
+        let end = region.end();
         while curr < end {
             // SAFETY: No one will modify the VO-bits when we are scanning pinned pages
             if unsafe { vo_bit::is_vo_addr(curr) } {
@@ -644,6 +647,22 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .read()
             .unwrap()
             .regenerate_objects();
+        // Promote all pages to mature
+        #[cfg(feature = "object_pinning")]
+        self.pr.with_regions(&mut |regions| {
+            for r in regions {
+                forwarding::MATURE_PAGE_SPEC.bset_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
+            }
+        });
+    }
+
+    #[cfg(feature = "object_pinning")]
+    pub fn touch_pages(&self, start: Address, size: usize) {
+        let pages = size / BYTES_IN_PAGE;
+        for n in 0..pages {
+            let page = start + BYTES_IN_PAGE * n;
+            forwarding::MATURE_PAGE_SPEC.store_atomic::<u8>(page, 0, Ordering::Relaxed);
+        }
     }
 
     #[cfg(feature = "object_pinning")]
@@ -704,11 +723,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let mut page = r.region.start();
-                let end = if pin_till_end {
-                    r.region.end()
-                } else {
-                    r.cursor()
-                };
+                let end = r.region.end();
                 while page < end {
                     let is_pinning_candidate = if check_pinning_candidates {
                         forwarding::PINNED_PAGE_SPEC.load_atomic::<u8>(page, Ordering::SeqCst)
@@ -716,7 +731,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     } else {
                         true
                     };
-                    let mature = page <= r.prev_cursor();
+                    let mature = forwarding::is_page_mature(page);
                     if is_pinning_candidate {
                         if rng.should_pin(mature) {
                             pages_pinned += 1;
@@ -779,7 +794,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 let mut page = r.region.start();
-                let end = r.cursor();
+                let end = r.region.end();
                 let cached_pinned_pages = self.cached_pinned_pages.read().unwrap();
                 while page < end {
                     if cached_pinned_pages.contains(&page) {
@@ -867,14 +882,13 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     }
 
     pub fn add_offset_vector_tasks(&'static self) {
-        let mut regions = vec![];
-        self.pr.enumerate_regions(&mut |r| {
-            regions.push((r.region, r.cursor()));
-        });
-        let offset_vector_packets: Vec<Box<dyn GCWork<VM>>> = regions
+        use itertools::Itertools;
+        let region_count = self.pr.with_regions(&mut |r| r.len());
+        let offset_vector_packets: Vec<Box<dyn GCWork<VM>>> = (0..region_count)
             .chunks(OFFSET_VECTOR_PACKET_BYTES / forwarding::CompressorRegion::BYTES)
+            .into_iter()
             .map(|c| {
-                Box::new(CalculateOffsetVector::<VM>::new(self, c.to_vec())) as Box<dyn GCWork<VM>>
+                Box::new(CalculateOffsetVector::<VM>::new(self, c.collect::<Vec<usize>>())) as Box<dyn GCWork<VM>>
             })
             .collect();
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
@@ -885,10 +899,13 @@ impl<VM: VMBinding> CompressorSpace<VM> {
 
     pub fn calculate_offset_vector_for_region(
         &self,
-        region: forwarding::CompressorRegion,
-        cursor: Address,
+        index: usize,
     ) {
-        self.forwarding.calculate_offset_vector(region, cursor);
+        self.pr.with_regions(&mut |regions| {
+            let region = &regions[index];
+            let free_list = self.forwarding.calculate_offset_vector(region.region);
+            self.pr.reset_free_list(region, &free_list);
+        });
     }
 
     pub fn forward<const CAN_CLMUL: bool>(
@@ -1008,7 +1025,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             let r = &regions[index];
             let start = r.region.start();
             debug!("\nCompacting region {}", start);
-            let end = r.cursor();
+            let end = r.region.end();
             #[cfg(feature = "vo_bit")]
             {
                 #[cfg(debug_assertions)]
@@ -1080,15 +1097,16 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                         to = to.max(new_object.to_object_start::<VM>() + copied_size);
                         self.update_references::<CAN_CLMUL>(worker, new_object);
                     });
-                debug_assert!(to <= r.cursor());
                 let perfect_compaction_end = r.region.start() + total_live_bytes;
+                /*
+                XXX:
                 info!(
                     "Compacted {:?} region [{}, {}) -> {to} with {objects} objects; saved {} bytes ({:.2}% savings) (copied {} bytes; live {} bytes)",
                     r.semantics,
                     r.region.start(), r.cursor(), r.cursor() - to,
                     (r.cursor() - to) as f64 / (r.cursor() - perfect_compaction_end) as f64 * 100.0, total_copied_bytes, total_live_bytes,
                 );
-                self.pr.reset_cursor(r, to);
+                */
             } else {
                 self.forwarding.scan_marked_objects(start, end, &mut |obj: ObjectReference| {
                     self.update_references::<CAN_CLMUL>(worker, obj);
@@ -1225,7 +1243,6 @@ impl<VM: VMBinding> GCWork<VM> for AfterCalculateOffsetVector<VM> {
 pub struct ScanPinnedPages<VM: VMBinding, Context: GCWorkContext<VM = VM>> {
     compressor_space: &'static CompressorSpace<VM>,
     region: forwarding::CompressorRegion,
-    cursor: Address,
     phantom: std::marker::PhantomData<Context>,
 }
 
@@ -1234,12 +1251,10 @@ impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> ScanPinnedPages<VM, Context
     pub fn new(
         compressor_space: &'static CompressorSpace<VM>,
         region: forwarding::CompressorRegion,
-        cursor: Address,
     ) -> Self {
         Self {
             compressor_space,
             region,
-            cursor,
             phantom: std::marker::PhantomData,
         }
     }
@@ -1249,7 +1264,7 @@ impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> ScanPinnedPages<VM, Context
 impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> GCWork<VM> for ScanPinnedPages<VM, Context> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
         self.compressor_space
-            .scan_pinned_pages(self.region, self.cursor);
+            .scan_pinned_pages(self.region);
     }
 }
 
@@ -1301,14 +1316,14 @@ impl<VM: VMBinding> GCWork<VM> for AfterScanPinnedPages<VM> {
 /// Calculate the offset vector for a region.
 pub struct CalculateOffsetVector<VM: VMBinding> {
     compressor_space: &'static CompressorSpace<VM>,
-    regions: Vec<(forwarding::CompressorRegion, Address)>,
+    indices: Vec<usize>,
 }
 
 impl<VM: VMBinding> GCWork<VM> for CalculateOffsetVector<VM> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        for (region, cursor) in self.regions.iter() {
+        for index in self.indices.iter() {
             self.compressor_space
-                .calculate_offset_vector_for_region(*region, *cursor);
+                .calculate_offset_vector_for_region(*index);
         }
     }
 }
@@ -1320,7 +1335,7 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
             .map(|c| {
                 c.iter().map(|r| {
                     let scale = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-                    let used = r.cursor() - r.region.start();
+                    let used = r.used_bytes();
                     let index = (used * (scale.len() - 1)) / forwarding::CompressorRegion::BYTES;
                     scale[index]
                 })
@@ -1332,11 +1347,11 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
 impl<VM: VMBinding> CalculateOffsetVector<VM> {
     pub fn new(
         compressor_space: &'static CompressorSpace<VM>,
-        regions: Vec<(forwarding::CompressorRegion, Address)>,
+        indices: Vec<usize>,
     ) -> Self {
         Self {
             compressor_space,
-            regions,
+            indices,
         }
     }
 }

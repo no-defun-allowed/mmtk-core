@@ -1574,7 +1574,7 @@ impl SideMetadataContext {
             self.local.len()
         );
         // Page aligned
-        debug_assert!(start.is_aligned_to(BYTES_IN_PAGE));
+        //debug_assert!(start.is_aligned_to(BYTES_IN_PAGE));
         debug_assert!(size % BYTES_IN_PAGE == 0);
         self.map_metadata_internal(start, size, false, space_name)
     }

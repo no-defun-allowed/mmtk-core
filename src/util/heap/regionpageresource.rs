@@ -1,47 +1,38 @@
 use crate::util::constants::BYTES_IN_PAGE;
+use crate::util::heap::layout::vm_layout::BYTES_IN_CHUNK;
 use crate::util::heap::layout::VMMap;
 use crate::util::heap::pageresource::{CommonPageResource, PRAllocFail, PRAllocResult};
 use crate::util::heap::space_descriptor::SpaceDescriptor;
-use crate::util::heap::{MonotonePageResource, PageResource};
+use crate::util::heap::{FreeListPageResource, PageResource};
 use crate::util::linear_scan::Region;
 use crate::util::object_enum::ObjectEnumerator;
 use crate::util::Address;
 use crate::util::VMThread;
 use crate::vm::VMBinding;
+use enum_map::EnumMap;
+use std::ops::Range;
+use std::sync::{Mutex, RwLock};
 use crate::AllocationSemantics;
-use atomic::Atomic;
-use std::sync::atomic::Ordering;
-use std::sync::RwLock;
 
-/// A region in a [`RegionPageResource`] and its allocation cursor.
+/// A region in a [`RegionPageResource`] and its free list.
 pub struct AllocatedRegion<R: Region> {
     pub region: R,
-    cursor: Atomic<Address>,
-    prev_cursor: Atomic<Address>,
-    pub semantics: AllocationSemantics,
+    free_list: Mutex<Vec<Range<Address>>>,
+    // Regions we just allocated from a chunk
+    // aren't assigned any semantics.
+    pub semantics: Option<AllocationSemantics>,
 }
 
 impl<R: Region> AllocatedRegion<R> {
-    pub fn cursor(&self) -> Address {
-        self.cursor.load(Ordering::Relaxed)
-    }
-
-    fn set_cursor(&self, a: Address) {
-        self.cursor.store(a, Ordering::Relaxed);
-    }
-
-    pub fn prev_cursor(&self) -> Address {
-        self.prev_cursor.load(Ordering::Relaxed)
-    }
-
-    fn set_prev_cursor(&self, a: Address) {
-        self.prev_cursor.store(a, Ordering::Relaxed);
+    pub fn used_bytes(&self) -> usize {
+        let free_list = self.free_list.lock().unwrap();
+        R::BYTES - free_list.iter().map(|r| r.end - r.start).sum::<usize>()
     }
 }
 
 struct Sync<R: Region> {
     all_regions: Vec<AllocatedRegion<R>>,
-    next_region: usize,
+    next_regions: EnumMap<AllocationSemantics, usize>,
 }
 
 /// A [`PageResource`] which allocates pages from a region-structured heap.
@@ -49,21 +40,21 @@ struct Sync<R: Region> {
 /// scan linearly over all regions to allocate, and do not revisit regions
 /// before a garbage collection cycle.
 pub struct RegionPageResource<VM: VMBinding, R: Region> {
-    mpr: MonotonePageResource<VM>,
+    flpr: FreeListPageResource<VM>,
     sync: RwLock<Sync<R>>,
 }
 
 impl<VM: VMBinding, R: Region + 'static> PageResource<VM> for RegionPageResource<VM, R> {
     fn common(&self) -> &CommonPageResource {
-        self.mpr.common()
+        self.flpr.common()
     }
 
     fn common_mut(&mut self) -> &mut CommonPageResource {
-        self.mpr.common_mut()
+        self.flpr.common_mut()
     }
 
     fn update_discontiguous_start(&mut self, start: Address) {
-        self.mpr.update_discontiguous_start(start)
+        self.flpr.update_discontiguous_start(start)
     }
 
     fn alloc_pages(
@@ -86,7 +77,7 @@ impl<VM: VMBinding, R: Region + 'static> PageResource<VM> for RegionPageResource
     }
 
     fn get_available_physical_pages(&self) -> usize {
-        self.mpr.get_available_physical_pages()
+        self.flpr.get_available_physical_pages()
     }
 }
 
@@ -94,19 +85,19 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
     const REGION_PAGES: usize = R::BYTES / BYTES_IN_PAGE;
 
     pub fn new_contiguous(start: Address, bytes: usize, vm_map: &'static dyn VMMap) -> Self {
-        Self::new(MonotonePageResource::new_contiguous(start, bytes, vm_map))
+        Self::new(FreeListPageResource::new_contiguous(start, bytes, vm_map))
     }
 
     pub fn new_discontiguous(vm_map: &'static dyn VMMap) -> Self {
-        Self::new(MonotonePageResource::new_discontiguous(vm_map))
+        Self::new(FreeListPageResource::new_discontiguous(vm_map))
     }
 
-    fn new(mpr: MonotonePageResource<VM>) -> Self {
+    fn new(flpr: FreeListPageResource<VM>) -> Self {
         Self {
-            mpr,
+            flpr,
             sync: RwLock::new(Sync {
                 all_regions: vec![],
-                next_region: 0,
+                next_regions: EnumMap::from_fn(|_| 0),
             }),
         }
     }
@@ -129,42 +120,37 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         };
         let bytes = reserved_pages * BYTES_IN_PAGE;
         // First try to reuse a region.
-        // XXX(kunals): We always scan from the first region. Since the list of
-        // regions contains all the flavors of allocation semantics, we need to
-        // check if there's a previous region that can help satisfy this
-        // allocation request.
-        let mut idx = 0;
+        let mut idx = b.next_regions[semantics];
         while idx < b.all_regions.len() {
-            let cursor = idx;
-            if let Option::Some(address) =
-                self.allocate_from_region(&mut b.all_regions[cursor], bytes, semantics)
-            {
+            let (addr, pages_wasted) = self.allocate_from_region(&mut b.all_regions[idx], bytes, semantics);
+            self.common().accounting.reserve_and_commit(pages_wasted);
+            if let Some(address) = addr {
                 self.commit_pages(reserved_pages, required_pages, tls);
+                b.next_regions[semantics] = idx;
                 return succeed(address, false);
             }
             idx += 1;
         }
-        // Else allocate a new region.
-        let PRAllocResult {
-            start, new_chunk, ..
-        } = self.mpr.alloc_pages(
-            space_descriptor,
-            Self::REGION_PAGES,
-            Self::REGION_PAGES,
-            semantics,
-            tls,
-        )?;
-        b.all_regions.push(AllocatedRegion {
-            region: R::from_aligned_address(start),
-            cursor: Atomic::<Address>::new(start),
-            prev_cursor: Atomic::<Address>::new(start),
-            semantics,
-        });
-        let cursor = b.all_regions.len() - 1;
+        b.next_regions[semantics] = idx;
+        // Else allocate a new chunk to carve regions from.
+        let chunk_start = self.flpr.allocate_one_chunk_no_commit(space_descriptor)?.start;
+        assert!(chunk_start.is_aligned_to(BYTES_IN_CHUNK));
+        assert!(R::BYTES < BYTES_IN_CHUNK); // XXX: where to do this properly?
+        for i in 0..(BYTES_IN_CHUNK / R::BYTES) {
+            let region_start = chunk_start + R::BYTES * i;
+            b.all_regions.push(AllocatedRegion {
+                region: R::from_aligned_address(region_start),
+                free_list: Mutex::new(vec![region_start..(region_start + R::BYTES)]),
+                semantics: None,
+            });
+        }
+        // This allocation from the first new region has to succeed, and can't waste space
+        // as it's at the very start of the region.
+        self.commit_pages(reserved_pages, required_pages, tls);
         succeed(
-            self.allocate_from_region(&mut b.all_regions[cursor], bytes, semantics)
-                .unwrap(),
-            new_chunk,
+            self.allocate_from_region(&mut b.all_regions[idx], bytes, semantics)
+                .0.expect("allocation should fit in new region"),
+            true,
         )
     }
 
@@ -173,41 +159,63 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         alloc: &mut AllocatedRegion<R>,
         bytes: usize,
         semantics: AllocationSemantics,
-    ) -> Option<Address> {
-        if semantics != alloc.semantics {
-            return Option::None;
+    ) -> (Option<Address>, usize) {
+        // Viable regions either have the right semantics,
+        // or haven't assigned semantics yet.
+        if let Some(s) = alloc.semantics {
+            if semantics != s {
+                return (None, 0);
+            }
         }
-        let free = alloc.cursor();
-        if free + bytes > alloc.region.end() {
-            Option::None
-        } else {
-            alloc.set_cursor(free + bytes);
-            Option::Some(free)
+        // If the region hasn't been assigned any semantics yet,
+        // due to being newly allocated, assign it now.
+        alloc.semantics = Some(semantics);
+        let mut bytes_wasted = 0;
+        let mut free_list = alloc.free_list.lock().unwrap();
+        loop {
+            match free_list.pop() {
+                None => return (None, bytes_wasted / BYTES_IN_PAGE),
+                Some(range) => {
+                    if range.end - range.start >= bytes {
+                        free_list.push((range.start + bytes)..(range.end));
+                        return (Some(range.start), bytes_wasted / BYTES_IN_PAGE);
+                    } else {
+                        bytes_wasted += range.end - range.start;
+                    }
+                }
+            }
         }
     }
 
-    /// Reset the allocation cursor for one region.
-    pub fn reset_cursor(&self, alloc: &AllocatedRegion<R>, address: Address) {
-        let old = alloc.cursor();
-        let new = address.align_up(BYTES_IN_PAGE);
-        let pages = (old - new) / BYTES_IN_PAGE;
-        self.common().accounting.release(pages);
-        alloc.set_cursor(new);
-        // After compaction, the previous cursor should be set to the new cursor,
-        // so that we can distinguish between mature and nursery objects.
-        alloc.set_prev_cursor(new);
+    pub fn reset_free_list(&self, region: &AllocatedRegion<R>, new_free_list: &[(Address, Address)]) {
+        let mut free_list = region.free_list.lock().unwrap();
+        let old_free_bytes = free_list.iter().map(|r| r.end - r.start).sum::<usize>();
+        // Get whole pages out of the free list. We reverse so that popping
+        // the vector later will give us the first range on the free list first.
+        let new_free_list = new_free_list.iter()
+            .map(|(s, e)| *s..*e)
+            .filter(|r| !r.is_empty())
+            .rev()
+            .collect::<Vec<_>>();
+        info!("free list: {new_free_list:?}");
+        let new_free_bytes = new_free_list.iter().map(|r| r.end - r.start).sum::<usize>();
+        if new_free_bytes > old_free_bytes {
+            let freed_pages = (new_free_bytes - old_free_bytes) / BYTES_IN_PAGE;
+            self.common().accounting.release(freed_pages);
+        }
+        *free_list = new_free_list;
     }
 
     /// Reset the allocator state after a collection, so that the allocator will
     /// revisit regions which the garbage collector has compacted.
     pub fn reset_allocator(&self) {
-        self.sync.write().unwrap().next_region = 0;
+        self.sync.write().unwrap().next_regions = EnumMap::from_fn(|_| 0);
     }
 
     pub fn enumerate(&self, enumerator: &mut dyn ObjectEnumerator) {
         let sync = self.sync.read().unwrap();
         for alloc in sync.all_regions.iter() {
-            enumerator.visit_address_range(alloc.region.start(), alloc.cursor());
+            enumerator.visit_address_range(alloc.region.start(), alloc.region.end());
         }
     }
 

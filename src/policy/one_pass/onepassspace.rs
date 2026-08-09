@@ -265,7 +265,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 // XXX: Can we do any region selection policies with OnePassSpace?
                 // We'll provide pre-GC usage like we could do any selection, but we don't
                 // actually do any selection.
-                let used = r.cursor() - r.region.start();
+                let used = r.region.end() - r.region.start();
                 self.forwarding
                     .select_region(r.region, used as forwarding::Offset);
                 locking::reset_metadata(r.region.start(), r.region.end() - r.region.start());
@@ -449,7 +449,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 #[cfg(debug_assertions)]
                 self.forwarding.scan_marked_objects(
                     r.region.start(),
-                    r.cursor(),
+                    r.region.end(),
                     &mut |object: ObjectReference| {
                         debug_assert!(
                             crate::util::metadata::vo_bit::is_vo_bit_set(object),
@@ -464,7 +464,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             let mut objects = 0;
             self.forwarding.calculate_and_walk_offset_vector(
                 r.region.start(),
-                r.cursor(),
+                r.region.end(),
                 &|obj: ObjectReference| {
                     let new_object = self.forward::<CAN_CLMUL>(obj, false);
                     VM::VMObjectModel::walk_threading_list(obj, &mut |slot| {
@@ -502,9 +502,10 @@ impl<VM: VMBinding> OnePassSpace<VM> {
             debug!(
                 "Compacted region [{}, {}) -> {to} with {objects} objects",
                 r.region.start(),
-                r.cursor()
+                r.region.end()
             );
-            self.pr.reset_cursor(r, to);
+            let to = (to - r.region.start()) as forwarding::Offset;
+            self.pr.reset_free_list(r, &forwarding::singleton_free_list(r.region, to));
         });
 
         counters.threaded.clone().lock().unwrap().inc_by(threaded);
