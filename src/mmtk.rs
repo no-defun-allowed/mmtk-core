@@ -264,6 +264,10 @@ impl<VM: VMBinding> MMTK<VM> {
             let filename: &str = &self.options.compressor_stub_table_metadata_file;
             let _ = std::fs::File::create(filename).unwrap();
         }
+        if *self.options.compressor_print_region_semantics_stats {
+            let filename: &str = &self.options.compressor_region_semantics_stats_file;
+            let _ = std::fs::File::create(filename).unwrap();
+        }
         self.scheduler.spawn_gc_threads(self, tls);
         self.state.initialized.store(true, Ordering::SeqCst);
         probe!(mmtk, collection_initialized);

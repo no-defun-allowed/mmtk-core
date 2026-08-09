@@ -37,8 +37,8 @@ use crate::util::options::{PagePinningMode, PinningMode};
 use crate::util::os::OSMemory;
 use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
-use crate::MMTK;
 use crate::{vm::*, ObjectQueue};
+use crate::{AllocationSemantics, MMTK};
 use atomic::Ordering;
 #[cfg(feature = "object_pinning")]
 use std::collections::HashSet;
@@ -381,10 +381,24 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         let mut total_nursery = 0_usize;
         #[cfg(feature = "object_pinning")]
         let mut total_allocated = 0_usize;
+
+        let mut default_bytes = 0_usize;
+        let mut ref_bytes = 0_usize;
+        let mut non_ref_bytes = 0_usize;
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 forwarding::MARK_SPEC
                     .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
+                match r.semantics {
+                    AllocationSemantics::Default => default_bytes += r.cursor() - r.region.start(),
+                    AllocationSemantics::ReferenceArray => {
+                        ref_bytes += r.cursor() - r.region.start()
+                    }
+                    AllocationSemantics::PrimitiveArray => {
+                        non_ref_bytes += r.cursor() - r.region.start()
+                    }
+                    _ => unreachable!("Unsupported allocation semantics: {:?}", r.semantics),
+                }
                 #[cfg(feature = "object_pinning")]
                 if is_pinning {
                     match VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC.as_spec() {
@@ -465,6 +479,36 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     }
                 }
             });
+
+        if *self
+            .common()
+            .options
+            .compressor_print_region_semantics_stats
+        {
+            use std::io::Write;
+
+            let filename: &str = &self.common().options.compressor_region_semantics_stats_file;
+            let total_bytes = default_bytes + ref_bytes + non_ref_bytes;
+            let mut metadata_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(filename)
+                .unwrap();
+
+            let epoch = super::NUM_GCS.load(Ordering::SeqCst);
+            writeln!(metadata_file, "GC epoch {}:", epoch).unwrap();
+            writeln!(
+                metadata_file,
+                "  Total pages: {} KB;\n  Default pages: {:.2}% ({} KB)\n  Reference pages: {:.2}% ({} KB)\n  Non-reference pages: {:.2}% ({} KB)",
+                total_bytes / 1024,
+                (default_bytes as f64 / total_bytes as f64) * 100.0,
+                default_bytes / 1024,
+                (ref_bytes as f64 / total_bytes as f64) * 100.0,
+                ref_bytes / 1024,
+                (non_ref_bytes as f64 / total_bytes as f64) * 100.0,
+                non_ref_bytes / 1024
+            ).unwrap();
+        }
 
         #[cfg(feature = "object_pinning")]
         {
@@ -1039,7 +1083,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 debug_assert!(to <= r.cursor());
                 let perfect_compaction_end = r.region.start() + total_live_bytes;
                 info!(
-                    "Compacted region [{}, {}) -> {to} with {objects} objects; saved {} bytes ({:.2}% savings) (copied {} bytes; live {} bytes)",
+                    "Compacted {:?} region [{}, {}) -> {to} with {objects} objects; saved {} bytes ({:.2}% savings) (copied {} bytes; live {} bytes)",
+                    r.semantics,
                     r.region.start(), r.cursor(), r.cursor() - to,
                     (r.cursor() - to) as f64 / (r.cursor() - perfect_compaction_end) as f64 * 100.0, total_copied_bytes, total_live_bytes,
                 );

@@ -932,7 +932,7 @@ impl FromStr for PinningMode {
                 let fraction = parts[1]
                     .parse::<f64>()
                     .map_err(|_| "Failed to parse fraction".to_string())?;
-                if fraction <= 0.0 || fraction > 1.0 {
+                if fraction < 0.0 || fraction > 1.0 {
                     return Err("Fraction should be between 0 and 1".to_string());
                 }
                 Ok(PinningMode::RandomObjectPinning(fraction))
@@ -954,7 +954,7 @@ impl FromStr for PinningMode {
                     .trim()
                     .parse::<f64>()
                     .map_err(|_| "Failed to parse fraction".to_string())?;
-                if fraction <= 0.0 || fraction > 1.0 {
+                if fraction < 0.0 || fraction > 1.0 {
                     return Err("Fraction should be between 0 and 1".to_string());
                 }
                 Ok(PinningMode::RandomPagePinning(page_pinning_mode, fraction))
@@ -1087,7 +1087,11 @@ options! {
     /// Print the Compressor stub table stats to a file.
     compressor_print_stub_table_stats: bool         [always_valid] = false,
     /// The file name to store the Compressor stub table metadata.
-    compressor_stub_table_metadata_file: String     [always_valid] = String::from("stub_table_metadata.txt")
+    compressor_stub_table_metadata_file: String     [always_valid] = String::from("stub_table_metadata.txt"),
+    /// Print the stats of the semantics of each region in the Compressor to a file.
+    compressor_print_region_semantics_stats: bool   [always_valid] = false,
+    /// The file name to store the Compressor region semantics stats.
+    compressor_region_semantics_stats_file: String  [always_valid] = String::from("region_semantics_stats.txt")
 }
 
 #[cfg(test)]
