@@ -391,15 +391,18 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 forwarding::MARK_SPEC
                     .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
-                match r.semantics {
-                    AllocationSemantics::Default => default_bytes += r.cursor() - r.region.start(),
-                    AllocationSemantics::ReferenceArray => {
-                        ref_bytes += r.cursor() - r.region.start()
-                    }
-                    AllocationSemantics::PrimitiveArray => {
-                        non_ref_bytes += r.cursor() - r.region.start()
-                    }
-                    _ => unreachable!("Unsupported allocation semantics: {:?}", r.semantics),
+                let semantics = if r.semantics.is_some() {
+                    // SAFETY: We've already checked the semantics is Some.
+                    unsafe { r.semantics.unwrap_unchecked() }
+                } else {
+                    // Skip regions that have not been allocated into yet.
+                    return;
+                };
+                match semantics {
+                    AllocationSemantics::Default => default_bytes += r.used_bytes(),
+                    AllocationSemantics::ReferenceArray => ref_bytes += r.used_bytes(),
+                    AllocationSemantics::PrimitiveArray => non_ref_bytes += r.used_bytes(),
+                    _ => unreachable!("Unsupported allocation semantics: {:?}", semantics),
                 }
                 #[cfg(feature = "object_pinning")]
                 if is_pinning {
@@ -593,10 +596,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         let mut packets = vec![];
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
-                packets.push(Box::new(ScanPinnedPages::<VM, Context>::new(
-                    space,
-                    r.region,
-                )) as Box<dyn GCWork<VM>>);
+                packets.push(
+                    Box::new(ScanPinnedPages::<VM, Context>::new(space, r.region))
+                        as Box<dyn GCWork<VM>>,
+                );
             });
         self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace].bulk_add(packets);
         self.scheduler.work_buckets[WorkBucketStage::PinningRootsTrace]
@@ -651,7 +654,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         #[cfg(feature = "object_pinning")]
         self.pr.with_regions(&mut |regions| {
             for r in regions {
-                forwarding::MATURE_PAGE_SPEC.bset_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
+                forwarding::MATURE_PAGE_SPEC
+                    .bset_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
             }
         });
     }
@@ -888,7 +892,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .chunks(OFFSET_VECTOR_PACKET_BYTES / forwarding::CompressorRegion::BYTES)
             .into_iter()
             .map(|c| {
-                Box::new(CalculateOffsetVector::<VM>::new(self, c.collect::<Vec<usize>>())) as Box<dyn GCWork<VM>>
+                Box::new(CalculateOffsetVector::<VM>::new(
+                    self,
+                    c.collect::<Vec<usize>>(),
+                )) as Box<dyn GCWork<VM>>
             })
             .collect();
         self.scheduler.work_buckets[WorkBucketStage::CalculateForwarding]
@@ -897,10 +904,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .set_sentinel(Box::new(AfterCalculateOffsetVector::new(self)));
     }
 
-    pub fn calculate_offset_vector_for_region(
-        &self,
-        index: usize,
-    ) {
+    pub fn calculate_offset_vector_for_region(&self, index: usize) {
         self.pr.with_regions(&mut |regions| {
             let region = &regions[index];
             let free_list = self.forwarding.calculate_offset_vector(region.region);
@@ -1263,8 +1267,7 @@ impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> ScanPinnedPages<VM, Context
 #[cfg(feature = "object_pinning")]
 impl<VM: VMBinding, Context: GCWorkContext<VM = VM>> GCWork<VM> for ScanPinnedPages<VM, Context> {
     fn do_work(&mut self, _worker: &mut GCWorker<VM>, _mmtk: &'static MMTK<VM>) {
-        self.compressor_space
-            .scan_pinned_pages(self.region);
+        self.compressor_space.scan_pinned_pages(self.region);
     }
 }
 
@@ -1345,10 +1348,7 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
 }
 
 impl<VM: VMBinding> CalculateOffsetVector<VM> {
-    pub fn new(
-        compressor_space: &'static CompressorSpace<VM>,
-        indices: Vec<usize>,
-    ) -> Self {
+    pub fn new(compressor_space: &'static CompressorSpace<VM>, indices: Vec<usize>) -> Self {
         Self {
             compressor_space,
             indices,
