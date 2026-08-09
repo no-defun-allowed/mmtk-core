@@ -1129,16 +1129,7 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
             let mut free = vec![(first_block.start(), last_block.start())];
             let mut block = first_block;
             let mut live_datas = vec![];
-            // while block < last_block {
-            for b in RegionIterator::<Block>::new(first_block, last_block) {
-                if b.start() < block.start() {
-                    OFFSET_VECTOR_SPEC.store_atomic::<Offset>(
-                        b.start(),
-                        last_offset,
-                        Ordering::Relaxed,
-                    );
-                    continue;
-                }
+            while block < last_block {
                 debug!(
                     "Calculating offset for block {}; free list: {:?}",
                     block.start(),
