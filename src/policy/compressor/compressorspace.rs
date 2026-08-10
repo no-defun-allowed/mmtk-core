@@ -519,8 +519,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             // individually pin live objects in these pages later.
             if needs_page_pinning {
                 let mature_fraction =
-                    0.0
-                    /* XXX: (total_allocated - total_nursery) as f64 / total_allocated as f64 */;
+                    (total_allocated - total_nursery) as f64 / total_allocated as f64;
                 self.pin_pages(mature_fraction);
                 self.add_scan_pinned_pages_tasks::<Context>();
             }
