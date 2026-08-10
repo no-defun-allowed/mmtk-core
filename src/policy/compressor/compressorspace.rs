@@ -391,11 +391,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 forwarding::MARK_SPEC
                     .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
-                let semantics = if r.semantics.is_some() {
-                    // SAFETY: We've already checked the semantics is Some.
-                    unsafe { r.semantics.unwrap_unchecked() }
-                } else {
-                    // Skip regions that have not been allocated into yet.
+                let Some(semantics) = r.semantics else {
+                    // Skip regions which have not been allocated into yet.
                     return;
                 };
                 match semantics {
