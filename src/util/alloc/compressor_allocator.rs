@@ -218,9 +218,8 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
         options.semantics = semantics;
         self.get_context().set_alloc_options(options);
 
-        let block_size = (size + BLOCK_MASK) & (!BLOCK_MASK);
-        let acquired_start = match self.space.acquire_hole(size, Some(BLOCK_SIZE), semantics) {
-            Some(hole) => hole.start,
+        let acquired_hole = match self.space.acquire_hole(size, Some(BLOCK_SIZE), semantics) {
+            Some(hole) => Some(hole),
             None => {
                 let region = self.space.acquire(
                     self.tls,
@@ -228,47 +227,50 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
                     self.get_context().get_alloc_options(),
                 );
                 if region.is_zero() {
-                    Address::ZERO
+                    None
                 } else {
+                    let block_size = (size + BLOCK_MASK) & (!BLOCK_MASK);
                     // Take a block out of the region, and give the rest to the space.
                     self.space.add_hole(
                         semantics,
-                        (region + BLOCK_SIZE)..(region + CompressorRegion::BYTES)
+                        (region + block_size)..(region + CompressorRegion::BYTES)
                     );
-                    region
+                    Some(region..(region + block_size))
                 }
             },
         };
         self.get_context()
             .set_alloc_options(crate::util::alloc::AllocationOptions::default());
-        if acquired_start.is_zero() {
-            trace!("Failed to acquire a new block");
-            acquired_start
-        } else {
-            trace!(
-                "Acquired a new block of size {} with start address {}",
-                block_size,
-                acquired_start
-            );
-            #[cfg(feature = "object_pinning")]
-            self.space.touch_pages(acquired_start, block_size);
-            if !stress_test {
-                self.set_limit(acquired_start, acquired_start + block_size, semantics);
-                self.alloc(size, align, offset, semantics)
-            } else {
-                // For a stress test, we artificially make the fastpath fail by
-                // manipulating the limit as below.
-                // The assumption here is that we use an address range such that
-                // cursor > block_size always.
-                self.set_limit(
-                    acquired_start,
-                    unsafe { Address::from_usize(block_size) },
-                    semantics,
-                );
-                // Note that we have just acquired a new block so we know that we don't have to go
-                // through the entire allocation sequence again, we can directly call the slow path
-                // allocation.
-                self.alloc_slow_once_precise_stress(size, align, offset, semantics, false)
+        match acquired_hole {
+            None => {
+                trace!("Failed to acquire a new block");
+                Address::ZERO
+            },
+            Some(hole) => {
+                let start = hole.start;
+                let end = hole.end;
+                let size = end - start;
+                trace!("Acquired a new block from {start} to {end}");
+                #[cfg(feature = "object_pinning")]
+                self.space.touch_pages(start, size);
+                if !stress_test {
+                    self.set_limit(start, end, semantics);
+                    self.alloc(size, align, offset, semantics)
+                } else {
+                    // For a stress test, we artificially make the fastpath fail by
+                    // manipulating the limit as below.
+                    // The assumption here is that we use an address range such that
+                    // cursor > block_size always.
+                    self.set_limit(
+                        start,
+                        unsafe { Address::from_usize(size) },
+                        semantics,
+                    );
+                    // Note that we have just acquired a new block so we know that we don't have to go
+                    // through the entire allocation sequence again, we can directly call the slow path
+                    // allocation.
+                    self.alloc_slow_once_precise_stress(size, align, offset, semantics, false)
+                }
             }
         }
     }
