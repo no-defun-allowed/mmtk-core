@@ -1,6 +1,5 @@
 use crate::plan::VectorObjectQueue;
-#[cfg(feature = "object_pinning")]
-use crate::policy::compressor::forwarding;
+use crate::policy::compressor::{forwarding, hole_list};
 #[cfg(feature = "object_pinning")]
 use crate::policy::compressor::forwarding::does_new_address_intersect_pinned_pages;
 #[cfg(all(feature = "object_pinning", debug_assertions))]
@@ -39,7 +38,9 @@ use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
 use crate::{vm::*, ObjectQueue};
 use crate::{AllocationSemantics, MMTK};
+use super::hole_list::HoleList;
 use atomic::Ordering;
+use enum_map::EnumMap;
 #[cfg(feature = "object_pinning")]
 use std::collections::HashSet;
 #[cfg(feature = "object_pinning")]
@@ -137,6 +138,7 @@ pub struct CompressorSpace<VM: VMBinding> {
     num_pinned_pages: AtomicU32,
     #[cfg(feature = "object_pinning")]
     cached_pinned_pages: RwLock<HashSet<Address>>,
+    hole_lists: EnumMap<AllocationSemantics, HoleList>,
 }
 
 /// The number of bytes of the heap that each CalculateOffsetVector
@@ -344,10 +346,23 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             num_pinned_pages: AtomicU32::new(0),
             #[cfg(feature = "object_pinning")]
             cached_pinned_pages: RwLock::new(HashSet::new()),
+            hole_lists: EnumMap::from_fn(|_| HoleList::new()),
         }
     }
 
+    pub fn acquire_hole(
+        &self,
+        minimum: usize,
+        maximum: Option<usize>,
+        s: AllocationSemantics,
+    ) -> Option<hole_list::Hole> {
+        self.hole_lists[s].acquire(minimum, maximum)
+    }
+
     pub fn prepare<Context: GCWorkContext<VM = VM>>(&self) {
+        for (_, hole_list) in &self.hole_lists {
+            hole_list.clear();
+        }
         #[cfg(feature = "object_pinning")]
         NUM_GCS.fetch_add(1, Ordering::Relaxed);
 

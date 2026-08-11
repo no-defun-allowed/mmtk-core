@@ -216,11 +216,14 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
         self.get_context().set_alloc_options(options);
 
         let block_size = (size + BLOCK_MASK) & (!BLOCK_MASK);
-        let acquired_start = self.space.acquire(
-            self.tls,
-            bytes_to_pages_up(block_size),
-            self.get_context().get_alloc_options(),
-        );
+        let acquired_start = match self.space.acquire_hole(size, Some(BLOCK_SIZE), semantics) {
+            Some(hole) => hole.start,
+            None => self.space.acquire(
+                self.tls,
+                bytes_to_pages_up(block_size),
+                self.get_context().get_alloc_options(),
+            ),
+        };
         self.get_context()
             .set_alloc_options(crate::util::alloc::AllocationOptions::default());
         if acquired_start.is_zero() {
