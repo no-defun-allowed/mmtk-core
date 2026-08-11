@@ -218,7 +218,8 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
         options.semantics = semantics;
         self.get_context().set_alloc_options(options);
 
-        let acquired_hole = match self.space.acquire_hole(size, Some(BLOCK_SIZE), semantics) {
+        let block_size = (size + BLOCK_MASK) & (!BLOCK_MASK);
+        let acquired_hole = match self.space.acquire_hole(size, Some(block_size), semantics) {
             Some(hole) => Some(hole),
             None => {
                 let region = self.space.acquire(
@@ -229,7 +230,6 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
                 if region.is_zero() {
                     None
                 } else {
-                    let block_size = (size + BLOCK_MASK) & (!BLOCK_MASK);
                     // Take a block out of the region, and give the rest to the space.
                     self.space.add_hole(
                         semantics,
