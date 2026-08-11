@@ -14,7 +14,7 @@ pub(crate) struct HoleList {
     holes: Mutex<VecDeque<Hole>>
 }
 
-fn size(h: &Hole) -> usize { h.end - h.start }
+pub(crate) fn size(h: &Hole) -> usize { h.end - h.start }
 
 impl HoleList {
     pub fn new() -> Self {

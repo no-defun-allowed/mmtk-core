@@ -928,6 +928,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             let region = &regions[index];
             let hole_list = self.forwarding.calculate_offset_vector(region.region);
             self.hole_lists[region.semantics].add_holes(&hole_list);
+            let live = forwarding::CompressorRegion::BYTES -
+                hole_list.iter().map(|(s, e)| *e - *s).sum::<usize>();
+            region.used_after_gc.store(live, Ordering::Relaxed);
         });
     }
 
@@ -1357,7 +1360,7 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
             .map(|c| {
                 c.iter().map(|r| {
                     let scale = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-                    let used = 0; // XXX(hayleyp): r.used_bytes();
+                    let used = r.used_after_gc.load(Ordering::Relaxed);
                     let index = (used * (scale.len() - 1)) / forwarding::CompressorRegion::BYTES;
                     scale[index]
                 })

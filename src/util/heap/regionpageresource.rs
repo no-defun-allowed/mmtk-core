@@ -10,11 +10,13 @@ use crate::util::Address;
 use crate::util::VMThread;
 use crate::vm::VMBinding;
 use std::sync::RwLock;
+use std::sync::atomic::AtomicUsize;
 use crate::AllocationSemantics;
 
 pub struct AllocatedRegion<R: Region> {
     pub region: R,
     pub semantics: AllocationSemantics,
+    pub used_after_gc: AtomicUsize,
 }
 
 struct Sync<R: Region> {
@@ -103,7 +105,8 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             Some(r) => {
                 sync.used_regions.push(AllocatedRegion {
                     region: r,
-                    semantics
+                    semantics,
+                    used_after_gc: AtomicUsize::new(0),
                 });
                 self.commit_pages(Self::REGION_PAGES, Self::REGION_PAGES, tls);
                 succeed(r.start(), false)
@@ -115,7 +118,11 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
                 assert!(R::BYTES < BYTES_IN_CHUNK); // XXX: where to do this properly?
                 // Get the first region to service this allocation.
                 let region = R::from_aligned_address(chunk_start);
-                sync.used_regions.push(AllocatedRegion { region, semantics });
+                sync.used_regions.push(AllocatedRegion {
+                    region,
+                    semantics,
+                    used_after_gc: AtomicUsize::new(0),
+                });
                 // Push the remaining regions to the free regions.
                 for i in 1..(BYTES_IN_CHUNK / R::BYTES) {
                     let region_start = chunk_start + R::BYTES * i;
