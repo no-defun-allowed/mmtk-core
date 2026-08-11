@@ -47,11 +47,17 @@ impl HoleList {
     }
     pub fn clear(&self) {
         let mut holes = self.holes.lock().unwrap();
-        *holes = VecDeque::new();
+        holes.clear();
     }
     pub fn add_holes(&self, holes: &[(Address, Address)]) {
         let filtered = holes.iter().map(|(s, e)| *s..*e).filter(|h| size(&h) >= MINIMUM_HOLE_BYTES);
         let mut holes = self.holes.lock().unwrap();
         holes.extend(filtered);
+    }
+    pub fn add_hole(&self, hole: Range<Address>) {
+        if size(&hole) >= MINIMUM_HOLE_BYTES {
+            let mut holes = self.holes.lock().unwrap();
+            holes.push_back(hole);
+        }
     }
 }

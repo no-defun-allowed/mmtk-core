@@ -359,6 +359,14 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.hole_lists[s].acquire(minimum, maximum)
     }
 
+    pub fn add_hole(
+        &self,
+        s: AllocationSemantics,
+        h: hole_list::Hole,
+    ) {
+        self.hole_lists[s].add_hole(h);
+    }
+
     pub fn prepare<Context: GCWorkContext<VM = VM>>(&self) {
         for (_, hole_list) in &self.hole_lists {
             hole_list.clear();
@@ -406,15 +414,11 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
                 forwarding::MARK_SPEC
                     .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
-                let Some(semantics) = r.semantics else {
-                    // Skip regions which have not been allocated into yet.
-                    return;
-                };
-                match semantics {
+                match r.semantics {
                     AllocationSemantics::Default => default_bytes += r.used_bytes(),
                     AllocationSemantics::ReferenceArray => ref_bytes += r.used_bytes(),
                     AllocationSemantics::PrimitiveArray => non_ref_bytes += r.used_bytes(),
-                    _ => unreachable!("Unsupported allocation semantics: {:?}", semantics),
+                    _ => unreachable!("Unsupported allocation semantics: {:?}", r.semantics),
                 }
                 #[cfg(feature = "object_pinning")]
                 if is_pinning {
@@ -918,8 +922,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
     pub fn calculate_offset_vector_for_region(&self, index: usize) {
         self.pr.with_regions(&mut |regions| {
             let region = &regions[index];
-            let free_list = self.forwarding.calculate_offset_vector(region.region);
-            self.pr.reset_free_list(region, &free_list);
+            let hole_list = self.forwarding.calculate_offset_vector(region.region);
+            self.hole_lists[region.semantics].add_holes(&hole_list);
         });
     }
 

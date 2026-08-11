@@ -505,7 +505,7 @@ impl<VM: VMBinding> OnePassSpace<VM> {
                 r.region.end()
             );
             let to = (to - r.region.start()) as forwarding::Offset;
-            self.pr.reset_free_list(r, &forwarding::singleton_free_list(r.region, to));
+            // self.pr.reset_free_list(r, &forwarding::singleton_free_list(r.region, to));
         });
 
         counters.threaded.clone().lock().unwrap().inc_by(threaded);

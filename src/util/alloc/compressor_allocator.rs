@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use crate::policy::compressor::CompressorSpace;
+use crate::policy::compressor::forwarding::CompressorRegion;
+use crate::util::constants::LOG_BYTES_IN_PAGE;
+use crate::util::linear_scan::Region;
 use crate::util::Address;
 use crate::AllocationSemantics;
 
@@ -12,7 +15,7 @@ use crate::util::opaque_pointer::*;
 use crate::vm::VMBinding;
 
 /// Size of a thread-local allocation buffer. Currently it is set to 4 KB.
-const BLOCK_SIZE: usize = 1 << crate::util::constants::LOG_BYTES_IN_PAGE;
+const BLOCK_SIZE: usize = 1 << LOG_BYTES_IN_PAGE;
 const BLOCK_MASK: usize = BLOCK_SIZE - 1;
 
 #[repr(C)]
@@ -218,11 +221,23 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
         let block_size = (size + BLOCK_MASK) & (!BLOCK_MASK);
         let acquired_start = match self.space.acquire_hole(size, Some(BLOCK_SIZE), semantics) {
             Some(hole) => hole.start,
-            None => self.space.acquire(
-                self.tls,
-                bytes_to_pages_up(block_size),
-                self.get_context().get_alloc_options(),
-            ),
+            None => {
+                let region = self.space.acquire(
+                    self.tls,
+                    CompressorRegion::BYTES >> LOG_BYTES_IN_PAGE,
+                    self.get_context().get_alloc_options(),
+                );
+                if region.is_zero() {
+                    Address::ZERO
+                } else {
+                    // Take a block out of the region, and give the rest to the space.
+                    self.space.add_hole(
+                        semantics,
+                        (region + BLOCK_SIZE)..(region + CompressorRegion::BYTES)
+                    );
+                    region
+                }
+            },
         };
         self.get_context()
             .set_alloc_options(crate::util::alloc::AllocationOptions::default());
