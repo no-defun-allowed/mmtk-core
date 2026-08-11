@@ -415,9 +415,9 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 forwarding::MARK_SPEC
                     .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
                 match r.semantics {
-                    AllocationSemantics::Default => default_bytes += r.used_bytes(),
-                    AllocationSemantics::ReferenceArray => ref_bytes += r.used_bytes(),
-                    AllocationSemantics::PrimitiveArray => non_ref_bytes += r.used_bytes(),
+                    AllocationSemantics::Default => default_bytes += forwarding::CompressorRegion::BYTES,
+                    AllocationSemantics::ReferenceArray => ref_bytes += forwarding::CompressorRegion::BYTES,
+                    AllocationSemantics::PrimitiveArray => non_ref_bytes += forwarding::CompressorRegion::BYTES,
                     _ => unreachable!("Unsupported allocation semantics: {:?}", r.semantics),
                 }
                 #[cfg(feature = "object_pinning")]
@@ -501,6 +501,10 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     }
                 }
             });
+
+        default_bytes -= self.hole_lists[AllocationSemantics::Default].free_bytes();
+        ref_bytes -= self.hole_lists[AllocationSemantics::ReferenceArray].free_bytes();
+        non_ref_bytes -= self.hole_lists[AllocationSemantics::PrimitiveArray].free_bytes();
 
         if *self
             .common()
@@ -1353,7 +1357,7 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
             .map(|c| {
                 c.iter().map(|r| {
                     let scale = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-                    let used = r.used_bytes();
+                    let used = 0; // XXX(hayleyp): r.used_bytes();
                     let index = (used * (scale.len() - 1)) / forwarding::CompressorRegion::BYTES;
                     scale[index]
                 })

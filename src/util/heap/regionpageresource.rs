@@ -90,7 +90,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
         semantics: AllocationSemantics,
         tls: VMThread,
     ) -> Result<PRAllocResult, PRAllocFail> {
-        let mut b = self.sync.write().unwrap();
+        let mut sync = self.sync.write().unwrap();
         let succeed = |start: Address, new_chunk: bool| {
             Result::Ok(PRAllocResult {
                 start,
@@ -99,9 +99,9 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             })
         };
         // First try to take a free region.
-        match b.free_regions.pop() {
+        match sync.free_regions.pop() {
             Some(r) => {
-                b.used_regions.push(AllocatedRegion {
+                sync.used_regions.push(AllocatedRegion {
                     region: r,
                     semantics
                 });
@@ -115,11 +115,11 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
                 assert!(R::BYTES < BYTES_IN_CHUNK); // XXX: where to do this properly?
                 // Get the first region to service this allocation.
                 let region = R::from_aligned_address(chunk_start);
-                self.used_regions.push(AllocatedRegion { region, semantics });
+                sync.used_regions.push(AllocatedRegion { region, semantics });
                 // Push the remaining regions to the free regions.
                 for i in 1..(BYTES_IN_CHUNK / R::BYTES) {
                     let region_start = chunk_start + R::BYTES * i;
-                    b.free_regions.push(R::from_aligned_address(region_start))
+                    sync.free_regions.push(R::from_aligned_address(region_start))
                 };
                 succeed(chunk_start, true)
             }

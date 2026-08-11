@@ -60,4 +60,8 @@ impl HoleList {
             holes.push_back(hole);
         }
     }
+    pub fn free_bytes(&self) -> usize {
+        let mut holes = self.holes.lock().unwrap();
+        holes.iter().map(size).sum()
+    }
 }
