@@ -642,7 +642,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 if intersects_pinned_page {
                     self.forwarding.stub_table.write().unwrap().add_stub(obj);
                     if forwarding::pin_block(block) {
-                        info!(
+                        trace!(
                             "Pinning new block {:?} because of pinned object {:?}",
                             block, obj
                         );
@@ -780,7 +780,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                                     );
                                 }
                             }
-                            info!(
+                            trace!(
                                 "Pinning {:?} page {}: {}",
                                 r.semantics,
                                 page,
