@@ -50,10 +50,10 @@ impl PageAccounting {
     /// both reserved and committed pages.
     pub fn release(&self, pages: usize) {
         let _prev_reserved = self.reserved.fetch_sub(pages, Ordering::Relaxed);
-        debug_assert!(_prev_reserved >= pages);
+        debug_assert!(_prev_reserved >= pages, "{_prev_reserved} >= {pages}");
 
         let _prev_committed = self.committed.fetch_sub(pages, Ordering::Relaxed);
-        debug_assert!(_prev_committed >= pages);
+        debug_assert!(_prev_committed >= pages, "{_prev_committed} >= {pages}");
     }
 
     /// Set both reserved and committed pages to zero. This is only used when we completely clear a space.

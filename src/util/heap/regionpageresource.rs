@@ -94,6 +94,7 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
     ) -> Result<PRAllocResult, PRAllocFail> {
         let mut sync = self.sync.write().unwrap();
         let succeed = |start: Address, new_chunk: bool| {
+            self.commit_pages(Self::REGION_PAGES, Self::REGION_PAGES, tls);
             Result::Ok(PRAllocResult {
                 start,
                 pages: Self::REGION_PAGES,
@@ -108,7 +109,6 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
                     semantics,
                     used_after_gc: AtomicUsize::new(0),
                 });
-                self.commit_pages(Self::REGION_PAGES, Self::REGION_PAGES, tls);
                 succeed(r.start(), false)
             }
             None => {

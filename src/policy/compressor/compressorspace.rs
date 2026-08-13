@@ -356,7 +356,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         maximum: Option<usize>,
         s: AllocationSemantics,
     ) -> Option<hole_list::Hole> {
-        self.hole_lists[s].acquire(minimum, maximum)
+        self.hole_lists[s].acquire(&self.pr.common().accounting, minimum, maximum)
     }
 
     pub fn add_hole(
@@ -364,12 +364,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         s: AllocationSemantics,
         h: hole_list::Hole,
     ) {
-        self.hole_lists[s].add_hole(h);
+        self.hole_lists[s].add_hole(&self.pr.common().accounting, h);
     }
 
     pub fn prepare<Context: GCWorkContext<VM = VM>>(&self) {
         for (_, hole_list) in &self.hole_lists {
-            hole_list.clear();
+            hole_list.clear(&self.pr.common().accounting);
         }
         #[cfg(feature = "object_pinning")]
         NUM_GCS.fetch_add(1, Ordering::Relaxed);
@@ -927,7 +927,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.pr.with_regions(&mut |regions| {
             let region = &regions[index];
             let hole_list = self.forwarding.calculate_offset_vector(region.region);
-            self.hole_lists[region.semantics].add_holes(&hole_list);
+            self.hole_lists[region.semantics].add_holes(&self.pr.common().accounting, &hole_list);
             let live = forwarding::CompressorRegion::BYTES -
                 hole_list.iter().map(|(s, e)| *e - *s).sum::<usize>();
             region.used_after_gc.store(live, Ordering::Relaxed);
@@ -1355,6 +1355,7 @@ impl<VM: VMBinding> GCWork<VM> for CalculateOffsetVector<VM> {
 
 pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::CompressorRegion>]) {
     if log::log_enabled!(log::Level::Info) {
+        info!("{} regions", regions.len());
         regions
             .chunks(64)
             .map(|c| {
