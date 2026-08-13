@@ -14,7 +14,7 @@ pub(crate) type Hole = Range<Address>;
 pub(crate) struct HoleList {
     // Supposing we push all holes in address-order,
     // a VecDeque will pop in that address order too.
-    holes: Mutex<VecDeque<Hole>>
+    pub holes: Mutex<VecDeque<Hole>>
 }
 
 pub(crate) fn size(h: &Hole) -> usize { h.end - h.start }

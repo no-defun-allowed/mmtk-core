@@ -139,6 +139,8 @@ pub struct CompressorSpace<VM: VMBinding> {
     #[cfg(feature = "object_pinning")]
     cached_pinned_pages: RwLock<HashSet<Address>>,
     hole_lists: EnumMap<AllocationSemantics, HoleList>,
+    #[cfg(feature = "object_pinning")]
+    collection: AtomicU32,
 }
 
 /// The number of bytes of the heap that each CalculateOffsetVector
@@ -347,6 +349,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             #[cfg(feature = "object_pinning")]
             cached_pinned_pages: RwLock::new(HashSet::new()),
             hole_lists: EnumMap::from_fn(|_| HoleList::new()),
+            #[cfg(feature = "object_pinning")]
+            collection: AtomicU32::new(0),
         }
     }
 
@@ -677,6 +681,35 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     .bset_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
             }
         });
+        // Draw region states
+        #[cfg(feature = "object_pinning")]
+        self.pr.with_regions(&mut |regions| {
+            use image::{Rgba, RgbaImage};
+            use imageproc::drawing::{draw_filled_rect_mut, draw_hollow_rect_mut};
+            use imageproc::rect::Rect;
+            let scale: usize = 128;
+            let width = forwarding::CompressorRegion::BYTES / scale;
+            let mut image = RgbaImage::from_pixel(width as u32, regions.len() as u32, Rgba([0,0,0,255]));
+            for (y, r) in regions.iter().enumerate() {
+                for x in 0..(forwarding::CompressorRegion::BYTES / BYTES_IN_PAGE) {
+                    let page = r.region.start() + x * BYTES_IN_PAGE;
+                    if forwarding::PINNED_PAGE_SPEC.load_atomic::<u8>(page, Ordering::Relaxed) == 1 {
+                        let rect = Rect::at((x * BYTES_IN_PAGE / scale) as i32, y as i32).of_size((BYTES_IN_PAGE / scale) as u32, 1);
+                        draw_filled_rect_mut(&mut image, rect, Rgba([255,0,0,255]));
+                    }
+                }
+            }
+            for (_, hole_list) in &self.hole_lists {
+                let holes = hole_list.holes.lock().unwrap();
+                for hole in holes.iter() {
+                    let y = regions.iter().position(|r| r.region.start() <= hole.start && hole.start < r.region.end()).unwrap();
+                    let x = (hole.start - regions[y].region.start()) / scale;
+                    let rect = Rect::at(x as i32, y as i32).of_size(((hole.end - hole.start) / scale) as u32, 1);
+                    draw_filled_rect_mut(&mut image, rect, Rgba([255,255,255,255]));
+                }
+            }
+            image.save(format!("/tmp/hayleyp-fop/{}.png", self.collection.fetch_add(1, Ordering::Relaxed))).unwrap();
+        });
     }
 
     #[cfg(feature = "object_pinning")]
@@ -745,12 +778,12 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .compressor_check_candidate_before_pinning;
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
+                forwarding::OFFSET_VECTOR_SPEC.bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
                 let mut page = r.region.start();
                 let end = r.region.end();
                 while page < end {
                     let is_pinning_candidate = if check_pinning_candidates {
-                        forwarding::PINNED_PAGE_SPEC.load_atomic::<u8>(page, Ordering::SeqCst)
-                            == 1_u8
+                        forwarding::PINNED_PAGE_SPEC.load_atomic::<u8>(page, Ordering::SeqCst) == 1
                     } else {
                         true
                     };
@@ -1367,6 +1400,9 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
                 })
             })
             .for_each(|c| info!("Region usage: {}", c.collect::<String>()));
+        let used = regions.iter().map(|r| r.used_after_gc.load(Ordering::Relaxed)).sum::<usize>();
+        let total = regions.len() * forwarding::CompressorRegion::BYTES;
+        info!("{used} / {total} = {} used in regions", used as f32 / total as f32);
     }
 }
 
