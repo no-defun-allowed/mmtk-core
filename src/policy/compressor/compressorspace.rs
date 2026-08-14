@@ -1,5 +1,5 @@
+use super::hole_list::HoleList;
 use crate::plan::VectorObjectQueue;
-use crate::policy::compressor::{forwarding, hole_list};
 #[cfg(feature = "object_pinning")]
 use crate::policy::compressor::forwarding::does_new_address_intersect_pinned_pages;
 #[cfg(all(feature = "object_pinning", debug_assertions))]
@@ -10,6 +10,7 @@ use crate::policy::compressor::forwarding::Block;
 use crate::policy::compressor::forwarding::{
     does_new_address_intersect_pinned_objects, COMPUTING_FORWARDING_INFO, FORWARDING_MAP,
 };
+use crate::policy::compressor::{forwarding, hole_list};
 use crate::policy::gc_work::{TraceKind, TRACE_KIND_TRANSITIVE_PIN};
 use crate::policy::sft::{GCWorkerMutRef, SFT};
 use crate::policy::space::{CommonSpace, Space};
@@ -32,14 +33,13 @@ use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::ObjectEnumerator;
 use crate::util::options::{PagePinningMode, PinningMode};
-use crate::util::statistics::stats::Stats;
 #[cfg(all(feature = "object_pinning", debug_assertions))]
 use crate::util::os::OSMemory;
+use crate::util::statistics::stats::Stats;
 use crate::util::{Address, ObjectReference};
 use crate::vm::slot::Slot;
 use crate::{vm::*, ObjectQueue};
 use crate::{AllocationSemantics, MMTK};
-use super::hole_list::HoleList;
 use atomic::Ordering;
 use enum_map::EnumMap;
 #[cfg(feature = "object_pinning")]
@@ -364,11 +364,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
         self.hole_lists[s].acquire(&self.pr.common().accounting, minimum, maximum)
     }
 
-    pub fn add_hole(
-        &self,
-        s: AllocationSemantics,
-        h: hole_list::Hole,
-    ) {
+    pub fn add_hole(&self, s: AllocationSemantics, h: hole_list::Hole) {
         self.hole_lists[s].add_hole(&self.pr.common().accounting, h);
     }
 
@@ -420,9 +416,15 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                 forwarding::MARK_SPEC
                     .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
                 match r.semantics {
-                    AllocationSemantics::Default => default_bytes += forwarding::CompressorRegion::BYTES,
-                    AllocationSemantics::ReferenceArray => ref_bytes += forwarding::CompressorRegion::BYTES,
-                    AllocationSemantics::PrimitiveArray => non_ref_bytes += forwarding::CompressorRegion::BYTES,
+                    AllocationSemantics::Default => {
+                        default_bytes += forwarding::CompressorRegion::BYTES
+                    }
+                    AllocationSemantics::ReferenceArray => {
+                        ref_bytes += forwarding::CompressorRegion::BYTES
+                    }
+                    AllocationSemantics::PrimitiveArray => {
+                        non_ref_bytes += forwarding::CompressorRegion::BYTES
+                    }
                     _ => unreachable!("Unsupported allocation semantics: {:?}", r.semantics),
                 }
                 #[cfg(feature = "object_pinning")]
@@ -649,7 +651,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
                     if forwarding::pin_block(block) {
                         trace!(
                             "Pinning new block {:?} because of pinned object {:?}",
-                            block, obj
+                            block,
+                            obj
                         );
                     }
                 }
@@ -683,33 +686,45 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             }
         });
         // Draw region states
-        #[cfg(all(feature = "object_pinning", feature = "image"))]
+        #[cfg(all(feature = "object_pinning", feature = "images"))]
         self.pr.with_regions(&mut |regions| {
             use image::{Rgba, RgbaImage};
             use imageproc::drawing::{draw_filled_rect_mut, draw_hollow_rect_mut};
             use imageproc::rect::Rect;
             let scale: usize = 128;
             let width = forwarding::CompressorRegion::BYTES / scale;
-            let mut image = RgbaImage::from_pixel(width as u32, regions.len() as u32, Rgba([0,0,0,255]));
+            let mut image =
+                RgbaImage::from_pixel(width as u32, regions.len() as u32, Rgba([0, 0, 0, 255]));
             for (y, r) in regions.iter().enumerate() {
                 for x in 0..(forwarding::CompressorRegion::BYTES / BYTES_IN_PAGE) {
                     let page = r.region.start() + x * BYTES_IN_PAGE;
-                    if forwarding::PINNED_PAGE_SPEC.load_atomic::<u8>(page, Ordering::Relaxed) == 1 {
-                        let rect = Rect::at((x * BYTES_IN_PAGE / scale) as i32, y as i32).of_size((BYTES_IN_PAGE / scale) as u32, 1);
-                        draw_filled_rect_mut(&mut image, rect, Rgba([255,0,0,255]));
+                    if forwarding::PINNED_PAGE_SPEC.load_atomic::<u8>(page, Ordering::Relaxed) == 1
+                    {
+                        let rect = Rect::at((x * BYTES_IN_PAGE / scale) as i32, y as i32)
+                            .of_size((BYTES_IN_PAGE / scale) as u32, 1);
+                        draw_filled_rect_mut(&mut image, rect, Rgba([255, 0, 0, 255]));
                     }
                 }
             }
             for (_, hole_list) in &self.hole_lists {
                 let holes = hole_list.holes.lock().unwrap();
                 for hole in holes.iter() {
-                    let y = regions.iter().position(|r| r.region.start() <= hole.start && hole.start < r.region.end()).unwrap();
+                    let y = regions
+                        .iter()
+                        .position(|r| r.region.start() <= hole.start && hole.start < r.region.end())
+                        .unwrap();
                     let x = (hole.start - regions[y].region.start()) / scale;
-                    let rect = Rect::at(x as i32, y as i32).of_size(((hole.end - hole.start) / scale) as u32, 1);
-                    draw_filled_rect_mut(&mut image, rect, Rgba([255,255,255,255]));
+                    let rect = Rect::at(x as i32, y as i32)
+                        .of_size(((hole.end - hole.start) / scale) as u32, 1);
+                    draw_filled_rect_mut(&mut image, rect, Rgba([255, 255, 255, 255]));
                 }
             }
-            image.save(format!("/tmp/hayleyp-fop/{}.png", self.collection.fetch_add(1, Ordering::Relaxed))).unwrap();
+            image
+                .save(format!(
+                    "/tmp/hayleyp-fop/{}.png",
+                    self.collection.fetch_add(1, Ordering::Relaxed)
+                ))
+                .unwrap();
         });
     }
 
@@ -779,7 +794,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             .compressor_check_candidate_before_pinning;
         self.pr
             .enumerate_regions(&mut |r: &AllocatedRegion<forwarding::CompressorRegion>| {
-                forwarding::OFFSET_VECTOR_SPEC.bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
+                forwarding::OFFSET_VECTOR_SPEC
+                    .bzero_metadata(r.region.start(), forwarding::CompressorRegion::BYTES);
                 let mut page = r.region.start();
                 let end = r.region.end();
                 while page < end {
@@ -962,8 +978,8 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             let region = &regions[index];
             let hole_list = self.forwarding.calculate_offset_vector(region.region);
             self.hole_lists[region.semantics].add_holes(&self.pr.common().accounting, &hole_list);
-            let live = forwarding::CompressorRegion::BYTES -
-                hole_list.iter().map(|(s, e)| *e - *s).sum::<usize>();
+            let live = forwarding::CompressorRegion::BYTES
+                - hole_list.iter().map(|(s, e)| *e - *s).sum::<usize>();
             region.used_after_gc.store(live, Ordering::Relaxed);
         });
     }
@@ -1401,9 +1417,15 @@ pub(crate) fn draw_region_usage(regions: &[AllocatedRegion<forwarding::Compresso
                 })
             })
             .for_each(|c| info!("Region usage: {}", c.collect::<String>()));
-        let used = regions.iter().map(|r| r.used_after_gc.load(Ordering::Relaxed)).sum::<usize>();
+        let used = regions
+            .iter()
+            .map(|r| r.used_after_gc.load(Ordering::Relaxed))
+            .sum::<usize>();
         let total = regions.len() * forwarding::CompressorRegion::BYTES;
-        info!("{used} / {total} = {} used in regions", used as f32 / total as f32);
+        info!(
+            "{used} / {total} = {} used in regions",
+            used as f32 / total as f32
+        );
     }
 }
 

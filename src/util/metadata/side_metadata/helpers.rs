@@ -127,7 +127,7 @@ pub(super) fn try_mmap_contiguous_metadata_space(
     no_reserve: bool,
     anno: &MmapAnnotation,
 ) -> MmapResult<usize> {
- //   debug_assert!(start.is_aligned_to(BYTES_IN_PAGE));
+    debug_assert!(start.is_aligned_to(BYTES_IN_PAGE));
     debug_assert!(size % BYTES_IN_PAGE == 0);
 
     // nearest page-aligned starting address

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use crate::policy::compressor::CompressorSpace;
 use crate::policy::compressor::forwarding::CompressorRegion;
+use crate::policy::compressor::CompressorSpace;
 use crate::util::constants::LOG_BYTES_IN_PAGE;
 use crate::util::linear_scan::Region;
 use crate::util::Address;
@@ -14,8 +14,8 @@ use crate::util::conversions::bytes_to_pages_up;
 use crate::util::opaque_pointer::*;
 use crate::vm::VMBinding;
 
-/// Size of a thread-local allocation buffer. Currently it is set to 4 KB.
-const BLOCK_SIZE: usize = 1 << LOG_BYTES_IN_PAGE;
+/// Maximum size hint for a thread-local allocation buffer. Currently it is set to 32 KB.
+const BLOCK_SIZE: usize = 8 << LOG_BYTES_IN_PAGE;
 const BLOCK_MASK: usize = BLOCK_SIZE - 1;
 
 #[repr(C)]
@@ -233,11 +233,11 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
                     // Take a block out of the region, and give the rest to the space.
                     self.space.add_hole(
                         semantics,
-                        (region + block_size)..(region + CompressorRegion::BYTES)
+                        (region + block_size)..(region + CompressorRegion::BYTES),
                     );
                     Some(region..(region + block_size))
                 }
-            },
+            }
         };
         self.get_context()
             .set_alloc_options(crate::util::alloc::AllocationOptions::default());
@@ -245,7 +245,7 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
             None => {
                 trace!("Failed to acquire a new block");
                 Address::ZERO
-            },
+            }
             Some(hole) => {
                 trace!("Acquired a new block {hole:?}");
                 #[cfg(feature = "object_pinning")]

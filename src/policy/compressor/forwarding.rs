@@ -5,12 +5,12 @@ use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::constants::BYTES_IN_WORD;
 use crate::util::linear_scan::Region;
 use crate::util::metadata::side_metadata::ranges::Bits;
+use crate::util::metadata::side_metadata::spec_defs::{
+    COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
+};
 #[cfg(feature = "object_pinning")]
 use crate::util::metadata::side_metadata::spec_defs::{
     COMPRESSOR_PAGE_MATURE, COMPRESSOR_PAGE_PINNED,
-};
-use crate::util::metadata::side_metadata::spec_defs::{
-    COMPRESSOR_MARK, COMPRESSOR_OFFSET_VECTOR, COMPRESSOR_SELECTED,
 };
 use crate::util::metadata::side_metadata::SideMetadataSpec;
 use crate::util::options::PinningMode;
@@ -1431,12 +1431,14 @@ impl<VM: VMBinding> ForwardingMetadata<VM> {
         self.calculated.store(false, Ordering::Relaxed);
         #[cfg(debug_assertions)]
         FORWARDING_MAP.lock().unwrap().clear();
-        info!("hole sizes: {:?}",
-               self.size_classes
-               .iter()
-               .enumerate()
-               .map(|(i, v)| (1usize << i, v.load(Ordering::Relaxed)))
-               .collect::<Vec<_>>());
+        info!(
+            "hole sizes: {:?}",
+            self.size_classes
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (1usize << i, v.load(Ordering::Relaxed)))
+                .collect::<Vec<_>>()
+        );
     }
 
     pub fn is_forwarding_region(&self, region: CompressorRegion) -> bool {

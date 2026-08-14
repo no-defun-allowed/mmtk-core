@@ -9,9 +9,9 @@ use crate::util::object_enum::ObjectEnumerator;
 use crate::util::Address;
 use crate::util::VMThread;
 use crate::vm::VMBinding;
-use std::sync::RwLock;
-use std::sync::atomic::AtomicUsize;
 use crate::AllocationSemantics;
+use std::sync::atomic::AtomicUsize;
+use std::sync::RwLock;
 
 pub struct AllocatedRegion<R: Region> {
     pub region: R,
@@ -53,11 +53,7 @@ impl<VM: VMBinding, R: Region + 'static> PageResource<VM> for RegionPageResource
     ) -> Result<PRAllocResult, PRAllocFail> {
         assert_eq!(reserved_pages, Self::REGION_PAGES);
         assert_eq!(required_pages, reserved_pages);
-        self.alloc(
-            space_descriptor,
-            semantics,
-            tls,
-        )
+        self.alloc(space_descriptor, semantics, tls)
     }
 
     fn get_available_physical_pages(&self) -> usize {
@@ -113,10 +109,13 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
             }
             None => {
                 // Else allocate a new chunk to carve regions from.
-                let chunk_start = self.flpr.allocate_one_chunk_no_commit(space_descriptor)?.start;
+                let chunk_start = self
+                    .flpr
+                    .allocate_one_chunk_no_commit(space_descriptor)?
+                    .start;
                 assert!(chunk_start.is_aligned_to(BYTES_IN_CHUNK));
                 assert!(R::BYTES < BYTES_IN_CHUNK); // XXX: where to do this properly?
-                // Get the first region to service this allocation.
+                                                    // Get the first region to service this allocation.
                 let region = R::from_aligned_address(chunk_start);
                 sync.used_regions.push(AllocatedRegion {
                     region,
@@ -126,14 +125,15 @@ impl<VM: VMBinding, R: Region + 'static> RegionPageResource<VM, R> {
                 // Push the remaining regions to the free regions.
                 for i in 1..(BYTES_IN_CHUNK / R::BYTES) {
                     let region_start = chunk_start + R::BYTES * i;
-                    sync.free_regions.push(R::from_aligned_address(region_start))
-                };
+                    sync.free_regions
+                        .push(R::from_aligned_address(region_start))
+                }
                 succeed(chunk_start, true)
             }
         }
     }
 
-    pub fn reset_allocator(&self) { }
+    pub fn reset_allocator(&self) {}
 
     pub fn enumerate(&self, enumerator: &mut dyn ObjectEnumerator) {
         let sync = self.sync.read().unwrap();

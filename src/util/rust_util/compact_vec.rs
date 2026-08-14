@@ -96,9 +96,7 @@ impl<T> CompactVec<T> {
             unsafe { alloc::alloc(new_layout) }
         } else {
             let old_layout = Self::layout_for(self.cap as usize);
-            unsafe {
-                alloc::realloc(self.ptr.as_ptr() as *mut u8, old_layout, new_layout.size())
-            }
+            unsafe { alloc::realloc(self.ptr.as_ptr() as *mut u8, old_layout, new_layout.size()) }
         };
 
         self.ptr = match NonNull::new(new_ptr as *mut T) {
