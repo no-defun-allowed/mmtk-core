@@ -32,6 +32,7 @@ use crate::util::metadata::vo_bit;
 use crate::util::metadata::MetadataSpec;
 use crate::util::object_enum::ObjectEnumerator;
 use crate::util::options::{PagePinningMode, PinningMode};
+use crate::util::statistics::stats::Stats;
 #[cfg(all(feature = "object_pinning", debug_assertions))]
 use crate::util::os::OSMemory;
 use crate::util::{Address, ObjectReference};
@@ -306,7 +307,7 @@ impl<VM: VMBinding> crate::policy::gc_work::PolicyTraceObject<VM> for Compressor
 }
 
 impl<VM: VMBinding> CompressorSpace<VM> {
-    pub fn new(args: crate::policy::space::PlanCreateSpaceArgs<VM>) -> Self {
+    pub fn new(args: crate::policy::space::PlanCreateSpaceArgs<VM>, stats: &Stats) -> Self {
         let vm_map = args.vm_map;
         assert!(
             VM::VMObjectModel::UNIFIED_OBJECT_REFERENCE_ADDRESS,
@@ -348,7 +349,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             num_pinned_pages: AtomicU32::new(0),
             #[cfg(feature = "object_pinning")]
             cached_pinned_pages: RwLock::new(HashSet::new()),
-            hole_lists: EnumMap::from_fn(|_| HoleList::new()),
+            hole_lists: EnumMap::from_fn(|s| HoleList::new(s, stats)),
             #[cfg(feature = "object_pinning")]
             collection: AtomicU32::new(0),
         }
@@ -682,7 +683,7 @@ impl<VM: VMBinding> CompressorSpace<VM> {
             }
         });
         // Draw region states
-        #[cfg(feature = "object_pinning")]
+        #[cfg(all(feature = "object_pinning", feature = "image"))]
         self.pr.with_regions(&mut |regions| {
             use image::{Rgba, RgbaImage};
             use imageproc::drawing::{draw_filled_rect_mut, draw_hollow_rect_mut};

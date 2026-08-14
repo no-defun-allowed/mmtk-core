@@ -247,14 +247,11 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
                 Address::ZERO
             },
             Some(hole) => {
-                let start = hole.start;
-                let end = hole.end;
-                let size = end - start;
-                trace!("Acquired a new block from {start} to {end}");
+                trace!("Acquired a new block {hole:?}");
                 #[cfg(feature = "object_pinning")]
-                self.space.touch_pages(start, size);
+                self.space.touch_pages(hole.start, hole.end - hole.start);
                 if !stress_test {
-                    self.set_limit(start, end, semantics);
+                    self.set_limit(hole.start, hole.end, semantics);
                     self.alloc(size, align, offset, semantics)
                 } else {
                     // For a stress test, we artificially make the fastpath fail by
@@ -262,8 +259,8 @@ impl<VM: VMBinding> CompressorAllocator<VM> {
                     // The assumption here is that we use an address range such that
                     // cursor > block_size always.
                     self.set_limit(
-                        start,
-                        unsafe { Address::from_usize(size) },
+                        hole.start,
+                        unsafe { Address::from_usize(hole.end - hole.start) },
                         semantics,
                     );
                     // Note that we have just acquired a new block so we know that we don't have to go

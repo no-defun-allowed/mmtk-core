@@ -104,6 +104,7 @@ impl<VM: VMBinding> Plan for Compressor<VM> {
 impl<VM: VMBinding> Compressor<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
         let scheduler = args.scheduler.clone();
+        let stats = args.stats;
 
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
@@ -112,12 +113,15 @@ impl<VM: VMBinding> Compressor<VM> {
         };
 
         Compressor {
-            compressor_space: CompressorSpace::new(plan_args.get_normal_space_args(
-                "compressor_space",
-                true,
-                false,
-                VMRequest::discontiguous(),
-            )),
+            compressor_space: CompressorSpace::new(
+                plan_args.get_normal_space_args(
+                    "compressor_space",
+                    true,
+                    false,
+                    VMRequest::discontiguous(),
+                ),
+                stats,
+            ),
             common: CommonPlan::new(plan_args),
             remset: RemSet::new(scheduler.num_workers()),
         }

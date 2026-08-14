@@ -67,8 +67,8 @@ strum = "0.27.1"
 strum_macros = "0.27.1"
 # sysinfo >=0.37.0 requires MSRV 1.88.0 and Rust edition 2024.
 sysinfo = "0.36.1"
-image = "0.25.6"
-imageproc = "0.25.1"
+image = { version = "0.25.6", optional = true }
+imageproc = { version = "0.25.1", optional = true }
 
 [dev-dependencies]
 paste = "1.0.8"
@@ -208,6 +208,9 @@ compressor_single_space = []
 
 # Use Android/Clozure Common Lisp-style mark bitmaps instead of Compressor-style.
 compressor_art_marking = []
+
+# Generate heap visualisations for Compressor.
+images = ["dep:image", "dep:imageproc"]
 
 # Avoid compacting mostly-live regions in the Compressor. (The threshold is set by
 # the environment variable MMTK_COMPACT_MAX_PERCENT, and defaults to 90%.)

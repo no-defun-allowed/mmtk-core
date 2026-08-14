@@ -1,11 +1,14 @@
+use crate::AllocationSemantics;
 use crate::util::heap::vm_layout::BYTES_IN_CHUNK;
 use crate::util::Address;
 use crate::util::constants::BYTES_IN_PAGE;
 use crate::util::heap::PageAccounting;
+use crate::util::statistics::counter::EventCounter;
+use crate::util::statistics::stats::Stats;
 use crate::vm::VMBinding;
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 const MINIMUM_HOLE_BYTES: usize = 128;
 const MAXIMUM_HOLE_BYTES: usize = BYTES_IN_CHUNK;
@@ -14,7 +17,9 @@ pub(crate) type Hole = Range<Address>;
 pub(crate) struct HoleList {
     // Supposing we push all holes in address-order,
     // a VecDeque will pop in that address order too.
-    pub holes: Mutex<VecDeque<Hole>>
+    pub holes: Mutex<VecDeque<Hole>>,
+    wasted: Arc<Mutex<EventCounter>>,
+    used: Arc<Mutex<EventCounter>>,
 }
 
 pub(crate) fn size(h: &Hole) -> usize { h.end - h.start }
@@ -24,9 +29,11 @@ fn pages(h: &Hole) -> usize {
 }
 
 impl HoleList {
-    pub fn new() -> Self {
+    pub fn new(name: AllocationSemantics, stats: &Stats) -> Self {
         Self {
             holes: Mutex::new(VecDeque::new()),
+            wasted: stats.new_event_counter(&format!("wasted-{:?}", name), true, true),
+            used: stats.new_event_counter(&format!("used-{:?}", name), true, true),
         }
     }
     pub fn acquire(&self, acc: &PageAccounting, minimum_size: usize, maximum_size: Option<usize>) -> Option<Hole> {
@@ -56,9 +63,11 @@ impl HoleList {
                         hole
                     };
                     acc.reserve_and_commit(pages(&carved));
+                    self.used.lock().unwrap().inc_by(size(&carved) as u64);
                     return Some(carved);
                 } else {
                     // We can't use this hole; skip it.
+                    self.wasted.lock().unwrap().inc_by(size(&hole) as u64);
                     acc.reserve_and_commit(pages(&hole));
                 }
             }
