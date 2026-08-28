@@ -570,6 +570,56 @@ impl<VM: VMBinding> MarkSweepSpace<VM> {
     }
 }
 
+use crate::util::alloc::FreeListAllocator;
+use crate::util::alloc::allocator::{Allocator, AllocatorContext};
+use crate::util::{Address, VMWorkerThread};
+use crate::policy::copy_context::PolicyCopyContext;
+
+pub struct MarkSweepCopyContext<VM: VMBinding> {
+    allocator: FreeListAllocator<VM>
+}
+
+impl<VM: VMBinding> PolicyCopyContext for MarkSweepCopyContext<VM> {
+    type VM = VM;
+
+    fn prepare(&mut self) {}
+
+    fn release(&mut self) {}
+
+    fn alloc_copy(
+        &mut self,
+        _original: ObjectReference,
+        bytes: usize,
+        align: usize,
+        offset: usize,
+    ) -> Address {
+        self.allocator.alloc(bytes, align, offset)
+    }
+
+    fn post_copy(&mut self, object: ObjectReference, _bytes: usize) {
+        // Mark the object
+        VM::VMObjectModel::LOCAL_MARK_BIT_SPEC.store_atomic::<VM, u8>(
+            object,
+            1u8,
+            None,
+            Ordering::SeqCst,
+        );
+    }
+}
+
+impl<VM: VMBinding> MarkSweepCopyContext<VM> {
+    pub(crate) fn new(
+        tls: VMWorkerThread,
+        context: Arc<AllocatorContext<VM>>,
+        space: &'static MarkSweepSpace<VM>,
+    ) -> Self {
+        MarkSweepCopyContext {
+            allocator: FreeListAllocator::new(tls.0, space, context),
+        }
+    }
+}
+
+
 use crate::scheduler::GCWork;
 use crate::MMTK;
 

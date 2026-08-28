@@ -7,6 +7,8 @@ use crate::policy::copyspace::CopySpace;
 use crate::policy::copyspace::CopySpaceCopyContext;
 use crate::policy::immix::ImmixSpace;
 use crate::policy::immix::{ImmixCopyContext, ImmixHybridCopyContext};
+use crate::policy::marksweepspace::native_ms::MarkSweepSpace;
+use crate::policy::marksweepspace::native_ms::MarkSweepCopyContext;
 use crate::policy::space::Space;
 use crate::util::object_forwarding;
 use crate::util::opaque_pointer::VMWorkerThread;
@@ -23,6 +25,7 @@ use super::alloc::allocator::AllocatorContext;
 const MAX_COPYSPACE_COPY_ALLOCATORS: usize = 1;
 const MAX_IMMIX_COPY_ALLOCATORS: usize = 1;
 const MAX_IMMIX_HYBRID_COPY_ALLOCATORS: usize = 1;
+const MAX_MARK_SWEEP_COPY_ALLOCATORS: usize = 1;
 
 type CopySpaceMapping<VM> = Vec<(CopySelector, &'static dyn Space<VM>)>;
 
@@ -58,6 +61,8 @@ pub struct GCWorkerCopyContext<VM: VMBinding> {
     pub immix: [MaybeUninit<ImmixCopyContext<VM>>; MAX_IMMIX_COPY_ALLOCATORS],
     /// Copy allocators for ImmixSpace
     pub immix_hybrid: [MaybeUninit<ImmixHybridCopyContext<VM>>; MAX_IMMIX_HYBRID_COPY_ALLOCATORS],
+    /// Copy allocators for MarkSweep
+    pub ms: [MaybeUninit<MarkSweepCopyContext<VM>>; MAX_MARK_SWEEP_COPY_ALLOCATORS],
     /// The config for the plan
     config: CopyConfig<VM>,
 }
@@ -98,6 +103,10 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
                 unsafe { self.immix_hybrid[index as usize].assume_init_mut() }
                     .alloc_copy(original, bytes, align, offset)
             }
+            CopySelector::MarkSweep(index) => {
+                unsafe { self.ms[index as usize].assume_init_mut() }
+                    .alloc_copy(original, bytes, align, offset)
+            }
             CopySelector::Unused => unreachable!(),
         }
     }
@@ -130,6 +139,10 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
                 unsafe { self.immix_hybrid[index as usize].assume_init_mut() }
                     .post_copy(object, bytes)
             }
+            CopySelector::MarkSweep(index) => {
+                unsafe { self.ms[index as usize].assume_init_mut() }
+                    .post_copy(object, bytes)
+            }
             CopySelector::Unused => unreachable!(),
         }
     }
@@ -147,6 +160,9 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
                 }
                 CopySelector::ImmixHybrid(index) => {
                     unsafe { self.immix_hybrid[*index as usize].assume_init_mut() }.prepare()
+                }
+                CopySelector::MarkSweep(index) => {
+                    unsafe { self.ms[*index as usize].assume_init_mut() }.prepare()
                 }
                 CopySelector::Unused => {}
             }
@@ -167,6 +183,9 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
                 CopySelector::ImmixHybrid(index) => {
                     unsafe { self.immix_hybrid[*index as usize].assume_init_mut() }.release()
                 }
+                CopySelector::MarkSweep(index) => {
+                    unsafe { self.ms[*index as usize].assume_init_mut() }.release()
+                }
                 CopySelector::Unused => {}
             }
         }
@@ -183,6 +202,7 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
             copy: unsafe { MaybeUninit::uninit().assume_init() },
             immix: unsafe { MaybeUninit::uninit().assume_init() },
             immix_hybrid: unsafe { MaybeUninit::uninit().assume_init() },
+            ms: unsafe { MaybeUninit::uninit().assume_init() },
             config,
         };
         let context = Arc::new(AllocatorContext::new(mmtk));
@@ -211,6 +231,13 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
                         space.downcast_ref::<ImmixSpace<VM>>().unwrap(),
                     ));
                 }
+                CopySelector::MarkSweep(index) => {
+                    ret.ms[index as usize].write(MarkSweepCopyContext::new(
+                        worker_tls,
+                        context.clone(),
+                        space.downcast_ref::<MarkSweepSpace<VM>>().unwrap(),
+                    ));
+                }
                 CopySelector::Unused => unreachable!(),
             }
         }
@@ -224,6 +251,7 @@ impl<VM: VMBinding> GCWorkerCopyContext<VM> {
             copy: unsafe { MaybeUninit::uninit().assume_init() },
             immix: unsafe { MaybeUninit::uninit().assume_init() },
             immix_hybrid: unsafe { MaybeUninit::uninit().assume_init() },
+            ms: unsafe { MaybeUninit::uninit().assume_init() },
             config: CopyConfig::default(),
         }
     }
@@ -259,6 +287,7 @@ pub(crate) enum CopySelector {
     CopySpace(u8),
     Immix(u8),
     ImmixHybrid(u8),
+    MarkSweep(u8),
     #[default]
     Unused,
 }

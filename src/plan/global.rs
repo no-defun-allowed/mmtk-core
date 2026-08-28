@@ -57,6 +57,9 @@ pub fn create_mutator<VM: VMBinding>(
         PlanSelector::Lisp2 => {
             crate::plan::markcompact::lisp2::mutator::create_lisp2_mutator(tls, mmtk)
         }
+        PlanSelector::Ungenerational => {
+            crate::plan::ungenerational::mutator::create_ug_mutator(tls, mmtk)
+        }
         PlanSelector::StickyImmix => {
             crate::plan::sticky::immix::mutator::create_stickyimmix_mutator(tls, mmtk)
         }
@@ -101,6 +104,9 @@ pub fn create_plan<VM: VMBinding>(
         }
         PlanSelector::Lisp2 => {
             Box::new(crate::plan::markcompact::lisp2::Lisp2::new(args)) as Box<dyn Plan<VM = VM>>
+        }
+        PlanSelector::Ungenerational => {
+            Box::new(crate::plan::ungenerational::Ungenerational::new(args)) as Box<dyn Plan<VM = VM>>
         }
         PlanSelector::StickyImmix => {
             Box::new(crate::plan::sticky::immix::StickyImmix::new(args)) as Box<dyn Plan<VM = VM>>

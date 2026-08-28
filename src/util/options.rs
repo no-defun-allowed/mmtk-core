@@ -48,6 +48,8 @@ pub enum PlanSelector {
     Lisp2,
     /// A mark-compact collector that uses offset-vector bitmaps.
     OVC,
+    /// A non-generational collector that allocates into a copying space, and copies into a mark-sweep space.
+    Ungenerational,
     /// An Immix collector that uses a sticky mark bit to allow generational behaviors without a copying nursery.
     StickyImmix,
     /// LXR GC
