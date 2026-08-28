@@ -584,7 +584,9 @@ impl<VM: VMBinding> PolicyCopyContext for MarkSweepCopyContext<VM> {
 
     fn prepare(&mut self) {}
 
-    fn release(&mut self) {}
+    fn release(&mut self) {
+        self.allocator.on_mutator_destroy();
+    }
 
     fn alloc_copy(
         &mut self,
