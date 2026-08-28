@@ -57,7 +57,6 @@ impl<VM: VMBinding> Plan for Ungenerational<VM> {
     fn create_copy_config(&'static self) -> CopyConfig<Self::VM> {
         use enum_map::enum_map;
         CopyConfig {
-            // XXX: need to copy into ms
             copy_mapping: enum_map! {
                 CopySemantics::DefaultCopy => CopySelector::MarkSweep(0),
                 _ => CopySelector::Unused,
