@@ -1,6 +1,8 @@
 use crate::mmtk::MMTK;
 use crate::util::options::Options;
 use crate::util::statistics::counter::*;
+#[cfg(feature = "pause_time_stats")]
+use crate::util::statistics::pause_time::PauseTimeStats;
 use crate::util::statistics::Timer;
 use crate::vm::VMBinding;
 
@@ -55,6 +57,9 @@ pub struct Stats {
     requests_time: Arc<Mutex<Timer>>,
     #[cfg(feature = "thread_local_gc")]
     thread_local_gc_count: AtomicUsize,
+    /// How long each pause took, as a histogram per pause kind.
+    #[cfg(feature = "pause_time_stats")]
+    pause_times: PauseTimeStats,
 }
 
 impl Stats {
@@ -116,6 +121,8 @@ impl Stats {
             requests_time,
             #[cfg(feature = "thread_local_gc")]
             thread_local_gc_count: AtomicUsize::new(0),
+            #[cfg(feature = "pause_time_stats")]
+            pause_times: PauseTimeStats::new(),
         }
     }
 
@@ -209,6 +216,18 @@ impl Stats {
     #[cfg(feature = "thread_local_gc")]
     pub fn end_local_gc(&self) {}
 
+    /// Count a pause of kind `pause` that took `duration` into the pause-time histogram.
+    ///
+    /// Like every other statistic, a pause is only counted while statistics are being gathered,
+    /// i.e. inside the harness; the GC `harness_begin` itself triggers is not counted.
+    #[cfg(feature = "pause_time_stats")]
+    pub fn record_pause_time(&self, pause: crate::plan::Pause, duration: std::time::Duration) {
+        if !self.get_gathering_stats() {
+            return;
+        }
+        self.pause_times.record(pause, duration);
+    }
+
     pub fn print_stats<VM: VMBinding>(&self, mmtk: &'static MMTK<VM>) {
         println!(
             "============================ MMTk Statistics Totals ============================"
@@ -239,6 +258,9 @@ impl Stats {
         print!("Total time: ");
         self.total_time.lock().unwrap().print_total(None);
         println!(" ms");
+
+        #[cfg(feature = "pause_time_stats")]
+        self.pause_times.print();
 
         println!("------------------------------ End MMTk Statistics -----------------------------")
     }

@@ -58,6 +58,9 @@ mod nogc;
 mod pageprotect;
 mod semispace;
 
+/// The kind of a pause, for the pause-time histogram (`pause_time_stats` only).
+#[cfg(feature = "pause_time_stats")]
+pub(crate) use concurrent::Pause;
 pub(crate) use generational::global::is_nursery_gc;
 pub(crate) use generational::global::GenerationalPlan;
 

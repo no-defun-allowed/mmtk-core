@@ -563,6 +563,16 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
         // Tell GC trigger that GC ended - this happens before we resume mutators.
         mmtk.gc_trigger.policy.on_gc_end(mmtk);
 
+        // The kind of pause this GC was, for the pause-time histogram.  Read before `end_of_gc`,
+        // which ends the pause.  A plan with no pauses of its own does everything in one full
+        // pause.
+        #[cfg(feature = "pause_time_stats")]
+        let pause = mmtk
+            .get_plan()
+            .concurrent()
+            .and_then(|c| c.current_pause())
+            .unwrap_or(crate::plan::Pause::Full);
+
         // All other workers are parked, so it is safe to access the Plan instance mutably.
         probe!(mmtk, plan_end_of_gc_begin);
         let plan_mut: &mut dyn Plan<VM = VM> = unsafe { mmtk.get_plan_mut() };
@@ -575,6 +585,9 @@ impl<VM: VMBinding> GCWorkScheduler<VM> {
             gc_start_time.take().expect("GC not started yet?")
         };
         let elapsed = start_time.elapsed();
+
+        #[cfg(feature = "pause_time_stats")]
+        mmtk.stats.record_pause_time(pause, elapsed);
 
         info!(
             "End of GC ({}/{} pages, took {} ms)",

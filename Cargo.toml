@@ -184,6 +184,13 @@ debug_thread_local_gc_copying = ["thread_local_gc_copying"]
 
 thread_local_gc_copying_stats = ["thread_local_gc_copying"]
 
+# Count every pause into a histogram per pause kind (<1ms, 1-10ms, 10-100ms, >=100ms), printed with
+# the MMTk statistics at harness_end. A pause is measured from the GC request to the resume of the
+# mutators -- the window the "End of GC (took N ms)" log line reports. Works with any plan: with the
+# thread-local GC every pause is a full GC (local GCs are not pauses and are not counted); the SATB
+# ConcurrentImmix's InitialMark and FinalMark pauses get rows of their own.
+pause_time_stats = []
+
 # The following two features are useful for using Immix for VMs that do not support moving GC.
 
 # Disable any object copying in Immix. This makes Immix a non-moving policy.
