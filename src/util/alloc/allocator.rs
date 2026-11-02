@@ -58,6 +58,11 @@ pub struct AllocationOptions {
     ///
     /// If `fasle`, the allocation will return null immediately when out of memory.
     pub allow_oom_call: bool,
+    
+    /// Whether the allocation is expected to be published in its lifetime.
+    ///
+    /// **The default is `false`.**
+    pub likely_public: bool,
 }
 
 /// The default value for `AllocationOptions` has the same semantics as calling [`Allocator::alloc`]
@@ -68,6 +73,7 @@ impl Default for AllocationOptions {
             allow_overcommit: false,
             at_safepoint: true,
             allow_oom_call: true,
+            likely_public: false,
         }
     }
 }
