@@ -28,6 +28,12 @@ pub use malloc_allocator::MallocAllocator;
 pub mod immix_allocator;
 pub use self::immix_allocator::ImmixAllocator;
 
+/// Thread-locality-predicting Immix allocator
+#[cfg(feature = "thread_local_gc")]
+pub mod iso_allocator;
+#[cfg(feature = "thread_local_gc")]
+pub use self::iso_allocator::IsoAllocator;
+
 /// Free list allocator based on Mimalloc
 pub mod free_list_allocator;
 pub use free_list_allocator::FreeListAllocator;
