@@ -1,4 +1,4 @@
-use crate::global_state::GlobalState;
+ouse crate::global_state::GlobalState;
 use crate::policy::space::Space;
 use crate::util::address::Address;
 #[cfg(feature = "analysis")]
@@ -684,3 +684,11 @@ pub trait Allocator<VM: VMBinding>: Downcast {
 }
 
 impl_downcast!(Allocator<VM> where VM: VMBinding);
+
+#[cfg(feature = "thread_local_gc")]
+use std::sync::atomic::AtomicU8;
+#[cfg(feature = "thread_local_gc")]
+/// The number of predictors in the predictor table.
+pub const PREDICTORS: usize = 65536;
+#[cfg(feature = "thread_local_gc")]
+pub(crate) static PREDICTOR_TABLE: [AtomicU8; PREDICTORS] = [const { AtomicU8::new(0) }; PREDICTORS];

@@ -9,7 +9,7 @@ use crate::policy::marksweepspace::native_ms::MarkSweepSpace;
 use crate::policy::space::Space;
 use crate::util::alloc::LargeObjectAllocator;
 use crate::util::alloc::MallocAllocator;
-use crate::util::alloc::{Allocator, BumpAllocator, ImmixAllocator};
+use crate::util::alloc::{Allocator, BumpAllocator, ImmixAllocator, IsoAllocator};
 use crate::util::VMMutatorThread;
 use crate::vm::VMBinding;
 use crate::Mutator;
@@ -25,6 +25,7 @@ pub(crate) const MAX_MALLOC_ALLOCATORS: usize = 1;
 pub(crate) const MAX_IMMIX_ALLOCATORS: usize = 2;
 pub(crate) const MAX_FREE_LIST_ALLOCATORS: usize = 2;
 pub(crate) const MAX_MARK_COMPACT_ALLOCATORS: usize = 1;
+pub(crate) const MAX_ISO_ALLOCATORS: usize = 1;
 
 // The allocators set owned by each mutator. We provide a fixed number of allocators for each allocator type in the mutator,
 // and each plan will select part of the allocators to use.
@@ -38,6 +39,7 @@ pub struct Allocators<VM: VMBinding> {
     pub immix: [MaybeUninit<ImmixAllocator<VM>>; MAX_IMMIX_ALLOCATORS],
     pub free_list: [MaybeUninit<FreeListAllocator<VM>>; MAX_FREE_LIST_ALLOCATORS],
     pub markcompact: [MaybeUninit<MarkCompactAllocator<VM>>; MAX_MARK_COMPACT_ALLOCATORS],
+    pub iso: [MaybeUninit<IsoAllocator<VM>>; MAX_ISO_ALLOCATORS],
 }
 
 impl<VM: VMBinding> Allocators<VM> {
@@ -57,6 +59,7 @@ impl<VM: VMBinding> Allocators<VM> {
             AllocatorSelector::MarkCompact(index) => {
                 self.markcompact[index as usize].assume_init_ref()
             }
+            AllocatorSelector::Iso(index) => self.iso[index as usize].assume_init_ref(),
             AllocatorSelector::None => panic!("Allocator mapping is not initialized"),
         }
     }
@@ -86,6 +89,7 @@ impl<VM: VMBinding> Allocators<VM> {
             AllocatorSelector::MarkCompact(index) => {
                 self.markcompact[index as usize].assume_init_mut()
             }
+            AllocatorSelector::Iso(index) => self.iso[index as usize].assume_init_mut(),
             AllocatorSelector::None => panic!("Allocator mapping is not initialized"),
         }
     }
@@ -112,6 +116,7 @@ impl<VM: VMBinding> Allocators<VM> {
             immix: unsafe { MaybeUninit::uninit().assume_init() },
             free_list: unsafe { MaybeUninit::uninit().assume_init() },
             markcompact: unsafe { MaybeUninit::uninit().assume_init() },
+            iso: unsafe { MaybeUninit::uninit().assume_init() },
         };
         let context = Arc::new(AllocatorContext::new(mmtk));
 
@@ -163,6 +168,17 @@ impl<VM: VMBinding> Allocators<VM> {
                         context.clone(),
                     ));
                 }
+                AllocatorSelector::Iso(index) => {
+                    ret.iso[index as usize].write(IsoAllocator::new(
+                        mutator_tls.0,
+                        #[cfg(feature = "thread_local_gc")]
+                        mutator_id,
+                        Some(space),
+                        context.clone(),
+                        false,
+                        None,
+                    ));
+                }
                 AllocatorSelector::None => panic!("Allocator mapping is not initialized"),
             }
         }
@@ -199,6 +215,8 @@ pub enum AllocatorSelector {
     MarkCompact(u8),
     /// Represents a [`crate::util::alloc::free_list_allocator::FreeListAllocator`].
     FreeList(u8),
+    /// Represents a [`crate::util::alloc::iso_allocator::IsoAllocator`].
+    Iso(u8),
     /// No allocator found.
     #[default]
     None,

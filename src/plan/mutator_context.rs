@@ -535,6 +535,10 @@ impl<VM: VMBinding> Mutator<VM> {
                     offset_of!(Allocators<VM>, markcompact)
                         + size_of::<MarkCompactAllocator<VM>>() * index as usize
                 }
+                AllocatorSelector::Iso(index) => {
+                    offset_of!(Allocators<VM>, iso)
+                        + size_of::<IsoAllocator<VM>>() * index as usize
+                }
                 AllocatorSelector::None => panic!("Expect a valid AllocatorSelector, found None"),
             }
     }
