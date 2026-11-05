@@ -1433,6 +1433,8 @@ pub enum AllocationSemantics {
     LargeCode = 5,
     /// Non moving objects will not be moved by GC.
     NonMoving = 6,
+    /// Likely public objects might be allocated differently than likely private objects.
+    LikelyPublic = 7,
 }
 
 #[cfg(feature = "thread_local_gc")]

@@ -1,4 +1,4 @@
-ouse crate::global_state::GlobalState;
+use crate::global_state::GlobalState;
 use crate::policy::space::Space;
 use crate::util::address::Address;
 #[cfg(feature = "analysis")]
@@ -9,6 +9,7 @@ use crate::util::options::Options;
 use crate::vm::VMBinding;
 use crate::vm::{ActivePlan, Collection};
 use crate::MMTK;
+use crate::AllocationSemantics;
 use downcast_rs::Downcast;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,11 +59,6 @@ pub struct AllocationOptions {
     ///
     /// If `fasle`, the allocation will return null immediately when out of memory.
     pub allow_oom_call: bool,
-    
-    /// Whether the allocation is expected to be published in its lifetime.
-    ///
-    /// **The default is `false`.**
-    pub likely_public: bool,
 }
 
 /// The default value for `AllocationOptions` has the same semantics as calling [`Allocator::alloc`]
@@ -73,7 +69,6 @@ impl Default for AllocationOptions {
             allow_overcommit: false,
             at_safepoint: true,
             allow_oom_call: true,
-            likely_public: false,
         }
     }
 }
@@ -366,8 +361,13 @@ pub trait Allocator<VM: VMBinding>: Downcast {
     /// Arguments:
     /// * `size`: the allocation size in bytes.
     /// * `align`: the required alignment in bytes.
-    /// * `offset` the required offset in bytes.
+    /// * `offset`: the required offset in bytes.
+    /// * `semantics`: the type of allocation.
     fn alloc(&mut self, size: usize, align: usize, offset: usize) -> Address;
+    fn alloc_with_semantics(&mut self, size: usize, align: usize, offset: usize,
+                            _semantics: AllocationSemantics) -> Address {
+        self.alloc(size, align, offset)
+    }
 
     /// An allocation attempt. The allocation options may specify different behaviors for this allocation request.
     ///
@@ -385,6 +385,19 @@ pub trait Allocator<VM: VMBinding>: Downcast {
     ) -> Address {
         self.get_context().set_alloc_options(alloc_options);
         let ret = self.alloc(size, align, offset);
+        self.get_context().clear_alloc_options();
+        ret
+    }
+    fn alloc_with_options_semantics(
+        &mut self,
+        size: usize,
+        align: usize,
+        offset: usize,
+        alloc_options: AllocationOptions,
+        semantics: AllocationSemantics,
+    ) -> Address {
+        self.get_context().set_alloc_options(alloc_options);
+        let ret = self.alloc_with_semantics(size, align, offset, semantics);
         self.get_context().clear_alloc_options();
         ret
     }

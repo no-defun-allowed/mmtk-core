@@ -14,11 +14,19 @@ use crate::plan::mutator_context::ReservedAllocators;
 use crate::plan::AllocationSemantics;
 use crate::util::alloc::allocators::AllocatorSelector;
 use crate::util::alloc::allocators::Allocators;
+#[cfg(not(feature = "thread_local_gc"))]
 use crate::util::alloc::ImmixAllocator;
+#[cfg(feature = "thread_local_gc")]
+use crate::util::alloc::IsoAllocator;
 use crate::util::opaque_pointer::{VMMutatorThread, VMWorkerThread};
 use crate::vm::VMBinding;
 use crate::MMTK;
 use enum_map::EnumMap;
+
+#[cfg(feature = "thread_local_gc")]
+type TheAllocator<VM> = IsoAllocator<VM>;
+#[cfg(not(feature = "thread_local_gc"))]
+type TheAllocator<VM> = ImmixAllocator<VM>;
 
 pub fn immix_mutator_prepare<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWorkerThread) {
     #[cfg(feature = "thread_local_gc")]
@@ -28,7 +36,7 @@ pub fn immix_mutator_prepare<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWo
     let immix_allocator = unsafe {
         allocators.get_allocator_mut(mutator.config.allocator_mapping[AllocationSemantics::Default])
     }
-    .downcast_mut::<ImmixAllocator<VM>>()
+    .downcast_mut::<TheAllocator<VM>>()
     .unwrap();
     immix_allocator.reset();
 
@@ -53,7 +61,7 @@ pub fn immix_mutator_release<VM: VMBinding>(mutator: &mut Mutator<VM>, tls: VMWo
     let immix_allocator = unsafe {
         allocators.get_allocator_mut(mutator.config.allocator_mapping[AllocationSemantics::Default])
     }
-    .downcast_mut::<ImmixAllocator<VM>>()
+    .downcast_mut::<TheAllocator<VM>>()
     .unwrap();
     immix_allocator.reset();
 
@@ -83,7 +91,7 @@ pub fn immix_mutator_thread_local_prepare<VM: VMBinding>(mutator: &mut Mutator<V
     let immix_allocator = unsafe {
         allocators.get_allocator_mut(mutator.config.allocator_mapping[AllocationSemantics::Default])
     }
-    .downcast_mut::<ImmixAllocator<VM>>()
+    .downcast_mut::<IsoAllocator<VM>>()
     .unwrap();
     immix_allocator.reset();
     immix_allocator.thread_local_prepare();
@@ -103,7 +111,7 @@ pub fn immix_mutator_thread_local_release<VM: VMBinding>(mutator: &mut Mutator<V
     let immix_allocator = unsafe {
         allocators.get_allocator_mut(mutator.config.allocator_mapping[AllocationSemantics::Default])
     }
-    .downcast_mut::<ImmixAllocator<VM>>()
+    .downcast_mut::<IsoAllocator<VM>>()
     .unwrap();
     immix_allocator.reset();
     immix_allocator.thread_local_release();
@@ -124,10 +132,10 @@ pub fn immix_mutator_thread_local_alloc_copy<VM: VMBinding>(
 ) -> crate::util::Address {
     let allocators: &mut Allocators<VM> = mutator.allocators.borrow_mut();
 
-    let immix_allocator: &mut ImmixAllocator<VM> = unsafe {
+    let immix_allocator: &mut IsoAllocator<VM> = unsafe {
         allocators.get_allocator_mut(mutator.config.allocator_mapping[AllocationSemantics::Default])
     }
-    .downcast_mut::<ImmixAllocator<VM>>()
+    .downcast_mut::<IsoAllocator<VM>>()
     .unwrap();
     immix_allocator.alloc_copy(bytes, align, offset)
 }
@@ -140,10 +148,10 @@ fn immix_mutator_thread_local_post_copy<VM: VMBinding>(
 ) {
     let allocators: &mut Allocators<VM> = mutator.allocators.borrow_mut();
 
-    let immix_allocator: &mut ImmixAllocator<VM> = unsafe {
+    let immix_allocator: &mut IsoAllocator<VM> = unsafe {
         allocators.get_allocator_mut(mutator.config.allocator_mapping[AllocationSemantics::Default])
     }
-    .downcast_mut::<ImmixAllocator<VM>>()
+    .downcast_mut::<IsoAllocator<VM>>()
     .unwrap();
     immix_allocator
         .immix_space()
@@ -157,13 +165,16 @@ pub fn immix_mutator_thread_local_defrag_prepare<VM: VMBinding>(mutator: &mut Mu
     let immix_allocator = unsafe {
         allocators.get_allocator_mut(mutator.config.allocator_mapping[AllocationSemantics::Default])
     }
-    .downcast_mut::<ImmixAllocator<VM>>()
+    .downcast_mut::<IsoAllocator<VM>>()
     .unwrap();
 
     immix_allocator.thread_local_defrag_prepare();
 }
 
 pub(in crate::plan) const RESERVED_ALLOCATORS: ReservedAllocators = ReservedAllocators {
+    #[cfg(feature = "thread_local_gc")]
+    n_iso: 1,
+    #[cfg(not(feature = "thread_local_gc"))]
     n_immix: 1,
     ..ReservedAllocators::DEFAULT
 };
@@ -171,7 +182,12 @@ pub(in crate::plan) const RESERVED_ALLOCATORS: ReservedAllocators = ReservedAllo
 lazy_static! {
     pub static ref ALLOCATOR_MAPPING: EnumMap<AllocationSemantics, AllocatorSelector> = {
         let mut map = create_allocator_mapping(RESERVED_ALLOCATORS, true);
-        map[AllocationSemantics::Default] = AllocatorSelector::Immix(0);
+        #[cfg(feature = "thread_local_gc")] {
+            map[AllocationSemantics::Default] = AllocatorSelector::Iso(0);
+        }
+        #[cfg(not(feature = "thread_local_gc"))] {
+            map[AllocationSemantics::Default] = AllocatorSelector::Immix(0);
+        }
         map
     };
 }

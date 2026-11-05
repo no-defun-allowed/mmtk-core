@@ -267,7 +267,7 @@ impl<VM: VMBinding> MutatorContext<VM> for Mutator<VM> {
         };
         // The value should be default/unset at the beginning of an allocation request.
         debug_assert!(allocator.get_context().get_alloc_options().is_default());
-        allocator.alloc(size, align, offset)
+        allocator.alloc_with_semantics(size, align, offset, semantics)
     }
 
     fn alloc_with_options(
@@ -275,16 +275,16 @@ impl<VM: VMBinding> MutatorContext<VM> for Mutator<VM> {
         size: usize,
         align: usize,
         offset: usize,
-        allocator: AllocationSemantics,
+        semantics: AllocationSemantics,
         options: AllocationOptions,
     ) -> Address {
         let allocator = unsafe {
             self.allocators
-                .get_allocator_mut(self.config.allocator_mapping[allocator])
+                .get_allocator_mut(self.config.allocator_mapping[semantics])
         };
         // The value should be default/unset at the beginning of an allocation request.
         debug_assert!(allocator.get_context().get_alloc_options().is_default());
-        allocator.alloc_with_options(size, align, offset, options)
+        allocator.alloc_with_options_semantics(size, align, offset, options, semantics)
     }
 
     fn alloc_slow(
@@ -751,6 +751,7 @@ pub(crate) struct ReservedAllocators {
     pub n_immix: u8,
     pub n_mark_compact: u8,
     pub n_free_list: u8,
+    pub n_iso: u8,
 }
 
 impl ReservedAllocators {
@@ -761,6 +762,7 @@ impl ReservedAllocators {
         n_immix: 0,
         n_mark_compact: 0,
         n_free_list: 0,
+        n_iso: 0,
     };
     /// check if the number of each allocator is okay. Panics if any allocator exceeds the max number.
     fn validate(&self) {
@@ -788,6 +790,10 @@ impl ReservedAllocators {
         assert!(
             self.n_free_list as usize <= MAX_FREE_LIST_ALLOCATORS,
             "Allocator mapping declared more free list allocators than the max allowed."
+        );
+        assert!(
+            self.n_free_list as usize <= MAX_ISO_ALLOCATORS,
+            "Allocator mapping declared more Iso allocators than the max allowed."
         );
     }
 
