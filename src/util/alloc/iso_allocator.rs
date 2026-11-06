@@ -23,6 +23,15 @@ pub struct IsoAllocator<VM: VMBinding> {
 
 unsafe impl<VM: VMBinding> Send for IsoAllocator<VM> {}
 
+macro_rules! forward_to_both {
+    ($method:ident) => {
+        pub fn $method(&mut self) {
+            self.likely_private.$method();
+            self.likely_public.$method();
+        }
+    };
+}
+
 impl<VM: VMBinding> IsoAllocator<VM> {
     pub(crate) fn new(
         tls: VMThread,
@@ -48,30 +57,13 @@ impl<VM: VMBinding> IsoAllocator<VM> {
     }
 
     // These all get forwarded to both sub-allocators.
-    pub fn prepare(&mut self) {
-        self.likely_private.prepare();
-        self.likely_public.prepare();
-    }
-    pub fn release(&mut self) {
-        self.likely_private.release();
-        self.likely_public.release();
-    }
-    pub fn reset(&mut self) {
-        self.likely_private.reset();
-        self.likely_public.reset();
-    }
-    pub fn thread_local_prepare(&mut self) {
-        self.likely_private.thread_local_prepare();
-        self.likely_public.thread_local_prepare();
-    }
-    pub fn thread_local_defrag_prepare(&mut self) {
-        self.likely_private.thread_local_defrag_prepare();
-        self.likely_public.thread_local_defrag_prepare();
-    }
-    pub fn thread_local_release(&mut self) {
-        self.likely_private.thread_local_release();
-        self.likely_public.thread_local_release();
-    }
+    forward_to_both!(prepare);
+    forward_to_both!(release);
+    forward_to_both!(reset);
+    forward_to_both!(thread_local_prepare);
+    forward_to_both!(thread_local_defrag_prepare);
+    forward_to_both!(thread_local_release);
+
     pub(crate) fn immix_space(&self) -> &'static ImmixSpace<VM> {
         self.likely_private.immix_space()
     }
