@@ -792,7 +792,7 @@ impl ReservedAllocators {
             "Allocator mapping declared more free list allocators than the max allowed."
         );
         assert!(
-            self.n_free_list as usize <= MAX_ISO_ALLOCATORS,
+            self.n_iso as usize <= MAX_ISO_ALLOCATORS,
             "Allocator mapping declared more Iso allocators than the max allowed."
         );
     }
