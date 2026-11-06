@@ -1227,7 +1227,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     .get_allocator_mut(
                         mutator.config.allocator_mapping[crate::AllocationSemantics::Default],
                     )
-                    .downcast_mut::<ImmixAllocator<VM>>()
+                    .downcast_mut::<IsoAllocator<VM>>()
                     .unwrap()
             }
             .thread_local_copy_reserve_exhausted(VM::VMObjectModel::get_size_when_copied(object));
@@ -2240,8 +2240,7 @@ impl<VM: VMBinding> Drop for FlushPageResource<VM> {
 }
 
 use crate::policy::copy_context::PolicyCopyContext;
-use crate::util::alloc::Allocator;
-use crate::util::alloc::ImmixAllocator;
+use crate::util::alloc::{Allocator, ImmixAllocator, IsoAllocator};
 
 /// Normal immix copy context. It has one copying Immix allocator.
 /// Most immix plans use this copy context.
