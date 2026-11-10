@@ -350,10 +350,12 @@ impl<VM: VMBinding> ConcurrentImmix<VM> {
         scheduler.work_buckets[WorkBucketStage::FinalizableForwarding].set_enabled(false);
         scheduler.work_buckets[WorkBucketStage::Compact].set_enabled(false);
 
+     let stats = plan_args.global_args.stats;
         let immix = ConcurrentImmix {
             immix_space: ImmixSpace::new(
                 plan_args.get_normal_space_args("immix", true, false, VMRequest::discontiguous()),
                 immix_args,
+                stats,
             ),
             common: CommonPlan::new(plan_args),
             last_gc_was_defrag: AtomicBool::new(false),

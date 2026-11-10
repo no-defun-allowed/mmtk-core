@@ -703,5 +703,7 @@ use std::sync::atomic::AtomicU8;
 #[cfg(feature = "thread_local_gc")]
 /// The number of predictors in the predictor table.
 pub const PREDICTORS: usize = 65536;
+pub const PREDICT_PRIVATE: u8 = 0;
+pub const PREICT_PUBLIC: u8 = 1;
 #[cfg(feature = "thread_local_gc")]
 pub(crate) static PREDICTOR_TABLE: [AtomicU8; PREDICTORS] = [const { AtomicU8::new(0) }; PREDICTORS];

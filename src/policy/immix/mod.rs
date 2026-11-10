@@ -2,6 +2,8 @@ pub mod block;
 pub mod defrag;
 pub mod immixspace;
 pub mod line;
+#[cfg(feature = "measure_private_lifetimes")]
+pub mod lifetime;
 
 pub use immixspace::*;
 

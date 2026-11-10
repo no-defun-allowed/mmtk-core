@@ -85,6 +85,8 @@ define_side_metadata_specs!(
     IX_BLOCK_METADATA = (global: false, log_num_of_bits: 3, log_bytes_in_region: crate::policy::immix::block::Block::LOG_BYTES),
     // Keep track of lines published by immix
     IX_LINE_PUBLICATION  = (global: false, log_num_of_bits: 0, log_bytes_in_region: crate::policy::immix::line::Line::LOG_BYTES),
+    // Keep track of object lifetimes in immix
+    IX_OBJECT_LIFETIME = (global: false, log_num_of_bits: 3, log_bytes_in_region: LOG_MIN_OBJECT_SIZE as usize),
     // Mark blocks by (native mimalloc) marksweep
     MS_BLOCK_MARK   = (global: false, log_num_of_bits: 3, log_bytes_in_region: crate::policy::marksweepspace::native_ms::Block::LOG_BYTES),
     // Next block in list for native mimalloc

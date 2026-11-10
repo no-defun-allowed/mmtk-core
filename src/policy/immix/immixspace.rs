@@ -1,6 +1,8 @@
 use super::defrag::StatsForDefrag;
 use super::line::*;
 use super::{block::*, defrag::Defrag};
+#[cfg(feature = "measure_private_lifetimes")]
+use super::lifetime;
 #[cfg(feature = "thread_local_gc")]
 use crate::plan::ThreadlocalTracedObjectType;
 use crate::plan::VectorObjectQueue;
@@ -88,6 +90,8 @@ pub struct ImmixSpace<VM: VMBinding> {
     // )>,
     #[cfg(all(feature = "thread_local_gc_copying", debug_assertions))]
     pub(crate) mutator_in_defrag: std::sync::Mutex<Vec<u32>>,
+    #[cfg(feature = "measure_private_lifetimes")]
+    counters: lifetime::Counters,
 }
 
 /// Some arguments for Immix Space.
@@ -162,6 +166,8 @@ impl<VM: VMBinding> SFT for ImmixSpace<VM> {
     fn initialize_object_metadata(&self, _object: ObjectReference) {
         #[cfg(feature = "vo_bit")]
         crate::util::metadata::vo_bit::set_vo_bit(_object);
+        #[cfg(feature = "measure_private_lifetimes")]
+        lifetime::zero_lifetime::<VM>(_object);
     }
     #[cfg(feature = "vo_bit")]
     fn is_mmtk_object(&self, addr: Address) -> Option<ObjectReference> {
@@ -335,6 +341,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 *VM::VMObjectModel::LOCAL_FORWARDING_POINTER_SPEC,
                 #[cfg(feature = "object_pinning")]
                 *VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC,
+                #[cfg(feature = "measure_private_lifetimes")]
+                MetadataSpec::OnSide(lifetime::LIFETIME_TABLE),
             ]
         } else {
             vec![
@@ -354,6 +362,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 *VM::VMObjectModel::LOCAL_FORWARDING_POINTER_SPEC,
                 #[cfg(feature = "object_pinning")]
                 *VM::VMObjectModel::LOCAL_PINNING_BIT_SPEC,
+                #[cfg(feature = "measure_private_lifetimes")]
+                MetadataSpec::OnSide(lifetime::LIFETIME_TABLE),
             ]
         })
     }
@@ -361,6 +371,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     pub fn new(
         args: crate::policy::space::PlanCreateSpaceArgs<VM>,
         mut space_args: ImmixSpaceArgs,
+        _stats: &crate::util::statistics::stats::Stats,
     ) -> Self {
         if args.unlog_traced_object {
             assert!(
@@ -471,6 +482,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             // log_buffer: crossbeam::queue::SegQueue::new(),
             #[cfg(all(feature = "thread_local_gc_copying", debug_assertions))]
             mutator_in_defrag: std::sync::Mutex::new(vec![]),
+            #[cfg(feature = "measure_private_lifetimes")]
+            counters: lifetime::Counters::new(_stats),
         }
     }
 
@@ -1171,7 +1184,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
             }
 
             self.unlog_object_if_needed(object);
-
+            #[cfg(feature = "measure_private_lifetimes")]
+            lifetime::on_object_marked::<VM>(object);
             return ThreadlocalTracedObjectType::ToBeScanned(object);
         }
         ThreadlocalTracedObjectType::Scanned(object)
@@ -1194,7 +1208,6 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         if crate::util::metadata::public_bit::is_public(object) {
             return ThreadlocalTracedObjectType::Scanned(object);
         }
-
         #[cfg(debug_assertions)]
         debug_assert!(
             block.is_defrag_source(),
@@ -1239,6 +1252,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 // set the ditry bit
                 block.taint();
 
+                #[cfg(feature = "measure_private_lifetimes")]
+                lifetime::on_object_marked::<VM>(object);
                 #[cfg(feature = "vo_bit")]
                 vo_bit::helper::on_object_marked::<VM>(object);
                 object
@@ -1258,6 +1273,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
                 #[cfg(feature = "vo_bit")]
                 vo_bit::helper::on_object_forwarded::<VM>(new_object);
+                #[cfg(feature = "measure_private_lifetimes")]
+                lifetime::on_object_forwarded::<VM>(object, new_object);
 
                 #[cfg(feature = "debug_publish_object")]
                 {
@@ -1370,6 +1387,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     }
                     #[cfg(feature = "vo_bit")]
                     vo_bit::helper::on_object_marked::<VM>(object);
+                    #[cfg(feature = "measure_private_lifetimes")]
+                    lifetime::on_object_marked::<VM>(object);
                     object
                 } else {
                     let new_object = if is_private_object {
@@ -1403,6 +1422,9 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                             |_new_object| {
                                 #[cfg(feature = "vo_bit")]
                                 vo_bit::helper::on_object_forwarded::<VM>(_new_object);
+                                #[cfg(feature = "measure_private_lifetimes")]
+                                lifetime::on_object_forwarded::<VM>(object, _new_object);
+
                                 #[cfg(feature = "debug_publish_object")]
                                 crate::util::metadata::public_bit::set_public_bit(
                                     _new_object,
@@ -1759,6 +1781,8 @@ impl<VM: VMBinding> ImmixSpace<VM> {
         #[cfg(feature = "debug_thread_local_gc_copying")] _tls: crate::util::VMMutatorThread,
     ) {
         debug_assert!(crate::util::metadata::public_bit::is_public(object));
+        #[cfg(feature = "measure_private_lifetimes")]
+        self.counters.count(lifetime::object_age::<VM>(object));
         // Mark block and lines
         if !super::BLOCK_ONLY {
             let state = self.line_mark_state.load(Ordering::Acquire);

@@ -262,6 +262,7 @@ impl<VM: VMBinding> crate::plan::generational::global::GenerationalPlanExt<VM> f
 
 impl<VM: VMBinding> GenImmix<VM> {
     pub fn new(args: CreateGeneralPlanArgs<VM>) -> Self {
+        let stats = args.stats;
         let mut plan_args = CreateSpecificPlanArgs {
             global_args: args,
             constraints: &GENIMMIX_CONSTRAINTS,
@@ -282,6 +283,7 @@ impl<VM: VMBinding> GenImmix<VM> {
                 max_local_copy_reserve: 0,
                 never_move_objects: false,
             },
+            stats,
         );
 
         let genimmix = GenImmix {

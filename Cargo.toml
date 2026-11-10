@@ -210,6 +210,8 @@ immix_zero_on_release = []
 sanity = []
 # Run analysis
 analysis = []
+# Measure private object lifetimes
+measure_private_lifetimes = []
 # Use lock free variant of NoGC
 nogc_lock_free = []
 # Use lock free with no zeroing NoGC

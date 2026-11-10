@@ -386,6 +386,7 @@ impl<VM: VMBinding> Immix<VM> {
         mut plan_args: CreateSpecificPlanArgs<VM>,
         space_args: ImmixSpaceArgs,
     ) -> Self {
+        let stats = plan_args.global_args.stats;
         let immix = Immix {
             immix_space: ImmixSpace::new(
                 if space_args.mixed_age {
@@ -404,6 +405,7 @@ impl<VM: VMBinding> Immix<VM> {
                     )
                 },
                 space_args,
+                stats,
             ),
             common: CommonPlan::new(plan_args),
             last_gc_was_defrag: AtomicBool::new(false),
