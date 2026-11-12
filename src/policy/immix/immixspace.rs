@@ -166,8 +166,14 @@ impl<VM: VMBinding> SFT for ImmixSpace<VM> {
     fn initialize_object_metadata(&self, _object: ObjectReference) {
         #[cfg(feature = "vo_bit")]
         crate::util::metadata::vo_bit::set_vo_bit(_object);
-        #[cfg(feature = "measure_private_lifetimes")]
-        lifetime::zero_lifetime::<VM>(_object);
+        #[cfg(feature = "measure_private_lifetimes")] {
+            lifetime::zero_lifetime::<VM>(_object);
+            // lousy random sampling to contend on the lock less...
+            const RANDOM_SAMPLING_SIZE: u64 = 4096;
+            if rand::random_range(0..RANDOM_SAMPLING_SIZE) == 0 {
+                self.counters.count_survival(0, RANDOM_SAMPLING_SIZE);
+            }
+        }
     }
     #[cfg(feature = "vo_bit")]
     fn is_mmtk_object(&self, addr: Address) -> Option<ObjectReference> {
@@ -1185,7 +1191,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
 
             self.unlog_object_if_needed(object);
             #[cfg(feature = "measure_private_lifetimes")]
-            lifetime::on_object_marked::<VM>(object);
+            lifetime::on_object_marked::<VM>(object, &self.counters);
             return ThreadlocalTracedObjectType::ToBeScanned(object);
         }
         ThreadlocalTracedObjectType::Scanned(object)
@@ -1253,7 +1259,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 block.taint();
 
                 #[cfg(feature = "measure_private_lifetimes")]
-                lifetime::on_object_marked::<VM>(object);
+                lifetime::on_object_marked::<VM>(object, &self.counters);
                 #[cfg(feature = "vo_bit")]
                 vo_bit::helper::on_object_marked::<VM>(object);
                 object
@@ -1274,7 +1280,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                 #[cfg(feature = "vo_bit")]
                 vo_bit::helper::on_object_forwarded::<VM>(new_object);
                 #[cfg(feature = "measure_private_lifetimes")]
-                lifetime::on_object_forwarded::<VM>(object, new_object);
+                lifetime::on_object_forwarded::<VM>(object, new_object, &self.counters);
 
                 #[cfg(feature = "debug_publish_object")]
                 {
@@ -1388,7 +1394,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                     #[cfg(feature = "vo_bit")]
                     vo_bit::helper::on_object_marked::<VM>(object);
                     #[cfg(feature = "measure_private_lifetimes")]
-                    lifetime::on_object_marked::<VM>(object);
+                    lifetime::on_object_marked::<VM>(object, &self.counters);
                     object
                 } else {
                     let new_object = if is_private_object {
@@ -1423,7 +1429,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
                                 #[cfg(feature = "vo_bit")]
                                 vo_bit::helper::on_object_forwarded::<VM>(_new_object);
                                 #[cfg(feature = "measure_private_lifetimes")]
-                                lifetime::on_object_forwarded::<VM>(object, _new_object);
+                                lifetime::on_object_forwarded::<VM>(object, _new_object, &self.counters);
 
                                 #[cfg(feature = "debug_publish_object")]
                                 crate::util::metadata::public_bit::set_public_bit(
@@ -1782,7 +1788,7 @@ impl<VM: VMBinding> ImmixSpace<VM> {
     ) {
         debug_assert!(crate::util::metadata::public_bit::is_public(object));
         #[cfg(feature = "measure_private_lifetimes")]
-        self.counters.count(lifetime::object_age::<VM>(object));
+        self.counters.count_publication(lifetime::object_age::<VM>(object));
         // Mark block and lines
         if !super::BLOCK_ONLY {
             let state = self.line_mark_state.load(Ordering::Acquire);

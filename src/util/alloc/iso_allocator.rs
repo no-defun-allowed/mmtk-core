@@ -60,16 +60,23 @@ impl<VM: VMBinding> IsoAllocator<VM> {
     forward_to_both!(prepare);
     forward_to_both!(release);
     forward_to_both!(reset);
-    forward_to_both!(thread_local_prepare);
-    forward_to_both!(thread_local_defrag_prepare);
+    // We deem any objects which survive one private GC without
+    // being published to be likely-private, so we change all the
+    // likely-public blocks to be likely-private before a private GC.
+    pub fn thread_local_prepare(&mut self) {
+        self.likely_private.take_blocks_from(&mut self.likely_public);
+        self.likely_private.thread_local_prepare();
+    }
+    pub fn thread_local_defrag_prepare(&mut self) {
+        self.likely_private.take_blocks_from(&mut self.likely_public);
+        self.likely_private.thread_local_defrag_prepare();
+    }
     forward_to_both!(thread_local_release);
 
     pub(crate) fn immix_space(&self) -> &'static ImmixSpace<VM> {
         self.likely_private.immix_space()
     }
 
-    // These pertain to private objects, so I forward them to the
-    // likely_private sub-allocator.
     #[cfg(feature = "thread_local_gc_copying")]
     pub fn thread_local_copy_reserve_exhausted(&mut self, size: usize) -> bool {
         self.likely_private.thread_local_copy_reserve_exhausted(size)

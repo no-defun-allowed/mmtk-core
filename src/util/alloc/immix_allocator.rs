@@ -415,6 +415,15 @@ impl<VM: VMBinding> ImmixAllocator<VM> {
         self.local_reusable_blocks.len()
     }
 
+    #[cfg(feature = "thread_local_gc")]
+    pub fn take_blocks_from(&mut self, other: &mut Self) {
+        self.local_blocks.append(&mut other.local_blocks);
+        self.local_free_blocks.append(&mut other.local_free_blocks);
+        self.local_reusable_blocks.dense.append(&mut other.local_reusable_blocks.dense);
+        #[cfg(feature = "sparse_immix_block")]
+        self.local_reusable_blocks.sparse.append(&mut other.local_reusable_blocks.sparse);
+    }
+
     #[cfg(feature = "thread_local_gc_copying")]
     pub fn thread_local_defrag_prepare(&mut self) {
         debug_assert!(VM::VMActivePlan::is_mutator(self.tls));

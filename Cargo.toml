@@ -57,6 +57,7 @@ num-traits = "0.2"
 pfm = { version = "0.1.1", optional = true }
 portable-atomic = "1.4.3"
 probe = "0.5"
+rand = { version = "0.10.3", features = ["thread_rng"] }
 regex = "1.7.0"
 rustversion = "1.0"
 spin = "0.10.0"
